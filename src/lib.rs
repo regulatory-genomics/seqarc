@@ -1,10 +1,9 @@
 //! A Rust-native, library-only sequencing read compressor.
 //!
 //! The archive format is intentionally independent from the original C++
-//! SPRING format. Archives are chunked, self-describing, and support range
-//! decoding without a command-line interface.
+//! SPRING format. RS3 archives are self-describing and support range decoding
+//! without a command-line interface.
 
-mod archive;
 mod codec;
 mod consensus_archive;
 mod fastx;
@@ -90,6 +89,41 @@ impl ReadRecord {
     }
 }
 
+pub(crate) fn apply_quality(record: &mut ReadRecord, mode: &QualityMode) {
+    if let Some(quality) = record.quality.as_mut() {
+        match mode {
+            QualityMode::Lossless => {}
+            QualityMode::IlluminaBinning => {
+                for q in quality {
+                    *q = match *q {
+                        b'!'..=b'"' => b'!',
+                        b'#'..=b'*' => b'\'',
+                        b'+'..=b'4' => b'0',
+                        b'5'..=b'9' => b'7',
+                        b':'..=b'>' => b'<',
+                        b'?'..=b'C' => b'B',
+                        b'D'..=b'H' => b'F',
+                        _ => b'I',
+                    };
+                }
+            }
+            QualityMode::Binary {
+                threshold,
+                high,
+                low,
+            } => {
+                for q in quality {
+                    *q = if q.saturating_sub(33) >= *threshold {
+                        high.saturating_add(33)
+                    } else {
+                        low.saturating_add(33)
+                    };
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum QualityMode {
     Lossless,
@@ -104,14 +138,12 @@ pub struct CompressionOptions {
     pub preserve_order: bool,
     pub quality_mode: QualityMode,
     pub threads: usize,
-    pub chunk_records: usize,
     pub zstd_level: i32,
     pub reorder: ReorderOptions,
 }
 
 #[derive(Clone, Debug)]
 pub struct ReorderOptions {
-    pub enabled: bool,
     pub kmer_size: usize,
     pub window_size: usize,
     pub max_bucket_records: usize,
@@ -123,7 +155,6 @@ pub struct ReorderOptions {
 impl Default for ReorderOptions {
     fn default() -> Self {
         Self {
-            enabled: true,
             kmer_size: 21,
             window_size: 31,
             max_bucket_records: 4_096,
@@ -142,7 +173,6 @@ impl Default for CompressionOptions {
             preserve_order: true,
             quality_mode: QualityMode::Lossless,
             threads: 16,
-            chunk_records: 131_072,
             zstd_level: 19,
             reorder: ReorderOptions::default(),
         }
@@ -182,50 +212,20 @@ pub struct ArchiveRecords {
     pub streams: Vec<Vec<ReadRecord>>,
 }
 
-/// Compress one logical read stream into a Rust-native archive.
-pub fn compress<I, W>(
-    records: I,
-    output: W,
-    options: &CompressionOptions,
-) -> Result<CompressionMetadata>
-where
-    I: IntoIterator<Item = Result<ReadRecord>>,
-    W: Write,
-{
-    compress_streams(vec![records.into_iter()], output, options)
-}
-
-/// Compress paired or multiple logical streams. Streams must contain the same number of records.
-pub fn compress_streams<I, W>(
-    streams: Vec<I>,
-    output: W,
-    options: &CompressionOptions,
-) -> Result<CompressionMetadata>
-where
-    I: IntoIterator<Item = Result<ReadRecord>>,
-    W: Write,
-{
-    archive::write_archive(streams, output, options)
-}
-
-/// Stream paired gzipped FASTQ files into a native archive without buffering
-/// the complete dataset in memory.
+/// Compress paired gzipped FASTQ files into a native archive.
+///
+/// Uses the store-backed RS3 consensus path.
 pub fn compress_paired_fastq_files(
     input_1: impl AsRef<Path>,
     input_2: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: &CompressionOptions,
 ) -> Result<CompressionMetadata> {
-    let reader_1 = FastxReader::new(
-        BufReader::new(gzip_reader(BufReader::new(File::open(input_1)?))),
-        Format::Fastq,
-    );
-    let reader_2 = FastxReader::new(
-        BufReader::new(gzip_reader(BufReader::new(File::open(input_2)?))),
-        Format::Fastq,
-    );
-    let archive = File::create(output)?;
-    archive::write_archive_streams(vec![reader_1, reader_2], archive, options)
+    let temp_dir =
+        options.reorder.temp_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("spring-rs-{}", std::process::id()))
+        });
+    compress_reordered_paired_fastq_files(input_1, input_2, output, options, temp_dir)
 }
 
 /// Reads paired FASTQ streams and writes an RS3 global-reorder archive.
@@ -266,9 +266,13 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     loop {
         match (first.next(), second.next()) {
             (None, None) => break,
-            (Some(Ok(first)), Some(Ok(second))) => {
+            (Some(Ok(mut first)), Some(Ok(mut second))) => {
                 first.validate(options.preserve_quality)?;
                 second.validate(options.preserve_quality)?;
+                if options.preserve_quality {
+                    apply_quality(&mut first, &options.quality_mode);
+                    apply_quality(&mut second, &options.quality_mode);
+                }
                 store.append(&first, &second)?;
             }
             (None, Some(_)) | (Some(_), None) => {
@@ -306,11 +310,7 @@ pub fn decompress<R: Read>(input: R, options: &DecompressionOptions) -> Result<A
     input.read_exact(&mut magic)?;
     let mut data = magic.to_vec();
     input.read_to_end(&mut data)?;
-    if &magic == b"SPRNG-RS3" {
-        consensus_archive::read_reordered(std::io::Cursor::new(data), options)
-    } else {
-        archive::read_archive(std::io::Cursor::new(data), options)
-    }
+    consensus_archive::read_reordered(std::io::Cursor::new(data), options)
 }
 
 /// Copy decoded records to FASTQ or FASTA writers.
@@ -337,41 +337,30 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_single_stream_and_range() {
-        let input = vec![Ok(record(1)), Ok(record(2)), Ok(record(3))];
-        let mut archive = Vec::new();
-        let metadata = compress(input, &mut archive, &CompressionOptions::default()).unwrap();
-        assert_eq!(metadata.records, 3);
-        let decoded = decompress(
-            Cursor::new(archive),
-            &DecompressionOptions { range: Some(1..=1) },
-        )
-        .unwrap();
-        assert_eq!(decoded.streams[0], vec![record(2)]);
-    }
-
-    #[test]
     fn defaults_use_sixteen_workers_and_large_chunks() {
         let options = CompressionOptions::default();
         assert_eq!(options.threads, 16);
-        assert_eq!(options.chunk_records, 131_072);
         assert_eq!(options.zstd_level, 19);
     }
 
     #[test]
-    fn round_trip_paired_streams() {
-        let left = vec![Ok(record(1)), Ok(record(2))];
-        let right = vec![Ok(record(3)), Ok(record(4))];
-        let mut archive = Vec::new();
-        compress_streams(
-            vec![left, right],
-            &mut archive,
-            &CompressionOptions::default(),
-        )
-        .unwrap();
-        let decoded = decompress(Cursor::new(archive), &DecompressionOptions::default()).unwrap();
-        assert_eq!(decoded.streams.len(), 2);
-        assert_eq!(decoded.streams[1][1], record(4));
+    fn illumina_binning_matches_spring_table() {
+        let mut record =
+            ReadRecord::new("read", b"ACGTACGT".to_vec(), Some((33u8..=127).collect()));
+        apply_quality(&mut record, &QualityMode::IlluminaBinning);
+        let expected = (33u8..=127)
+            .map(|quality| match quality {
+                33..=34 => 33,
+                35..=42 => 39,
+                43..=52 => 48,
+                53..=57 => 55,
+                58..=62 => 60,
+                63..=67 => 66,
+                68..=72 => 70,
+                _ => 73,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(record.quality, Some(expected));
     }
 
     #[test]
@@ -393,64 +382,6 @@ mod tests {
             .unwrap();
         assert_eq!(records[0].sequence, b"ACGT");
         assert_eq!(records[1].quality, None);
-    }
-
-    #[test]
-    fn streaming_writer_round_trips_multiple_chunks() {
-        let records: Vec<_> = (0..5).map(|n| Ok(record(n))).collect();
-        let mates: Vec<_> = (5..10).map(|n| Ok(record(n))).collect();
-        let mut archive = std::io::Cursor::new(Vec::new());
-        let options = CompressionOptions {
-            chunk_records: 2,
-            ..CompressionOptions::default()
-        };
-        let metadata = archive::write_archive_streams(
-            vec![records.into_iter(), mates.into_iter()],
-            &mut archive,
-            &options,
-        )
-        .unwrap();
-        assert_eq!(metadata.records, 5);
-        let decoded = decompress(
-            std::io::Cursor::new(archive.into_inner()),
-            &DecompressionOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(decoded.streams[0].len(), 5);
-        assert_eq!(decoded.streams[1][4], record(9));
-    }
-
-    #[test]
-    fn parallel_and_serial_produce_identical_archives() {
-        let encode = |threads: usize| {
-            let left: Vec<_> = (0..50).map(|n| Ok(record(n))).collect();
-            let right: Vec<_> = (50..100).map(|n| Ok(record(n))).collect();
-            let options = CompressionOptions {
-                chunk_records: 7,
-                threads,
-                ..CompressionOptions::default()
-            };
-            let mut archive = std::io::Cursor::new(Vec::new());
-            archive::write_archive_streams(
-                vec![left.into_iter(), right.into_iter()],
-                &mut archive,
-                &options,
-            )
-            .unwrap();
-            archive.into_inner()
-        };
-
-        let serial = encode(1);
-        let parallel = encode(8);
-        assert_eq!(serial, parallel, "archive bytes must be deterministic");
-
-        let decoded = decompress(
-            std::io::Cursor::new(parallel),
-            &DecompressionOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(decoded.streams[0].len(), 50);
-        assert_eq!(decoded.streams[1][49], record(99));
     }
 
     #[test]
@@ -541,24 +472,19 @@ mod tests {
         encoder_1.finish().unwrap();
         encoder_2.finish().unwrap();
         let options = CompressionOptions {
+            quality_mode: QualityMode::IlluminaBinning,
             reorder: ReorderOptions {
                 kmer_size: 3,
                 window_size: 3,
                 sort_chunk_size: 1,
                 max_bucket_records: 2,
+                temp_dir: Some(directory.path().join("work")),
                 ..ReorderOptions::default()
             },
             zstd_level: 3,
             ..CompressionOptions::default()
         };
-        compress_reordered_paired_fastq_files(
-            &input_1,
-            &input_2,
-            &output,
-            &options,
-            directory.path().join("work"),
-        )
-        .unwrap();
+        compress_paired_fastq_files(&input_1, &input_2, &output, &options).unwrap();
         let decoded = decompress(
             BufReader::new(File::open(output).unwrap()),
             &DecompressionOptions::default(),
@@ -578,6 +504,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             second
         );
+        assert!(decoded.streams[0]
+            .iter()
+            .all(|record| record.quality.as_deref() == Some(b"IIIIIIII")));
+        assert!(decoded.streams[1]
+            .iter()
+            .all(|record| record.quality.as_deref() == Some(b"IIIIIIII")));
     }
 
     #[test]

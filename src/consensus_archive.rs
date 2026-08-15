@@ -6,17 +6,11 @@ use crate::{
     DecompressionOptions, Error, ReadRecord, Result,
 };
 use crossbeam_channel::bounded;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 9] = b"SPRNG-RS3";
-const VERSION_V3: u32 = 3;
-const VERSION_V4: u32 = 4;
-const VERSION_V5: u32 = 5;
-const VERSION_V6: u32 = 6;
-const VERSION_V7: u32 = 7;
-const VERSION_V8: u32 = 8;
 const VERSION: u32 = 7;
 const LONG_DISTANCE_WINDOW_LOG: u32 = 27;
 
@@ -83,11 +77,7 @@ pub fn read_reordered<R: Read>(
         return Err(Error::InvalidFormat("bad RS3 magic".into()));
     }
     let version = read_u32(&mut input)?;
-    if ![
-        VERSION_V3, VERSION_V4, VERSION_V5, VERSION_V6, VERSION_V7, VERSION_V8,
-    ]
-    .contains(&version)
-    {
+    if version != VERSION {
         return Err(Error::InvalidFormat("unsupported RS3 version".into()));
     }
     let streams = read_u16(&mut input)? as usize;
@@ -102,228 +92,7 @@ pub fn read_reordered<R: Read>(
     if checksum(&payload) != expected {
         return Err(Error::InvalidFormat("RS3 checksum failure".into()));
     }
-    match version {
-        VERSION_V3 => read_payload_v3(&payload, streams, flags, options),
-        VERSION_V4 => read_payload_v4(&payload, streams, flags, options),
-        VERSION_V5 => read_payload_v5(&payload, streams, flags, options),
-        VERSION_V6 => read_payload_v6(&payload, streams, flags, options),
-        VERSION_V7 => read_payload_v7(&payload, streams, flags, options),
-        VERSION_V8 => read_payload_v8(&payload, streams, flags, options),
-        _ => unreachable!(),
-    }
-}
-
-fn read_payload_v3(
-    payload: &[u8],
-    streams: usize,
-    flags: u16,
-    options: &DecompressionOptions,
-) -> Result<ArchiveRecords> {
-    let mut cursor = Cursor::new(payload);
-    let records = cursor.u64()? as usize;
-    let payload_streams = cursor.u16()? as usize;
-    if streams == 0 || streams != payload_streams {
-        return Err(Error::InvalidFormat("RS3 stream count mismatch".into()));
-    }
-    let permutation = cursor.u64_vec()?;
-    if permutation.len() != records {
-        return Err(Error::InvalidFormat(
-            "RS3 permutation length mismatch".into(),
-        ));
-    }
-    let _quality_mode = cursor.u8()?;
-    let has_ids = flags & 1 != 0;
-    let has_quality = flags & 2 != 0;
-    let mut decoded_streams = Vec::with_capacity(streams);
-    for _ in 0..streams {
-        let clusters = cursor.clusters()?;
-        let reordered = cursor.records(has_ids, has_quality)?;
-        let mut sequences = HashMap::new();
-        for cluster in &clusters {
-            for read in &cluster.reads {
-                sequences.insert(
-                    read.original_id,
-                    crate::reorder::decode_consensus_read(cluster, read)?,
-                );
-            }
-        }
-        if reordered.len() != records {
-            return Err(Error::InvalidFormat("RS3 record count mismatch".into()));
-        }
-        let mut original = vec![None; records];
-        for (position, record) in reordered.into_iter().enumerate() {
-            let original_id = permutation[position] as usize;
-            if original_id >= records || original[original_id].is_some() {
-                return Err(Error::InvalidFormat("invalid RS3 permutation".into()));
-            }
-            let sequence = sequences
-                .remove(&permutation[position])
-                .ok_or_else(|| Error::InvalidFormat("missing RS3 residual".into()))?;
-            original[original_id] = Some(ReadRecord {
-                id: record.record.id,
-                sequence,
-                quality: record.record.quality,
-            });
-        }
-        decoded_streams.push(
-            original
-                .into_iter()
-                .map(|record| {
-                    record.ok_or_else(|| Error::InvalidFormat("incomplete RS3 permutation".into()))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        );
-    }
-    finish_decoding(decoded_streams, options)
-}
-
-fn read_payload_v4(
-    payload: &[u8],
-    streams: usize,
-    flags: u16,
-    options: &DecompressionOptions,
-) -> Result<ArchiveRecords> {
-    let mut cursor = Cursor::new(payload);
-    let records = usize_from(cursor.u64()?, "record count")?;
-    let payload_streams = cursor.u16()? as usize;
-    if streams == 0 || streams != payload_streams {
-        return Err(Error::InvalidFormat("RS3 stream count mismatch".into()));
-    }
-    let _quality_mode = cursor.u8()?;
-    let has_ids = flags & 1 != 0;
-    let has_quality = flags & 2 != 0;
-    let mut decoded_streams = Vec::with_capacity(streams);
-    for _ in 0..streams {
-        let clusters = cursor.clusters_v4()?;
-        let mut metadata = cursor.columnar_records(has_ids, has_quality)?;
-        if metadata.len() != records {
-            return Err(Error::InvalidFormat("RS3 record count mismatch".into()));
-        }
-        let mut seen = vec![false; records];
-        for cluster in &clusters {
-            for read in &cluster.reads {
-                let original_id = usize_from(read.original_id, "original read ID")?;
-                if original_id >= records || seen[original_id] {
-                    return Err(Error::InvalidFormat("invalid RS3 original read ID".into()));
-                }
-                metadata[original_id].sequence =
-                    crate::reorder::decode_consensus_read(cluster, read)?;
-                seen[original_id] = true;
-            }
-        }
-        if seen.iter().any(|seen| !seen) {
-            return Err(Error::InvalidFormat("incomplete RS3 residuals".into()));
-        }
-        decoded_streams.push(metadata);
-    }
-    if cursor.position != payload.len() {
-        return Err(Error::InvalidFormat("trailing RS3 payload data".into()));
-    }
-    finish_decoding(decoded_streams, options)
-}
-
-fn read_payload_v5(
-    payload: &[u8],
-    streams: usize,
-    flags: u16,
-    options: &DecompressionOptions,
-) -> Result<ArchiveRecords> {
-    let mut cursor = Cursor::new(payload);
-    let records = usize_from(cursor.u64()?, "record count")?;
-    let payload_streams = cursor.u16()? as usize;
-    if streams == 0 || streams != payload_streams {
-        return Err(Error::InvalidFormat("RS3 stream count mismatch".into()));
-    }
-    let _quality_mode = cursor.u8()?;
-    let has_ids = flags & 1 != 0;
-    let has_quality = flags & 2 != 0;
-    let mut decoded_streams = Vec::with_capacity(streams);
-    for _ in 0..streams {
-        let clusters = cursor.clusters_v5()?;
-        let mut metadata = cursor.columnar_records(has_ids, has_quality)?;
-        if metadata.len() != records {
-            return Err(Error::InvalidFormat("RS3 record count mismatch".into()));
-        }
-        let mut seen = vec![false; records];
-        for cluster in &clusters {
-            for read in &cluster.reads {
-                let original_id = usize_from(read.original_id, "original read ID")?;
-                if original_id >= records || seen[original_id] {
-                    return Err(Error::InvalidFormat("invalid RS3 original read ID".into()));
-                }
-                metadata[original_id].sequence =
-                    crate::reorder::decode_consensus_read(cluster, read)?;
-                seen[original_id] = true;
-            }
-        }
-        if seen.iter().any(|seen| !seen) {
-            return Err(Error::InvalidFormat("incomplete RS3 residuals".into()));
-        }
-        decoded_streams.push(metadata);
-    }
-    if cursor.position != payload.len() {
-        return Err(Error::InvalidFormat("trailing RS3 payload data".into()));
-    }
-    finish_decoding(decoded_streams, options)
-}
-
-fn read_payload_v6(
-    payload: &[u8],
-    streams: usize,
-    flags: u16,
-    options: &DecompressionOptions,
-) -> Result<ArchiveRecords> {
-    let mut cursor = Cursor::new(payload);
-    let records = usize_from(cursor.u64()?, "record count")?;
-    let payload_streams = cursor.u16()? as usize;
-    if streams == 0 || streams != payload_streams {
-        return Err(Error::InvalidFormat("RS3 stream count mismatch".into()));
-    }
-    let _quality_mode = cursor.u8()?;
-    let id_pattern = PairedIdPattern::try_from(cursor.u8()?)?;
-    let has_ids = flags & 1 != 0;
-    let has_quality = flags & 2 != 0;
-    if id_pattern != PairedIdPattern::Independent && (!has_ids || streams != 2) {
-        return Err(Error::InvalidFormat(
-            "paired ID pattern requires two ID-bearing streams".into(),
-        ));
-    }
-    let mut decoded_streams = Vec::with_capacity(streams);
-    for stream_index in 0..streams {
-        let clusters = cursor.clusters_v5()?;
-        let ids_stored =
-            has_ids && (stream_index == 0 || id_pattern == PairedIdPattern::Independent);
-        let mut metadata = cursor.columnar_records(ids_stored, has_quality)?;
-        if metadata.len() != records {
-            return Err(Error::InvalidFormat("RS3 record count mismatch".into()));
-        }
-        let mut seen = vec![false; records];
-        for cluster in &clusters {
-            for read in &cluster.reads {
-                let original_id = usize_from(read.original_id, "original read ID")?;
-                if original_id >= records || seen[original_id] {
-                    return Err(Error::InvalidFormat("invalid RS3 original read ID".into()));
-                }
-                metadata[original_id].sequence =
-                    crate::reorder::decode_consensus_read(cluster, read)?;
-                seen[original_id] = true;
-            }
-        }
-        if seen.iter().any(|seen| !seen) {
-            return Err(Error::InvalidFormat("incomplete RS3 residuals".into()));
-        }
-        decoded_streams.push(metadata);
-    }
-    if has_ids && id_pattern != PairedIdPattern::Independent {
-        let (first, rest) = decoded_streams.split_at_mut(1);
-        for (first, second) in first[0].iter().zip(&mut rest[0]) {
-            second.id = id_pattern.derive_second(&first.id)?;
-        }
-    }
-    if cursor.position != payload.len() {
-        return Err(Error::InvalidFormat("trailing RS3 payload data".into()));
-    }
-    finish_decoding(decoded_streams, options)
+    read_payload_v7(&payload, streams, flags, options)
 }
 
 fn read_payload_v7(
@@ -358,67 +127,6 @@ fn read_payload_v7(
         }
         let mut seen = vec![false; records];
         for cluster in &clusters {
-            for read in &cluster.reads {
-                let original_id = usize_from(read.original_id, "original read ID")?;
-                if original_id >= records || seen[original_id] {
-                    return Err(Error::InvalidFormat("invalid RS3 original read ID".into()));
-                }
-                metadata[original_id].sequence =
-                    crate::reorder::decode_consensus_read(cluster, read)?;
-                seen[original_id] = true;
-            }
-        }
-        if seen.iter().any(|seen| !seen) {
-            return Err(Error::InvalidFormat("incomplete RS3 residuals".into()));
-        }
-        decoded_streams.push(metadata);
-    }
-    if has_ids && id_pattern != PairedIdPattern::Independent {
-        let (first, rest) = decoded_streams.split_at_mut(1);
-        for (first, second) in first[0].iter().zip(&mut rest[0]) {
-            second.id = id_pattern.derive_second(&first.id)?;
-        }
-    }
-    if cursor.position != payload.len() {
-        return Err(Error::InvalidFormat("trailing RS3 payload data".into()));
-    }
-    finish_decoding(decoded_streams, options)
-}
-
-fn read_payload_v8(
-    payload: &[u8],
-    streams: usize,
-    flags: u16,
-    options: &DecompressionOptions,
-) -> Result<ArchiveRecords> {
-    let mut cursor = Cursor::new(payload);
-    let records = usize_from(cursor.u64()?, "record count")?;
-    let payload_streams = cursor.u16()? as usize;
-    if streams == 0 || streams != payload_streams {
-        return Err(Error::InvalidFormat("RS3 stream count mismatch".into()));
-    }
-    let _quality_mode = cursor.u8()?;
-    let id_pattern = PairedIdPattern::try_from(cursor.u8()?)?;
-    let has_ids = flags & 1 != 0;
-    let has_quality = flags & 2 != 0;
-    if id_pattern != PairedIdPattern::Independent && (!has_ids || streams != 2) {
-        return Err(Error::InvalidFormat(
-            "paired ID pattern requires two ID-bearing streams".into(),
-        ));
-    }
-    let clusters = (0..streams)
-        .map(|_| cursor.clusters_v7())
-        .collect::<Result<Vec<_>>>()?;
-    let mut decoded_streams = Vec::with_capacity(streams);
-    for (stream_index, stream_clusters) in clusters.iter().enumerate() {
-        let ids_stored =
-            has_ids && (stream_index == 0 || id_pattern == PairedIdPattern::Independent);
-        let mut metadata = cursor.columnar_records(ids_stored, has_quality)?;
-        if metadata.len() != records {
-            return Err(Error::InvalidFormat("RS3 record count mismatch".into()));
-        }
-        let mut seen = vec![false; records];
-        for cluster in stream_clusters {
             for read in &cluster.reads {
                 let original_id = usize_from(read.original_id, "original read ID")?;
                 if original_id >= records || seen[original_id] {
@@ -1377,139 +1085,6 @@ impl<'a> Cursor<'a> {
         let length = usize_from(self.u32()? as u64, "field")?;
         Ok(self.take(length)?.to_vec())
     }
-    fn u64_vec(&mut self) -> Result<Vec<u64>> {
-        let length = usize_from(self.u64()?, "permutation")?;
-        (0..length).map(|_| self.u64()).collect()
-    }
-    fn clusters(&mut self) -> Result<Vec<ConsensusCluster>> {
-        let count = self.u32()? as usize;
-        let mut clusters = Vec::with_capacity(count);
-        for _ in 0..count {
-            let reference = self.bytes()?;
-            let reads_count = self.u32()? as usize;
-            let mut reads = Vec::with_capacity(reads_count);
-            for _ in 0..reads_count {
-                let original_id = self.u64()?;
-                let reverse = self.u8()? != 0;
-                let offset = self.u32()?;
-                let length = self.u32()?;
-                let mismatch_count = self.u32()? as usize;
-                let mut mismatches = Vec::with_capacity(mismatch_count);
-                for _ in 0..mismatch_count {
-                    mismatches.push((self.u32()?, self.u8()?));
-                }
-                reads.push(ConsensusRead {
-                    original_id,
-                    offset,
-                    reverse,
-                    length,
-                    mismatches,
-                });
-            }
-            clusters.push(ConsensusCluster { reference, reads });
-        }
-        Ok(clusters)
-    }
-
-    fn clusters_v4(&mut self) -> Result<Vec<ConsensusCluster>> {
-        let count = self.u32()? as usize;
-        let mut clusters = Vec::with_capacity(count);
-        for _ in 0..count {
-            let reference = self.bytes()?;
-            let reads_count = self.u32()? as usize;
-            if reads_count == 0 {
-                return Err(Error::InvalidFormat("empty RS3 consensus cluster".into()));
-            }
-            let singleton = reads_count == 1;
-            let length = u32::try_from(reference.len())
-                .map_err(|_| Error::InvalidFormat("RS3 reference too large".into()))?;
-            let mut reads = Vec::with_capacity(reads_count);
-            let mut previous_id = 0u64;
-            for index in 0..reads_count {
-                let encoded_id = self.varint()?;
-                let original_id = if index == 0 {
-                    encoded_id
-                } else {
-                    decode_zigzag_delta(encoded_id, previous_id)?
-                };
-                previous_id = original_id;
-                let reverse = !singleton && self.u8()? != 0;
-                let mismatch_count = if singleton {
-                    0
-                } else {
-                    usize_from(self.varint()?, "mismatch count")?
-                };
-                let mut mismatches = Vec::with_capacity(mismatch_count);
-                let mut position = 0u32;
-                for _ in 0..mismatch_count {
-                    let delta = u32::try_from(self.varint()?).map_err(|_| {
-                        Error::InvalidFormat("RS3 mismatch position too large".into())
-                    })?;
-                    position = position.checked_add(delta).ok_or_else(|| {
-                        Error::InvalidFormat("RS3 mismatch position overflow".into())
-                    })?;
-                    mismatches.push((position, self.u8()?));
-                }
-                reads.push(ConsensusRead {
-                    original_id,
-                    offset: 0,
-                    reverse,
-                    length,
-                    mismatches,
-                });
-            }
-            clusters.push(ConsensusCluster { reference, reads });
-        }
-        Ok(clusters)
-    }
-
-    fn clusters_v5(&mut self) -> Result<Vec<ConsensusCluster>> {
-        let mut clusters = self.clusters_v4()?;
-        if clusters.iter().any(|cluster| cluster.reads.len() < 2) {
-            return Err(Error::InvalidFormat(
-                "V5 multi-read stream contains a singleton".into(),
-            ));
-        }
-        let singleton_count = self.u32()? as usize;
-        let id_bytes_len = usize_from(self.u64()?, "singleton ID column")?;
-        let id_bytes = self.take(id_bytes_len)?;
-        let mut id_cursor = Cursor::new(id_bytes);
-        let mut singleton_ids = Vec::with_capacity(singleton_count);
-        let mut previous_id = 0u64;
-        for index in 0..singleton_count {
-            let encoded = id_cursor.varint()?;
-            let original_id = if index == 0 {
-                encoded
-            } else {
-                decode_zigzag_delta(encoded, previous_id)?
-            };
-            singleton_ids.push(original_id);
-            previous_id = original_id;
-        }
-        if id_cursor.position != id_bytes.len() {
-            return Err(Error::InvalidFormat(
-                "trailing RS3 singleton ID data".into(),
-            ));
-        }
-        let sequences = self.column(singleton_count, true, "singleton sequence")?;
-        clusters.reserve(singleton_count);
-        for (original_id, reference) in singleton_ids.into_iter().zip(sequences) {
-            let length = u32::try_from(reference.len())
-                .map_err(|_| Error::InvalidFormat("RS3 reference too large".into()))?;
-            clusters.push(ConsensusCluster {
-                reference,
-                reads: vec![ConsensusRead {
-                    original_id,
-                    offset: 0,
-                    reverse: false,
-                    length,
-                    mismatches: Vec::new(),
-                }],
-            });
-        }
-        Ok(clusters)
-    }
-
     fn multi_clusters_v7(&mut self) -> Result<Vec<ConsensusCluster>> {
         let count = self.u32()? as usize;
         let mut clusters = Vec::with_capacity(count);
@@ -1641,24 +1216,6 @@ impl<'a> Cursor<'a> {
         }
         Err(Error::InvalidFormat("unterminated RS3 varint".into()))
     }
-    fn records(&mut self, ids: bool, quality: bool) -> Result<Vec<crate::reorder::OrderedRead>> {
-        let count = self.u32()? as usize;
-        let mut records = Vec::with_capacity(count);
-        for index in 0..count {
-            let id = self.bytes()?;
-            let q = if quality { Some(self.bytes()?) } else { None };
-            records.push(crate::reorder::OrderedRead {
-                original_id: index as u64,
-                record: ReadRecord {
-                    id: if ids { id } else { Vec::new() },
-                    sequence: Vec::new(),
-                    quality: q,
-                },
-            });
-        }
-        Ok(records)
-    }
-
     fn columnar_records(&mut self, ids: bool, quality: bool) -> Result<Vec<ReadRecord>> {
         let count = self.u32()? as usize;
         let id_values = self.column(count, ids, "ID")?;
@@ -1994,87 +1551,6 @@ mod tests {
     }
 
     #[test]
-    fn version_three_archive_remains_decodable() {
-        let mut payload = Vec::new();
-        put_u64_writer(&mut payload, 1).unwrap();
-        put_u16_writer(&mut payload, 1).unwrap();
-        put_u64_writer(&mut payload, 1).unwrap();
-        put_u64_writer(&mut payload, 0).unwrap();
-        payload.push(0);
-        put_u32_writer(&mut payload, 1).unwrap();
-        put_bytes_writer(&mut payload, b"ACGT", true).unwrap();
-        put_u32_writer(&mut payload, 1).unwrap();
-        put_u64_writer(&mut payload, 0).unwrap();
-        payload.push(0);
-        put_u32_writer(&mut payload, 0).unwrap();
-        put_u32_writer(&mut payload, 4).unwrap();
-        put_u32_writer(&mut payload, 0).unwrap();
-        put_u32_writer(&mut payload, 1).unwrap();
-        put_bytes_writer(&mut payload, b"read", true).unwrap();
-        put_bytes_writer(&mut payload, b"IIII", true).unwrap();
-
-        let encoded = zstd::bulk::compress(&payload, 3).unwrap();
-        let mut archive = Vec::new();
-        archive.extend_from_slice(MAGIC);
-        put_u32_writer(&mut archive, VERSION_V3).unwrap();
-        put_u16_writer(&mut archive, 1).unwrap();
-        put_u16_writer(&mut archive, 3).unwrap();
-        put_u64_writer(&mut archive, payload.len() as u64).unwrap();
-        put_u64_writer(&mut archive, encoded.len() as u64).unwrap();
-        put_u32_writer(&mut archive, checksum(&payload)).unwrap();
-        archive.extend_from_slice(&encoded);
-
-        let decoded = crate::decompress(
-            std::io::Cursor::new(archive),
-            &crate::DecompressionOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(decoded.streams[0][0].sequence, b"ACGT");
-        assert_eq!(decoded.streams[0][0].id, b"read");
-    }
-
-    #[test]
-    fn version_four_archive_remains_decodable() {
-        let mut payload = Vec::new();
-        put_u64_writer(&mut payload, 1).unwrap();
-        put_u16_writer(&mut payload, 1).unwrap();
-        payload.push(0);
-        put_u32_writer(&mut payload, 1).unwrap();
-        put_bytes_writer(&mut payload, b"ACGT", true).unwrap();
-        put_u32_writer(&mut payload, 1).unwrap();
-        put_varint(&mut payload, 0).unwrap();
-        put_u32_writer(&mut payload, 1).unwrap();
-        for value in [b"read".as_slice(), b"IIII"] {
-            payload.push(1);
-            put_u32_writer(&mut payload, value.len() as u32).unwrap();
-            put_u64_writer(&mut payload, value.len() as u64).unwrap();
-            payload.extend_from_slice(value);
-        }
-
-        let encoded = zstd::bulk::compress(&payload, 3).unwrap();
-        let mut archive = Vec::new();
-        archive.extend_from_slice(MAGIC);
-        put_u32_writer(&mut archive, VERSION_V4).unwrap();
-        put_u16_writer(&mut archive, 1).unwrap();
-        put_u16_writer(&mut archive, 3).unwrap();
-        put_u64_writer(&mut archive, payload.len() as u64).unwrap();
-        put_u64_writer(&mut archive, encoded.len() as u64).unwrap();
-        put_u32_writer(&mut archive, checksum(&payload)).unwrap();
-        archive.extend_from_slice(&encoded);
-
-        let decoded = crate::decompress(
-            std::io::Cursor::new(archive),
-            &crate::DecompressionOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(decoded.streams[0][0].sequence, b"ACGT");
-        assert_eq!(
-            decoded.streams[0][0].quality.as_deref(),
-            Some(b"IIII".as_slice())
-        );
-    }
-
-    #[test]
     fn record_columns_support_fixed_and_variable_widths() {
         let directory = tempfile::tempdir().unwrap();
         for (name, values) in [
@@ -2134,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn version_five_separates_singleton_clusters() {
+    fn singleton_clusters_are_separated() {
         let clusters = (0..100)
             .map(|original_id| ConsensusCluster {
                 reference: vec![b'A'; 150],

@@ -3,6 +3,7 @@ use crate::external_bytes::{copy_to as copy_external_bytes, Lz4ByteWriter};
 use crate::packed_sequence::PackedSequence;
 #[cfg(test)]
 use crate::record_store::PairStore;
+#[cfg(test)]
 use crate::record_store::StoreStats;
 use crate::reorder::{ConsensusCluster, ConsensusRead};
 use crate::sequence_spool::{SequenceSpoolReader, SequenceSpoolWriter, SortableRead};
@@ -15,6 +16,8 @@ use crossbeam_channel::bounded;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SPRNG-RS3";
 const VERSION: u32 = 7;
@@ -336,6 +339,7 @@ pub(crate) fn write_prepared_profiled<W: Write>(
     payload.write_all(&[id_pattern as u8])?;
 
     let mut assignment_time = std::time::Duration::default();
+    let mut consensus_metrics = ConsensusMetrics::default();
     let payload_start = std::time::Instant::now();
     for (mate, ((spool_path, columns), max_sortable_bytes)) in spool_paths
         .iter()
@@ -378,11 +382,10 @@ pub(crate) fn write_prepared_profiled<W: Write>(
             .sort_by(input, SortableRead::compare)
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
         assignment_time += sort_start.elapsed();
-        let source_error = source_error.borrow_mut().take();
-        if let Some(error) = source_error {
+        if let Some(error) = source_error.borrow_mut().take() {
             return Err(error);
         }
-        write_sorted_clusters(
+        let metrics = write_sorted_clusters(
             &mut payload,
             sorted,
             mate,
@@ -391,6 +394,7 @@ pub(crate) fn write_prepared_profiled<W: Write>(
             temp_dir,
             count,
         )?;
+        consensus_metrics.merge(metrics);
         let ids_stored =
             options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
         write_prepared_record_columns(
@@ -464,6 +468,19 @@ pub(crate) fn write_prepared_profiled<W: Write>(
         assignment_bytes,
         payload_bytes: raw_len,
         archive_bytes: 37 + encoded_len,
+        consensus_producer: consensus_metrics.producer,
+        consensus_producer_wait: consensus_metrics.producer_wait,
+        consensus_workers: consensus_metrics.workers,
+        consensus_writer: consensus_metrics.writer,
+        consensus_writer_active: consensus_metrics.writer_active,
+        consensus_writer_wait: consensus_metrics.writer_wait,
+        consensus_max_pending_buckets: consensus_metrics.max_pending_buckets,
+        consensus_multi_clusters: consensus_metrics.multi_clusters,
+        consensus_singletons: consensus_metrics.singletons,
+        consensus_buckets: consensus_metrics.buckets,
+        consensus_overlap_comparisons: consensus_metrics.overlap_comparisons,
+        consensus_max_bucket_records: consensus_metrics.max_bucket_records,
+        consensus_max_groups: consensus_metrics.max_groups,
         ..CompressionProfile::default()
     };
     Ok((metadata, profile))
@@ -504,50 +521,56 @@ fn write_store_clusters<W: Write>(
         .map(|_| PairStore::open(store.root()))
         .collect::<Result<Vec<_>>>()?;
 
-    let (cluster_count, stats) = std::thread::scope(|scope| -> Result<((u32, u32), StoreStats)> {
-        let producer_errors = done_tx.clone();
-        scope.spawn(move || {
-            let result = produce_consensus_buckets(assignments, limit, permit_rx, job_tx);
-            if let Err(error) = result {
-                let _ = producer_errors.send(Err(error));
-            }
-        });
-
-        for mut worker_store in worker_stores {
-            let job_rx = job_rx.clone();
-            let done_tx = done_tx.clone();
+    let (cluster_count, _pending, stats) =
+        std::thread::scope(|scope| -> Result<((u32, u32), u64, StoreStats)> {
+            let producer_errors = done_tx.clone();
             scope.spawn(move || {
-                while let Ok((index, ids)) = job_rx.recv() {
-                    worker_store.reset_stats();
-                    let result = cluster_bucket(&mut worker_store, mate, reorder.kmer_size, &ids)
-                        .and_then(|clusters| {
-                            let (multi_bytes, multi_cluster_count, singletons) =
-                                partition_clusters_v7(&clusters)?;
-                            Ok(ConsensusBucket {
-                                index,
-                                multi_cluster_count,
-                                multi_bytes,
-                                singletons,
-                                stats: worker_store.stats(),
-                            })
-                        });
-                    if done_tx.send(result).is_err() {
-                        break;
-                    }
+                let result = produce_consensus_buckets(assignments, limit, permit_rx, job_tx);
+                if let Err(error) = result {
+                    let _ = producer_errors.send(Err(error));
                 }
             });
-        }
-        drop(job_rx);
-        drop(done_tx);
 
-        write_consensus_buckets(
-            done_rx,
-            permit_tx,
-            &mut multi_body,
-            &mut singleton_ids,
-            &mut singleton_sequences,
-        )
-    })?;
+            for mut worker_store in worker_stores {
+                let job_rx = job_rx.clone();
+                let done_tx = done_tx.clone();
+                scope.spawn(move || {
+                    while let Ok((index, ids)) = job_rx.recv() {
+                        worker_store.reset_stats();
+                        let result =
+                            cluster_bucket(&mut worker_store, mate, reorder.kmer_size, &ids)
+                                .and_then(|clusters| {
+                                    let (multi_bytes, multi_cluster_count, singletons) =
+                                        partition_clusters_v7(&clusters)?;
+                                    Ok(ConsensusBucket {
+                                        index,
+                                        multi_cluster_count,
+                                        multi_bytes,
+                                        singletons,
+                                        stats: worker_store.stats(),
+                                        overlap_comparisons: 0,
+                                        source_records: ids.len() as u64,
+                                        groups: clusters.len() as u64,
+                                    })
+                                });
+                        if done_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(job_rx);
+            drop(done_tx);
+
+            let result = write_consensus_buckets(
+                done_rx,
+                permit_tx,
+                &mut multi_body,
+                &mut singleton_ids,
+                &mut singleton_sequences,
+            )?;
+            Ok((result.counts, result.max_pending_buckets, result.stats))
+        })?;
     multi_body.flush()?;
     drop(multi_body);
     put_u32_writer(payload, cluster_count.0)?;
@@ -567,8 +590,47 @@ struct ConsensusBucket {
     index: usize,
     multi_cluster_count: u32,
     multi_bytes: Vec<u8>,
-    singletons: Vec<(u64, Vec<u8>)>,
+    singletons: Vec<(u64, PackedSequence)>,
+    #[cfg(test)]
     stats: StoreStats,
+    overlap_comparisons: u64,
+    source_records: u64,
+    groups: u64,
+}
+
+#[derive(Default)]
+struct ConsensusMetrics {
+    producer: std::time::Duration,
+    producer_wait: std::time::Duration,
+    workers: std::time::Duration,
+    writer: std::time::Duration,
+    writer_active: std::time::Duration,
+    writer_wait: std::time::Duration,
+    max_pending_buckets: u64,
+    multi_clusters: u64,
+    singletons: u64,
+    buckets: u64,
+    overlap_comparisons: u64,
+    max_bucket_records: u64,
+    max_groups: u64,
+}
+
+impl ConsensusMetrics {
+    fn merge(&mut self, other: Self) {
+        self.producer += other.producer;
+        self.producer_wait += other.producer_wait;
+        self.workers += other.workers;
+        self.writer += other.writer;
+        self.writer_active += other.writer_active;
+        self.writer_wait += other.writer_wait;
+        self.max_pending_buckets = self.max_pending_buckets.max(other.max_pending_buckets);
+        self.multi_clusters += other.multi_clusters;
+        self.singletons += other.singletons;
+        self.buckets += other.buckets;
+        self.overlap_comparisons += other.overlap_comparisons;
+        self.max_bucket_records = self.max_bucket_records.max(other.max_bucket_records);
+        self.max_groups = self.max_groups.max(other.max_groups);
+    }
 }
 
 #[cfg(test)]
@@ -589,12 +651,12 @@ struct AssignedSequence {
 }
 
 trait SingletonSequenceSink {
-    fn push_sequence(&mut self, sequence: &[u8]) -> Result<()>;
+    fn push_sequence(&mut self, sequence: PackedSequence) -> Result<()>;
 }
 
 impl SingletonSequenceSink for StoredColumn {
-    fn push_sequence(&mut self, sequence: &[u8]) -> Result<()> {
-        self.push(sequence)
+    fn push_sequence(&mut self, sequence: PackedSequence) -> Result<()> {
+        self.push(&sequence.decode())
     }
 }
 
@@ -695,8 +757,7 @@ impl PackedDnaColumnWriter {
 }
 
 impl SingletonSequenceSink for PackedDnaColumnWriter {
-    fn push_sequence(&mut self, sequence: &[u8]) -> Result<()> {
-        let packed = PackedSequence::try_from_bytes(sequence)?;
+    fn push_sequence(&mut self, packed: PackedSequence) -> Result<()> {
         let length = packed.len();
         self.variable_length |= self.common_length.is_some_and(|common| common != length);
         self.common_length.get_or_insert(length);
@@ -743,7 +804,7 @@ fn write_sorted_clusters<W, I, E>(
     threads: usize,
     temp_dir: &Path,
     expected_count: u64,
-) -> Result<()>
+) -> Result<ConsensusMetrics>
 where
     W: Write,
     I: Iterator<Item = std::result::Result<SortableRead, E>> + Send,
@@ -767,49 +828,76 @@ where
             .map_err(|_| Error::InvalidInput("failed to initialize consensus pipeline".into()))?;
     }
 
-    let (cluster_count, _) = std::thread::scope(|scope| -> Result<((u32, u32), StoreStats)> {
-        let producer_errors = done_tx.clone();
-        scope.spawn(move || {
-            let result =
-                produce_sorted_consensus_buckets(sorted, limit, permit_rx, job_tx, expected_count);
-            if let Err(error) = result {
-                let _ = producer_errors.send(Err(error));
-            }
-        });
-
-        for _ in 0..workers {
-            let job_rx = job_rx.clone();
-            let done_tx = done_tx.clone();
+    let worker_nanos = Arc::new(AtomicU64::new(0));
+    let producer_nanos = Arc::new(AtomicU64::new(0));
+    let producer_wait_nanos = Arc::new(AtomicU64::new(0));
+    let (cluster_count, metrics) =
+        std::thread::scope(|scope| -> Result<((u32, u32), ConsensusMetrics)> {
+            let producer_errors = done_tx.clone();
+            let producer_metric = producer_nanos.clone();
+            let producer_wait_metric = producer_wait_nanos.clone();
             scope.spawn(move || {
-                while let Ok((index, reads)) = job_rx.recv() {
-                    let result = cluster_sequences(reorder.kmer_size, reads).and_then(|clusters| {
-                        let (multi_bytes, multi_cluster_count, singletons) =
-                            partition_clusters_v7(&clusters)?;
-                        Ok(ConsensusBucket {
-                            index,
-                            multi_cluster_count,
-                            multi_bytes,
-                            singletons,
-                            stats: StoreStats::default(),
-                        })
-                    });
-                    if done_tx.send(result).is_err() {
-                        break;
-                    }
+                let started = std::time::Instant::now();
+                let result = produce_sorted_consensus_buckets(
+                    sorted,
+                    limit,
+                    permit_rx,
+                    job_tx,
+                    expected_count,
+                    &producer_wait_metric,
+                );
+                producer_metric.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if let Err(error) = result {
+                    let _ = producer_errors.send(Err(error));
                 }
             });
-        }
-        drop(job_rx);
-        drop(done_tx);
 
-        write_consensus_buckets(
-            done_rx,
-            permit_tx,
-            &mut multi_body,
-            &mut singleton_ids,
-            &mut singleton_sequences,
-        )
-    })?;
+            for _ in 0..workers {
+                let job_rx = job_rx.clone();
+                let done_tx = done_tx.clone();
+                let worker_nanos = worker_nanos.clone();
+                scope.spawn(move || {
+                    while let Ok((index, reads)) = job_rx.recv() {
+                        let started = std::time::Instant::now();
+                        let result = process_consensus_bucket(index, reorder.kmer_size, reads);
+                        worker_nanos
+                            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        if done_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(job_rx);
+            drop(done_tx);
+
+            let writer_started = std::time::Instant::now();
+            let result = write_consensus_buckets(
+                done_rx,
+                permit_tx,
+                &mut multi_body,
+                &mut singleton_ids,
+                &mut singleton_sequences,
+            )?;
+            let metrics = ConsensusMetrics {
+                producer: std::time::Duration::from_nanos(producer_nanos.load(Ordering::Relaxed)),
+                producer_wait: std::time::Duration::from_nanos(
+                    producer_wait_nanos.load(Ordering::Relaxed),
+                ),
+                workers: std::time::Duration::from_nanos(worker_nanos.load(Ordering::Relaxed)),
+                writer: writer_started.elapsed(),
+                writer_active: result.writer_active,
+                writer_wait: result.writer_wait,
+                multi_clusters: result.counts.0 as u64,
+                singletons: result.counts.1 as u64,
+                max_pending_buckets: result.max_pending_buckets,
+                buckets: result.buckets,
+                overlap_comparisons: result.overlap_comparisons,
+                max_bucket_records: result.max_bucket_records,
+                max_groups: result.max_groups,
+            };
+            Ok((result.counts, metrics))
+        })?;
     multi_body.flush()?;
     drop(multi_body);
     put_u32_writer(payload, cluster_count.0)?;
@@ -822,7 +910,43 @@ where
     put_u64_writer(payload, singleton_id_bytes)?;
     std::io::copy(&mut singleton_ids, payload)?;
     singleton_sequences.finish_to(payload, cluster_count.1 as usize)?;
-    Ok(())
+    Ok(metrics)
+}
+
+fn process_consensus_bucket(
+    index: usize,
+    kmer_size: usize,
+    mut reads: Vec<AssignedSequence>,
+) -> Result<ConsensusBucket> {
+    let source_records = reads.len() as u64;
+    if reads.len() == 1 {
+        let read = reads.pop().unwrap();
+        return Ok(ConsensusBucket {
+            index,
+            multi_cluster_count: 0,
+            multi_bytes: Vec::new(),
+            singletons: vec![(read.id, PackedSequence::try_from_bytes(&read.sequence)?)],
+            #[cfg(test)]
+            stats: StoreStats::default(),
+            overlap_comparisons: 0,
+            source_records,
+            groups: 1,
+        });
+    }
+    let (clusters, overlap_comparisons) = cluster_sequences_profiled(kmer_size, reads)?;
+    let groups = clusters.len() as u64;
+    let (multi_bytes, multi_cluster_count, singletons) = partition_clusters_v7(&clusters)?;
+    Ok(ConsensusBucket {
+        index,
+        multi_cluster_count,
+        multi_bytes,
+        singletons,
+        #[cfg(test)]
+        stats: StoreStats::default(),
+        overlap_comparisons,
+        source_records,
+        groups,
+    })
 }
 
 fn produce_sorted_consensus_buckets<I, E>(
@@ -831,6 +955,7 @@ fn produce_sorted_consensus_buckets<I, E>(
     permit_rx: crossbeam_channel::Receiver<()>,
     job_tx: crossbeam_channel::Sender<(usize, Vec<AssignedSequence>)>,
     expected_count: u64,
+    wait_nanos: &AtomicU64,
 ) -> Result<()>
 where
     I: Iterator<Item = std::result::Result<SortableRead, E>>,
@@ -857,9 +982,12 @@ where
         id_square_sum += (read.original_id as u128) * (read.original_id as u128);
         id_xor ^= read.original_id;
         if current_hash.is_some_and(|hash| hash != read.hash) || bucket.len() == limit {
+            let wait_started = std::time::Instant::now();
             permit_rx.recv().map_err(|_| {
                 Error::InvalidInput("consensus workers exited before all buckets were sent".into())
             })?;
+            wait_nanos.fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let wait_started = std::time::Instant::now();
             job_tx
                 .send((index, std::mem::take(&mut bucket)))
                 .map_err(|_| {
@@ -867,6 +995,7 @@ where
                         "consensus workers exited before all buckets were sent".into(),
                     )
                 })?;
+            wait_nanos.fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             bucket = Vec::with_capacity(limit);
             index += 1;
         }
@@ -880,12 +1009,16 @@ where
         });
     }
     if !bucket.is_empty() {
+        let wait_started = std::time::Instant::now();
         permit_rx.recv().map_err(|_| {
             Error::InvalidInput("consensus workers exited before all buckets were sent".into())
         })?;
+        wait_nanos.fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let wait_started = std::time::Instant::now();
         job_tx.send((index, bucket)).map_err(|_| {
             Error::InvalidInput("consensus workers exited before all buckets were sent".into())
         })?;
+        wait_nanos.fetch_add(wait_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     if !valid_id_permutation(expected_count, record_count, id_sum, id_square_sum, id_xor) {
         return Err(Error::InvalidFormat(
@@ -975,16 +1108,36 @@ fn write_consensus_buckets<W: Write, S: SingletonSequenceSink>(
     multi_output: &mut W,
     singleton_ids: &mut std::fs::File,
     singleton_sequences: &mut S,
-) -> Result<((u32, u32), StoreStats)> {
+) -> Result<ConsensusWriteResult> {
     let mut pending = BTreeMap::new();
     let mut next_to_write = 0usize;
     let mut multi_cluster_count = 0u32;
     let mut singleton_count = 0u32;
     let mut previous_singleton_id = None;
+    let mut max_pending_buckets = 0u64;
+    #[cfg(test)]
     let mut stats = StoreStats::default();
-    while let Ok(result) = done_rx.recv() {
+    let mut buckets = 0u64;
+    let mut overlap_comparisons = 0u64;
+    let mut max_bucket_records = 0u64;
+    let mut max_groups = 0u64;
+    let mut writer_active = std::time::Duration::default();
+    let mut writer_wait = std::time::Duration::default();
+    loop {
+        let wait_started = std::time::Instant::now();
+        let result = match done_rx.recv() {
+            Ok(result) => result,
+            Err(_) => break,
+        };
+        writer_wait += wait_started.elapsed();
+        let active_started = std::time::Instant::now();
         let bucket = result?;
+        buckets += 1;
+        overlap_comparisons += bucket.overlap_comparisons;
+        max_bucket_records = max_bucket_records.max(bucket.source_records);
+        max_groups = max_groups.max(bucket.groups);
         pending.insert(bucket.index, bucket);
+        max_pending_buckets = max_pending_buckets.max(pending.len() as u64);
         while let Some(bucket) = pending.remove(&next_to_write) {
             multi_output.write_all(&bucket.multi_bytes)?;
             multi_cluster_count = multi_cluster_count
@@ -994,25 +1147,53 @@ fn write_consensus_buckets<W: Write, S: SingletonSequenceSink>(
                 let encoded_id = previous_singleton_id
                     .map_or(original_id, |previous| zigzag_delta(original_id, previous));
                 put_varint(singleton_ids, encoded_id)?;
-                singleton_sequences.push_sequence(&sequence)?;
+                singleton_sequences.push_sequence(sequence)?;
                 previous_singleton_id = Some(original_id);
                 singleton_count = singleton_count
                     .checked_add(1)
                     .ok_or_else(|| Error::InvalidInput("too many consensus clusters".into()))?;
             }
-            stats.index_reads += bucket.stats.index_reads;
-            stats.blob_reads += bucket.stats.blob_reads;
-            stats.bytes_read += bucket.stats.bytes_read;
+            #[cfg(test)]
+            {
+                stats.index_reads += bucket.stats.index_reads;
+                stats.blob_reads += bucket.stats.blob_reads;
+                stats.bytes_read += bucket.stats.bytes_read;
+            }
             let _ = permit_tx.send(());
             next_to_write += 1;
         }
+        writer_active += active_started.elapsed();
     }
     if !pending.is_empty() {
         return Err(Error::InvalidInput(
             "consensus workers exited before all buckets were written".into(),
         ));
     }
-    Ok(((multi_cluster_count, singleton_count), stats))
+    Ok(ConsensusWriteResult {
+        counts: (multi_cluster_count, singleton_count),
+        max_pending_buckets,
+        #[cfg(test)]
+        stats,
+        writer_active,
+        writer_wait,
+        buckets,
+        overlap_comparisons,
+        max_bucket_records,
+        max_groups,
+    })
+}
+
+struct ConsensusWriteResult {
+    counts: (u32, u32),
+    max_pending_buckets: u64,
+    #[cfg(test)]
+    stats: StoreStats,
+    writer_active: std::time::Duration,
+    writer_wait: std::time::Duration,
+    buckets: u64,
+    overlap_comparisons: u64,
+    max_bucket_records: u64,
+    max_groups: u64,
 }
 
 #[derive(Clone)]
@@ -1048,18 +1229,19 @@ fn cluster_bucket(
             sequence: store.read_sequence(assignment.id, mate)?,
         });
     }
-    cluster_sequences(kmer_size, reads)
+    cluster_sequences_profiled(kmer_size, reads).map(|(clusters, _)| clusters)
 }
 
-fn cluster_sequences(
+fn cluster_sequences_profiled(
     kmer_size: usize,
     assignments: Vec<AssignedSequence>,
-) -> Result<Vec<ConsensusCluster>> {
+) -> Result<(Vec<ConsensusCluster>, u64)> {
     let mut groups: Vec<ClusterGroup> = Vec::new();
+    let mut overlap_comparisons = 0u64;
     for assignment in assignments {
         let mut sequence = assignment.sequence;
         if assignment.reverse {
-            sequence = reverse_complement(&sequence);
+            reverse_complement_in_place(&mut sequence);
         }
         let anchor = if assignment.anchored {
             let position = assignment.position as usize;
@@ -1081,6 +1263,7 @@ fn cluster_sequences(
         };
         let mut best = None;
         for (index, group) in groups.iter().enumerate() {
+            overlap_comparisons += 1;
             let offset = group.anchor - anchor;
             let consensus_offset = offset - group.minimum_offset;
             let (overlap, distance) =
@@ -1128,7 +1311,13 @@ fn cluster_sequences(
             }
         }
     }
-    groups.into_iter().map(finish_cluster).collect()
+    Ok((
+        groups
+            .into_iter()
+            .map(finish_cluster)
+            .collect::<Result<Vec<_>>>()?,
+        overlap_comparisons,
+    ))
 }
 
 fn add_cluster_member(group: &mut ClusterGroup, input: ClusterInput) -> Result<()> {
@@ -1144,15 +1333,20 @@ fn add_cluster_member(group: &mut ClusterGroup, input: ClusterInput) -> Result<(
         let mut counts = vec![[0u32; 5]; prefix];
         counts.append(&mut group.counts);
         group.counts = counts;
+        let mut reference = vec![0; prefix];
+        reference.append(&mut group.reference);
+        group.reference = reference;
     }
     group.counts.resize(new_len, [0u32; 5]);
+    group.reference.resize(new_len, b'A');
     let start = usize::try_from(input.offset - new_minimum)
         .map_err(|_| Error::InvalidInput("negative consensus offset".into()))?;
     for (position, &base) in input.sequence.iter().enumerate() {
-        group.counts[start + position][base_index(base)] += 1;
+        let index = start + position;
+        group.counts[index][base_index(base)] += 1;
+        group.reference[index] = consensus_base(&group.counts[index]);
     }
     group.minimum_offset = new_minimum;
-    group.reference = consensus_reference(&group.counts);
     group.members.push(input);
     Ok(())
 }
@@ -1164,27 +1358,27 @@ fn overlap_distance(reference: &[u8], sequence: &[u8], offset: i32) -> (usize, u
         return (0, 0);
     }
     let overlap = (reference.len() - reference_start).min(sequence.len() - sequence_start);
-    let distance = reference[reference_start..reference_start + overlap]
+    let mut distance = 0usize;
+    for (left, right) in reference[reference_start..reference_start + overlap]
         .iter()
         .zip(&sequence[sequence_start..sequence_start + overlap])
-        .filter(|(left, right)| left != right)
-        .count();
+    {
+        distance += (left != right) as usize;
+        if distance > 4 {
+            break;
+        }
+    }
     (overlap, distance)
 }
 
-fn consensus_reference(counts: &[[u32; 5]]) -> Vec<u8> {
-    counts
-        .iter()
-        .map(|count| {
-            let mut best = 0;
-            for index in 1..5 {
-                if count[index] > count[best] {
-                    best = index;
-                }
-            }
-            [b'A', b'C', b'G', b'T', b'N'][best]
-        })
-        .collect()
+fn consensus_base(count: &[u32; 5]) -> u8 {
+    let mut best = 0;
+    for index in 1..5 {
+        if count[index] > count[best] {
+            best = index;
+        }
+    }
+    [b'A', b'C', b'G', b'T', b'N'][best]
 }
 
 fn finish_cluster(mut group: ClusterGroup) -> Result<ConsensusCluster> {
@@ -1238,7 +1432,20 @@ fn reverse_complement(sequence: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-type SingletonSequence = (u64, Vec<u8>);
+fn reverse_complement_in_place(sequence: &mut [u8]) {
+    sequence.reverse();
+    for base in sequence {
+        *base = match *base {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            other => other,
+        };
+    }
+}
+
+type SingletonSequence = (u64, PackedSequence);
 
 fn partition_clusters_v7(
     clusters: &[ConsensusCluster],
@@ -1262,7 +1469,7 @@ fn partition_clusters_v7(
             } else {
                 cluster.reference.clone()
             };
-            singletons.push((read.original_id, sequence));
+            singletons.push((read.original_id, PackedSequence::try_from_bytes(&sequence)?));
         } else {
             put_cluster_bodies_v7(&mut multi_bytes, std::slice::from_ref(cluster))?;
             multi_cluster_count = multi_cluster_count
@@ -1471,6 +1678,49 @@ pub(crate) struct PreparedRecordsBuilder {
     count: u64,
 }
 
+pub(crate) struct PreparedPair {
+    ids: [Vec<u8>; 2],
+    qualities: [Vec<u8>; 2],
+    reads: [SortableRead; 2],
+}
+
+pub(crate) fn prepare_pair(
+    first: ReadRecord,
+    second: ReadRecord,
+    original_id: u64,
+    options: &CompressionOptions,
+) -> Result<PreparedPair> {
+    let records = [first, second];
+    let mut reads = Vec::with_capacity(2);
+    for record in &records {
+        let assignment = crate::reorder::canonical_minimizers(
+            &record.sequence,
+            options.reorder.kmer_size,
+            options.reorder.window_size,
+        )
+        .into_iter()
+        .min_by_key(|(hash, position, reverse)| (*hash, *position, *reverse));
+        let (hash, position, reverse) = assignment.unwrap_or((u64::MAX, 0, false));
+        reads.push(SortableRead {
+            hash,
+            original_id,
+            position,
+            reverse,
+            sequence: PackedSequence::try_from_bytes(&record.sequence)?,
+        });
+    }
+    let [first, second] = records;
+    let [first_read, second_read] = reads.try_into().unwrap();
+    Ok(PreparedPair {
+        ids: [first.id, second.id],
+        qualities: [
+            first.quality.unwrap_or_default(),
+            second.quality.unwrap_or_default(),
+        ],
+        reads: [first_read, second_read],
+    })
+}
+
 pub(crate) struct PreparedRecords {
     columns: [PreparedColumn; 2],
     spool_paths: [std::path::PathBuf; 2],
@@ -1497,6 +1747,7 @@ impl PreparedRecordsBuilder {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn push(
         &mut self,
         first: &ReadRecord,
@@ -1513,43 +1764,38 @@ impl PreparedRecordsBuilder {
                 "short-read consensus supports sequences up to i32::MAX bases".into(),
             ));
         }
+        let prepared = prepare_pair(first.clone(), second.clone(), self.count, options)?;
+        self.push_prepared(prepared, options)
+    }
+
+    pub(crate) fn push_prepared(
+        &mut self,
+        prepared: PreparedPair,
+        options: &CompressionOptions,
+    ) -> Result<()> {
+        let PreparedPair {
+            ids,
+            qualities,
+            reads,
+        } = prepared;
         if options.preserve_ids {
-            let current = PairedIdPattern::detect(&first.id, &second.id);
+            let current = PairedIdPattern::detect(&ids[0], &ids[1]);
             self.id_pattern = Some(match self.id_pattern {
                 None => current,
                 Some(previous) if previous == current => previous,
                 Some(_) => PairedIdPattern::Independent,
             });
-            self.columns[0].ids.push(&first.id)?;
-            self.columns[1].ids.push(&second.id)?;
+            self.columns[0].ids.push(&ids[0])?;
+            self.columns[1].ids.push(&ids[1])?;
         }
         if options.preserve_quality {
-            self.columns[0]
-                .qualities
-                .push(first.quality.as_deref().unwrap_or(&[]))?;
-            self.columns[1]
-                .qualities
-                .push(second.quality.as_deref().unwrap_or(&[]))?;
+            self.columns[0].qualities.push(&qualities[0])?;
+            self.columns[1].qualities.push(&qualities[1])?;
         }
-        for (mate, (spool, record)) in self.spools.iter_mut().zip([first, second]).enumerate() {
-            let assignment = crate::reorder::canonical_minimizers(
-                &record.sequence,
-                options.reorder.kmer_size,
-                options.reorder.window_size,
-            )
-            .into_iter()
-            .min_by_key(|(hash, position, reverse)| (*hash, *position, *reverse));
-            let (hash, position, reverse) = assignment.unwrap_or((u64::MAX, 0, false));
-            let sequence = PackedSequence::try_from_bytes(&record.sequence)?;
+        for (mate, (spool, read)) in self.spools.iter_mut().zip(reads).enumerate() {
             self.max_sortable_bytes[mate] = self.max_sortable_bytes[mate]
-                .max(std::mem::size_of::<SortableRead>() + sequence.encoded_size());
-            spool.push(&SortableRead {
-                hash,
-                original_id: self.count,
-                position,
-                reverse,
-                sequence,
-            })?;
+                .max(std::mem::size_of::<SortableRead>() + read.sequence.encoded_size());
+            spool.push(&read)?;
         }
         self.count = self
             .count
@@ -2326,6 +2572,12 @@ fn decode_zigzag_delta(encoded: u64, previous: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlap_distance_stops_after_rejection_threshold() {
+        assert_eq!(overlap_distance(b"AAAAAAAA", b"AAAACCCC", 0), (8, 4));
+        assert_eq!(overlap_distance(b"AAAAAAAA", b"CCCCCCCC", 0), (8, 5));
+    }
 
     #[test]
     fn validates_complete_sorted_id_permutations() {

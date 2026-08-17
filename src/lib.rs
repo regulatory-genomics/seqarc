@@ -14,6 +14,7 @@ mod record_store;
 pub mod reorder;
 mod sequence_spool;
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::ops::RangeInclusive;
@@ -210,6 +211,19 @@ pub struct CompressionProfile {
     pub assignment_bytes: u64,
     pub payload_bytes: u64,
     pub archive_bytes: u64,
+    pub consensus_producer: Duration,
+    pub consensus_producer_wait: Duration,
+    pub consensus_workers: Duration,
+    pub consensus_writer: Duration,
+    pub consensus_writer_active: Duration,
+    pub consensus_writer_wait: Duration,
+    pub consensus_max_pending_buckets: u64,
+    pub consensus_multi_clusters: u64,
+    pub consensus_singletons: u64,
+    pub consensus_buckets: u64,
+    pub consensus_overlap_comparisons: u64,
+    pub consensus_max_bucket_records: u64,
+    pub consensus_max_groups: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,37 +280,115 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     let mut guard = CompressionGuard::new(create_workspace(temp_root)?, partial_output);
     let temp_dir = guard.workspace().to_path_buf();
     let ingest_start = std::time::Instant::now();
-    let reader_1 = FastxReader::new(
-        BufReader::new(gzip_reader(BufReader::new(File::open(input_1)?))),
-        Format::Fastq,
-    );
-    let reader_2 = FastxReader::new(
-        BufReader::new(gzip_reader(BufReader::new(File::open(input_2)?))),
-        Format::Fastq,
-    );
     let mut prepared = consensus_archive::PreparedRecordsBuilder::create(&temp_dir)?;
-    let mut first = reader_1;
-    let mut second = reader_2;
-    loop {
-        match (first.next(), second.next()) {
-            (None, None) => break,
-            (Some(Ok(mut first)), Some(Ok(mut second))) => {
-                first.validate(true)?;
-                second.validate(true)?;
-                if options.preserve_quality {
-                    apply_quality(&mut first, &options.quality_mode);
-                    apply_quality(&mut second, &options.quality_mode);
+    let input_1 = input_1.as_ref().to_path_buf();
+    let input_2 = input_2.as_ref().to_path_buf();
+    let workers = options.threads.max(1);
+    let queue_capacity = workers.saturating_mul(2).max(1);
+    let (job_tx, job_rx) =
+        crossbeam_channel::bounded::<(usize, Vec<(u64, ReadRecord, ReadRecord)>)>(queue_capacity);
+    let (result_tx, result_rx) = crossbeam_channel::bounded::<
+        Result<(usize, Vec<consensus_archive::PreparedPair>)>,
+    >(queue_capacity);
+    let mut pending = BTreeMap::new();
+    let mut next_batch = 0usize;
+    std::thread::scope(|scope| -> Result<()> {
+        let producer_results = result_tx.clone();
+        let producer_options = options.clone();
+        scope.spawn(move || {
+            let result = (|| -> Result<()> {
+                let first = FastxReader::new(
+                    BufReader::new(gzip_reader(BufReader::new(File::open(input_1)?))),
+                    Format::Fastq,
+                );
+                let second = FastxReader::new(
+                    BufReader::new(gzip_reader(BufReader::new(File::open(input_2)?))),
+                    Format::Fastq,
+                );
+                let mut first = first;
+                let mut second = second;
+                let mut batch = Vec::with_capacity(2048);
+                let mut batch_index = 0usize;
+                let mut original_id = 0u64;
+                loop {
+                    match (first.next(), second.next()) {
+                        (None, None) => break,
+                        (Some(Ok(mut first)), Some(Ok(mut second))) => {
+                            first.validate(true)?;
+                            second.validate(true)?;
+                            if producer_options.preserve_quality {
+                                apply_quality(&mut first, &producer_options.quality_mode);
+                                apply_quality(&mut second, &producer_options.quality_mode);
+                            }
+                            batch.push((original_id, first, second));
+                            original_id += 1;
+                            if batch.len() == 2048 {
+                                job_tx
+                                    .send((batch_index, std::mem::take(&mut batch)))
+                                    .map_err(|_| {
+                                        Error::InvalidInput("preparation workers exited".into())
+                                    })?;
+                                batch_index += 1;
+                                batch = Vec::with_capacity(2048);
+                            }
+                        }
+                        (None, Some(_)) | (Some(_), None) => {
+                            return Err(Error::InvalidInput(
+                                "paired streams have different record counts".into(),
+                            ));
+                        }
+                        (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
+                    }
                 }
-                prepared.push(&first, &second, options)?;
+                if !batch.is_empty() {
+                    job_tx
+                        .send((batch_index, batch))
+                        .map_err(|_| Error::InvalidInput("preparation workers exited".into()))?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = producer_results.send(Err(error));
             }
-            (None, Some(_)) | (Some(_), None) => {
-                return Err(Error::InvalidInput(
-                    "paired streams have different record counts".into(),
-                ));
-            }
-            (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
+        });
+        for _ in 0..workers {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            let worker_options = options.clone();
+            scope.spawn(move || {
+                while let Ok((batch_index, batch)) = job_rx.recv() {
+                    let result = batch
+                        .into_iter()
+                        .map(|(original_id, first, second)| {
+                            consensus_archive::prepare_pair(
+                                first,
+                                second,
+                                original_id,
+                                &worker_options,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                        .map(|pairs| (batch_index, pairs));
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
         }
-    }
+        drop(job_rx);
+        drop(result_tx);
+        while let Ok(result) = result_rx.recv() {
+            let (batch_index, pairs) = result?;
+            pending.insert(batch_index, pairs);
+            while let Some(pairs) = pending.remove(&next_batch) {
+                for pair in pairs {
+                    prepared.push_prepared(pair, options)?;
+                }
+                next_batch += 1;
+            }
+        }
+        Ok(())
+    })?;
     let prepared = prepared.finish()?;
     let ingest = ingest_start.elapsed();
     let archive = File::create(guard.partial_output())?;

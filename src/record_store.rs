@@ -26,6 +26,7 @@ pub struct StoreStats {
     pub bytes_read: u64,
 }
 
+#[cfg(test)]
 pub(crate) struct PairMetadata {
     pub id: Vec<u8>,
     pub quality: Vec<u8>,
@@ -77,6 +78,7 @@ impl PairStore {
         Ok(id)
     }
 
+    #[cfg(test)]
     pub(crate) fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let index = open_blob(&root, "pairs.index")?;
@@ -149,6 +151,7 @@ impl PairStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn read_pair_metadata(
         &mut self,
         pair_id: u64,
@@ -195,6 +198,7 @@ impl PairStore {
         self.stats = StoreStats::default();
     }
 
+    #[cfg(test)]
     pub(crate) fn add_stats(&mut self, stats: StoreStats) {
         self.stats.index_reads += stats.index_reads;
         self.stats.blob_reads += stats.blob_reads;
@@ -228,6 +232,7 @@ fn create_blob(root: &Path, name: &str) -> Result<File> {
         .open(root.join(name))?)
 }
 
+#[cfg(test)]
 fn open_blob(root: &Path, name: &str) -> Result<File> {
     Ok(OpenOptions::new().read(true).open(root.join(name))?)
 }

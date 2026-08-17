@@ -1,10 +1,16 @@
 use crate::codec;
-use crate::record_store::{PairStore, StoreStats};
+use crate::external_bytes::{copy_to as copy_external_bytes, Lz4ByteWriter};
+use crate::packed_sequence::PackedSequence;
+#[cfg(test)]
+use crate::record_store::PairStore;
+use crate::record_store::StoreStats;
 use crate::reorder::{ConsensusCluster, ConsensusRead};
+use crate::sequence_spool::{SequenceSpoolReader, SequenceSpoolWriter, SortableRead};
 use crate::{
     ArchiveRecords, CompressionMetadata, CompressionOptions, CompressionProfile,
     DecompressionOptions, Error, ReadRecord, Result,
 };
+use bed_utils::extsort::{ExternalChunk, ExternalChunkBuilder};
 use crossbeam_channel::bounded;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -178,6 +184,7 @@ fn finish_decoding(
     Ok(ArchiveRecords { streams })
 }
 
+#[cfg(test)]
 pub fn write_reordered_store_profiled<W: Write>(
     store: &mut PairStore,
     mut output: W,
@@ -299,10 +306,174 @@ pub fn write_reordered_store_profiled<W: Write>(
     Ok((metadata, profile))
 }
 
+pub(crate) fn write_prepared_profiled<W: Write>(
+    prepared: PreparedRecords,
+    mut output: W,
+    options: &CompressionOptions,
+    temp_dir: impl AsRef<Path>,
+) -> Result<(CompressionMetadata, CompressionProfile)> {
+    let temp_dir = temp_dir.as_ref();
+    let PreparedRecords {
+        columns,
+        spool_paths,
+        max_sortable_bytes,
+        id_pattern,
+        count,
+    } = prepared;
+    let assignment_bytes = spool_paths.iter().try_fold(0u64, |total, path| {
+        Ok::<_, Error>(total + std::fs::metadata(path)?.len())
+    })?;
+    let payload_path = temp_dir.join("spring-rs3.payload");
+    let mut payload = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&payload_path)?;
+    put_u64_writer(&mut payload, count)?;
+    put_u16_writer(&mut payload, 2)?;
+    payload.write_all(&[1])?;
+    payload.write_all(&[id_pattern as u8])?;
+
+    let mut assignment_time = std::time::Duration::default();
+    let payload_start = std::time::Instant::now();
+    for (mate, ((spool_path, columns), max_sortable_bytes)) in spool_paths
+        .iter()
+        .zip(columns)
+        .zip(max_sortable_bytes)
+        .enumerate()
+    {
+        const SORT_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+        let memory_limited_records = SORT_MEMORY_BYTES / max_sortable_bytes.max(1);
+        let sort_chunk_size = options
+            .reorder
+            .sort_chunk_size
+            .min(memory_limited_records.max(1))
+            .max(1);
+        let sorter = bed_utils::extsort::ExternalSorterBuilder::new()
+            .with_chunk_size(sort_chunk_size)
+            .with_tmp_dir(temp_dir)
+            .with_compression(3)
+            .num_threads(options.reorder.sort_threads.max(1))
+            .build()
+            .map_err(Error::Io)?;
+        let mut reader = SequenceSpoolReader::open(spool_path)?;
+        if reader.record_count() != count {
+            return Err(Error::InvalidFormat(
+                "sequence spool record count mismatch".into(),
+            ));
+        }
+        let source_error = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let input_error = source_error.clone();
+        let input = std::iter::from_fn(move || match reader.next() {
+            Some(Ok(read)) => Some(read),
+            Some(Err(error)) => {
+                *input_error.borrow_mut() = Some(error);
+                None
+            }
+            None => None,
+        });
+        let sort_start = std::time::Instant::now();
+        let sorted = sorter
+            .sort_by(input, SortableRead::compare)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        assignment_time += sort_start.elapsed();
+        let source_error = source_error.borrow_mut().take();
+        if let Some(error) = source_error {
+            return Err(error);
+        }
+        write_sorted_clusters(
+            &mut payload,
+            sorted,
+            mate,
+            &options.reorder,
+            options.threads,
+            temp_dir,
+            count,
+        )?;
+        let ids_stored =
+            options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
+        write_prepared_record_columns(
+            &mut payload,
+            columns,
+            count,
+            ids_stored,
+            options.preserve_quality,
+        )?;
+        std::fs::remove_file(spool_path)?;
+    }
+    payload.flush()?;
+    let raw_len = payload.seek(SeekFrom::End(0))?;
+    payload.seek(SeekFrom::Start(0))?;
+    let payload_time = payload_start.elapsed();
+    let checksum_start = std::time::Instant::now();
+    let checksum = checksum_file(std::fs::File::open(&payload_path)?)?;
+    let checksum_time = checksum_start.elapsed();
+    let encoded_path = temp_dir.join("spring-rs3.payload.zst");
+    let encoded_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(&encoded_path)?;
+    let zstd_start = std::time::Instant::now();
+    let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
+    encoder.multithread(worker_count(options.threads)?)?;
+    if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
+        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
+            LONG_DISTANCE_WINDOW_LOG,
+        ))?;
+        encoder.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+            true,
+        ))?;
+    }
+    encoder.set_pledged_src_size(Some(raw_len))?;
+    let mut transfer_buffer = vec![0; 16 * 1024 * 1024];
+    loop {
+        let bytes_read = payload.read(&mut transfer_buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        encoder.write_all(&transfer_buffer[..bytes_read])?;
+    }
+    let mut encoded_file = encoder.finish()?;
+    encoded_file.flush()?;
+    let encoded_len = encoded_file.seek(SeekFrom::End(0))?;
+    let zstd_time = zstd_start.elapsed();
+    encoded_file.seek(SeekFrom::Start(0))?;
+    output.write_all(MAGIC)?;
+    put_u32_writer(&mut output, VERSION)?;
+    put_u16_writer(&mut output, 2)?;
+    put_u16_writer(&mut output, flags(options))?;
+    put_u64_writer(&mut output, raw_len)?;
+    put_u64_writer(&mut output, encoded_len)?;
+    put_u32_writer(&mut output, checksum)?;
+    std::io::copy(&mut encoded_file, &mut output)?;
+    let metadata = CompressionMetadata {
+        streams: 2,
+        records: count,
+        preserved_ids: options.preserve_ids,
+        preserved_quality: options.preserve_quality,
+        preserved_order: true,
+    };
+    let profile = CompressionProfile {
+        assignments: assignment_time,
+        consensus_and_payload: payload_time.saturating_sub(assignment_time),
+        checksum: checksum_time,
+        zstd: zstd_time,
+        assignment_bytes,
+        payload_bytes: raw_len,
+        archive_bytes: 37 + encoded_len,
+        ..CompressionProfile::default()
+    };
+    Ok((metadata, profile))
+}
+
 fn worker_count(workers: usize) -> Result<u32> {
     u32::try_from(workers).map_err(|_| Error::InvalidInput("thread count exceeds u32".into()))
 }
 
+#[cfg(test)]
 fn write_store_clusters<W: Write>(
     payload: &mut W,
     store: &PairStore,
@@ -400,6 +571,7 @@ struct ConsensusBucket {
     stats: StoreStats,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct AssignedRead {
     id: u64,
@@ -408,6 +580,351 @@ struct AssignedRead {
     anchored: bool,
 }
 
+struct AssignedSequence {
+    id: u64,
+    position: u32,
+    reverse: bool,
+    anchored: bool,
+    sequence: Vec<u8>,
+}
+
+trait SingletonSequenceSink {
+    fn push_sequence(&mut self, sequence: &[u8]) -> Result<()>;
+}
+
+impl SingletonSequenceSink for StoredColumn {
+    fn push_sequence(&mut self, sequence: &[u8]) -> Result<()> {
+        self.push(sequence)
+    }
+}
+
+struct PackedDnaColumnWriter {
+    path: std::path::PathBuf,
+    builder: ExternalChunkBuilder<PackedSequence>,
+    count: usize,
+    common_length: Option<u32>,
+    variable_length: bool,
+    data_len: u64,
+    clean_records: usize,
+}
+
+impl PackedDnaColumnWriter {
+    fn create(temp_dir: &Path, mate: usize) -> Result<Self> {
+        let path = temp_dir.join(format!("records.{mate}.singleton-dna.lz4"));
+        let builder = ExternalChunkBuilder::new(std::fs::File::create(&path)?, 1)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        Ok(Self {
+            path,
+            builder,
+            count: 0,
+            common_length: None,
+            variable_length: false,
+            data_len: 0,
+            clean_records: 0,
+        })
+    }
+
+    fn finish_to<W: Write>(self, payload: &mut W, expected_count: usize) -> Result<()> {
+        let PackedDnaColumnWriter {
+            path,
+            builder,
+            count,
+            common_length,
+            variable_length,
+            data_len,
+            clean_records,
+        } = self;
+        if count != expected_count {
+            return Err(Error::InvalidInput(
+                "singleton sequence count mismatch".into(),
+            ));
+        }
+        let chunk = builder
+            .finish()
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        drop(chunk);
+        if variable_length {
+            payload.write_all(&[2])?;
+            put_u64_writer(payload, data_len)?;
+            for_each_packed_sequence(&path, count, |sequence| {
+                put_u32_writer(payload, sequence.len())
+            })?;
+            for_each_packed_sequence(&path, count, |sequence| {
+                payload.write_all(&sequence.decode())?;
+                Ok(())
+            })?;
+        } else {
+            let width = common_length.unwrap_or(0) as usize;
+            let packed_width = width.div_ceil(4);
+            let clean = clean_records == count;
+            if clean {
+                payload.write_all(&[4])?;
+                put_u32_writer(payload, width as u32)?;
+                let packed_len = (packed_width as u64)
+                    .checked_mul(count as u64)
+                    .ok_or_else(|| Error::InvalidInput("packed DNA column too large".into()))?;
+                put_u64_writer(payload, packed_len)?;
+            } else {
+                let ambiguous = count - clean_records;
+                let encoded_len =
+                    count
+                        .checked_add(clean_records.checked_mul(packed_width).ok_or_else(|| {
+                            Error::InvalidInput("mixed DNA column too large".into())
+                        })?)
+                        .and_then(|length| length.checked_add(ambiguous.checked_mul(width)?))
+                        .ok_or_else(|| Error::InvalidInput("mixed DNA column too large".into()))?;
+                payload.write_all(&[5])?;
+                put_u32_writer(payload, width as u32)?;
+                put_u64_writer(payload, encoded_len as u64)?;
+            }
+            for_each_packed_sequence(&path, count, |sequence| {
+                if !clean {
+                    payload.write_all(&[(!sequence.is_packed()) as u8])?;
+                }
+                if sequence.is_packed() {
+                    payload.write_all(sequence.encoded_bytes())?;
+                } else {
+                    payload.write_all(&sequence.decode())?;
+                }
+                Ok(())
+            })?;
+        }
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+}
+
+impl SingletonSequenceSink for PackedDnaColumnWriter {
+    fn push_sequence(&mut self, sequence: &[u8]) -> Result<()> {
+        let packed = PackedSequence::try_from_bytes(sequence)?;
+        let length = packed.len();
+        self.variable_length |= self.common_length.is_some_and(|common| common != length);
+        self.common_length.get_or_insert(length);
+        self.data_len = self
+            .data_len
+            .checked_add(length as u64)
+            .ok_or_else(|| Error::InvalidInput("singleton sequence column too large".into()))?;
+        self.clean_records += packed.is_packed() as usize;
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("too many singleton sequences".into()))?;
+        self.builder
+            .add(packed)
+            .map_err(|error| Error::InvalidInput(error.to_string()))
+    }
+}
+
+fn for_each_packed_sequence<F>(path: &Path, expected_count: usize, mut visit: F) -> Result<()>
+where
+    F: FnMut(PackedSequence) -> Result<()>,
+{
+    let chunk = ExternalChunk::<PackedSequence>::open(std::fs::File::open(path)?)
+        .map_err(|error| Error::InvalidFormat(error.to_string()))?;
+    let mut count = 0usize;
+    for sequence in chunk {
+        let sequence = sequence.map_err(|error| Error::InvalidFormat(error.to_string()))?;
+        visit(sequence)?;
+        count += 1;
+    }
+    if count != expected_count {
+        return Err(Error::InvalidFormat(
+            "singleton sequence chunk count mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_sorted_clusters<W, I, E>(
+    payload: &mut W,
+    sorted: I,
+    mate: usize,
+    reorder: &crate::ReorderOptions,
+    threads: usize,
+    temp_dir: &Path,
+    expected_count: u64,
+) -> Result<()>
+where
+    W: Write,
+    I: Iterator<Item = std::result::Result<SortableRead, E>> + Send,
+    E: std::fmt::Display + Send,
+{
+    let limit = reorder.max_bucket_records.max(1);
+    let body_path = temp_dir.join(format!("clusters.{mate}.multi.body"));
+    let mut multi_body = std::fs::File::create(&body_path)?;
+    let singleton_ids_path = temp_dir.join(format!("clusters.{mate}.singleton.ids"));
+    let mut singleton_ids = create_temporary_column(&singleton_ids_path)?;
+    let mut singleton_sequences = PackedDnaColumnWriter::create(temp_dir, mate)?;
+    let workers = threads.max(1);
+    let queue_capacity = workers.div_ceil(2).max(1);
+    let in_flight = workers + queue_capacity;
+    let (job_tx, job_rx) = bounded::<(usize, Vec<AssignedSequence>)>(queue_capacity);
+    let (done_tx, done_rx) = bounded::<Result<ConsensusBucket>>(queue_capacity);
+    let (permit_tx, permit_rx) = bounded::<()>(in_flight);
+    for _ in 0..in_flight {
+        permit_tx
+            .send(())
+            .map_err(|_| Error::InvalidInput("failed to initialize consensus pipeline".into()))?;
+    }
+
+    let (cluster_count, _) = std::thread::scope(|scope| -> Result<((u32, u32), StoreStats)> {
+        let producer_errors = done_tx.clone();
+        scope.spawn(move || {
+            let result =
+                produce_sorted_consensus_buckets(sorted, limit, permit_rx, job_tx, expected_count);
+            if let Err(error) = result {
+                let _ = producer_errors.send(Err(error));
+            }
+        });
+
+        for _ in 0..workers {
+            let job_rx = job_rx.clone();
+            let done_tx = done_tx.clone();
+            scope.spawn(move || {
+                while let Ok((index, reads)) = job_rx.recv() {
+                    let result = cluster_sequences(reorder.kmer_size, reads).and_then(|clusters| {
+                        let (multi_bytes, multi_cluster_count, singletons) =
+                            partition_clusters_v7(&clusters)?;
+                        Ok(ConsensusBucket {
+                            index,
+                            multi_cluster_count,
+                            multi_bytes,
+                            singletons,
+                            stats: StoreStats::default(),
+                        })
+                    });
+                    if done_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(job_rx);
+        drop(done_tx);
+
+        write_consensus_buckets(
+            done_rx,
+            permit_tx,
+            &mut multi_body,
+            &mut singleton_ids,
+            &mut singleton_sequences,
+        )
+    })?;
+    multi_body.flush()?;
+    drop(multi_body);
+    put_u32_writer(payload, cluster_count.0)?;
+    let mut multi_body = std::fs::File::open(body_path)?;
+    std::io::copy(&mut multi_body, payload)?;
+    put_u32_writer(payload, cluster_count.1)?;
+    singleton_ids.flush()?;
+    let singleton_id_bytes = singleton_ids.seek(SeekFrom::End(0))?;
+    singleton_ids.seek(SeekFrom::Start(0))?;
+    put_u64_writer(payload, singleton_id_bytes)?;
+    std::io::copy(&mut singleton_ids, payload)?;
+    singleton_sequences.finish_to(payload, cluster_count.1 as usize)?;
+    Ok(())
+}
+
+fn produce_sorted_consensus_buckets<I, E>(
+    sorted: I,
+    limit: usize,
+    permit_rx: crossbeam_channel::Receiver<()>,
+    job_tx: crossbeam_channel::Sender<(usize, Vec<AssignedSequence>)>,
+    expected_count: u64,
+) -> Result<()>
+where
+    I: Iterator<Item = std::result::Result<SortableRead, E>>,
+    E: std::fmt::Display,
+{
+    let mut bucket = Vec::with_capacity(limit);
+    let mut current_hash = None;
+    let mut index = 0usize;
+    let mut record_count = 0u64;
+    let mut id_sum = 0u128;
+    let mut id_square_sum = 0u128;
+    let mut id_xor = 0u64;
+    for read in sorted {
+        let read = read.map_err(|error| {
+            Error::InvalidInput(format!("cannot read sorted sequence spool: {error}"))
+        })?;
+        if read.original_id >= expected_count {
+            return Err(Error::InvalidFormat(
+                "sorted sequence spool contains an out-of-range ID".into(),
+            ));
+        }
+        record_count += 1;
+        id_sum += read.original_id as u128;
+        id_square_sum += (read.original_id as u128) * (read.original_id as u128);
+        id_xor ^= read.original_id;
+        if current_hash.is_some_and(|hash| hash != read.hash) || bucket.len() == limit {
+            permit_rx.recv().map_err(|_| {
+                Error::InvalidInput("consensus workers exited before all buckets were sent".into())
+            })?;
+            job_tx
+                .send((index, std::mem::take(&mut bucket)))
+                .map_err(|_| {
+                    Error::InvalidInput(
+                        "consensus workers exited before all buckets were sent".into(),
+                    )
+                })?;
+            bucket = Vec::with_capacity(limit);
+            index += 1;
+        }
+        current_hash = Some(read.hash);
+        bucket.push(AssignedSequence {
+            id: read.original_id,
+            position: read.position,
+            reverse: read.reverse,
+            anchored: read.hash != u64::MAX,
+            sequence: read.sequence.decode(),
+        });
+    }
+    if !bucket.is_empty() {
+        permit_rx.recv().map_err(|_| {
+            Error::InvalidInput("consensus workers exited before all buckets were sent".into())
+        })?;
+        job_tx.send((index, bucket)).map_err(|_| {
+            Error::InvalidInput("consensus workers exited before all buckets were sent".into())
+        })?;
+    }
+    if !valid_id_permutation(expected_count, record_count, id_sum, id_square_sum, id_xor) {
+        return Err(Error::InvalidFormat(
+            "sorted sequence spool is not a complete ID permutation".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_id_permutation(
+    expected_count: u64,
+    record_count: u64,
+    id_sum: u128,
+    id_square_sum: u128,
+    id_xor: u64,
+) -> bool {
+    let n = expected_count as u128;
+    let expected_sum = n * n.saturating_sub(1) / 2;
+    let expected_square_sum = if n == 0 {
+        0
+    } else {
+        n * (n - 1) * (2 * n - 1) / 6
+    };
+    record_count == expected_count
+        && id_sum == expected_sum
+        && id_square_sum == expected_square_sum
+        && id_xor == xor_zero_to(expected_count.saturating_sub(1))
+}
+
+fn xor_zero_to(value: u64) -> u64 {
+    match value % 4 {
+        0 => value,
+        1 => 1,
+        2 => value + 1,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
 fn produce_consensus_buckets(
     assignments: &Path,
     limit: usize,
@@ -452,12 +969,12 @@ fn produce_consensus_buckets(
     Ok(())
 }
 
-fn write_consensus_buckets<W: Write>(
+fn write_consensus_buckets<W: Write, S: SingletonSequenceSink>(
     done_rx: crossbeam_channel::Receiver<Result<ConsensusBucket>>,
     permit_tx: crossbeam_channel::Sender<()>,
     multi_output: &mut W,
     singleton_ids: &mut std::fs::File,
-    singleton_sequences: &mut StoredColumn,
+    singleton_sequences: &mut S,
 ) -> Result<((u32, u32), StoreStats)> {
     let mut pending = BTreeMap::new();
     let mut next_to_write = 0usize;
@@ -477,7 +994,7 @@ fn write_consensus_buckets<W: Write>(
                 let encoded_id = previous_singleton_id
                     .map_or(original_id, |previous| zigzag_delta(original_id, previous));
                 put_varint(singleton_ids, encoded_id)?;
-                singleton_sequences.push(&sequence)?;
+                singleton_sequences.push_sequence(&sequence)?;
                 previous_singleton_id = Some(original_id);
                 singleton_count = singleton_count
                     .checked_add(1)
@@ -510,18 +1027,37 @@ struct ClusterGroup {
     anchor: i32,
     minimum_offset: i32,
     reference: Vec<u8>,
+    counts: Vec<[u32; 5]>,
     members: Vec<ClusterInput>,
 }
 
+#[cfg(test)]
 fn cluster_bucket(
     store: &mut PairStore,
     mate: usize,
     kmer_size: usize,
     assignments: &[AssignedRead],
 ) -> Result<Vec<ConsensusCluster>> {
+    let mut reads = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        reads.push(AssignedSequence {
+            id: assignment.id,
+            position: assignment.position,
+            reverse: assignment.reverse,
+            anchored: assignment.anchored,
+            sequence: store.read_sequence(assignment.id, mate)?,
+        });
+    }
+    cluster_sequences(kmer_size, reads)
+}
+
+fn cluster_sequences(
+    kmer_size: usize,
+    assignments: Vec<AssignedSequence>,
+) -> Result<Vec<ConsensusCluster>> {
     let mut groups: Vec<ClusterGroup> = Vec::new();
     for assignment in assignments {
-        let mut sequence = store.read_sequence(assignment.id, mate)?;
+        let mut sequence = assignment.sequence;
         if assignment.reverse {
             sequence = reverse_complement(&sequence);
         }
@@ -558,25 +1094,30 @@ fn cluster_bucket(
         match best {
             Some((index, offset)) => {
                 let group = &mut groups[index];
-                group.members.push(ClusterInput {
-                    id: assignment.id,
-                    sequence,
-                    reverse: assignment.reverse,
-                    offset,
-                });
-                group.minimum_offset = group
-                    .members
-                    .iter()
-                    .map(|input| input.offset)
-                    .min()
-                    .unwrap_or(0);
-                group.reference = finish_cluster(group.members.clone())?.reference;
+                add_cluster_member(
+                    group,
+                    ClusterInput {
+                        id: assignment.id,
+                        sequence,
+                        reverse: assignment.reverse,
+                        offset,
+                    },
+                )?;
             }
             None => {
+                let counts = sequence
+                    .iter()
+                    .map(|&base| {
+                        let mut count = [0u32; 5];
+                        count[base_index(base)] = 1;
+                        count
+                    })
+                    .collect();
                 groups.push(ClusterGroup {
                     anchor,
                     minimum_offset: 0,
                     reference: sequence.clone(),
+                    counts,
                     members: vec![ClusterInput {
                         id: assignment.id,
                         sequence,
@@ -587,10 +1128,33 @@ fn cluster_bucket(
             }
         }
     }
-    groups
-        .into_iter()
-        .map(|group| finish_cluster(group.members))
-        .collect()
+    groups.into_iter().map(finish_cluster).collect()
+}
+
+fn add_cluster_member(group: &mut ClusterGroup, input: ClusterInput) -> Result<()> {
+    let old_minimum = group.minimum_offset;
+    let old_end = old_minimum as i64 + group.counts.len() as i64;
+    let new_minimum = old_minimum.min(input.offset);
+    let new_end = old_end.max(input.offset as i64 + input.sequence.len() as i64);
+    let new_len = usize::try_from(new_end - new_minimum as i64)
+        .map_err(|_| Error::InvalidInput("consensus reference too large".into()))?;
+    if new_minimum < old_minimum {
+        let prefix = usize::try_from(old_minimum - new_minimum)
+            .map_err(|_| Error::InvalidInput("consensus offset too large".into()))?;
+        let mut counts = vec![[0u32; 5]; prefix];
+        counts.append(&mut group.counts);
+        group.counts = counts;
+    }
+    group.counts.resize(new_len, [0u32; 5]);
+    let start = usize::try_from(input.offset - new_minimum)
+        .map_err(|_| Error::InvalidInput("negative consensus offset".into()))?;
+    for (position, &base) in input.sequence.iter().enumerate() {
+        group.counts[start + position][base_index(base)] += 1;
+    }
+    group.minimum_offset = new_minimum;
+    group.reference = consensus_reference(&group.counts);
+    group.members.push(input);
+    Ok(())
 }
 
 fn overlap_distance(reference: &[u8], sequence: &[u8], offset: i32) -> (usize, usize) {
@@ -608,25 +1172,9 @@ fn overlap_distance(reference: &[u8], sequence: &[u8], offset: i32) -> (usize, u
     (overlap, distance)
 }
 
-fn finish_cluster(mut group: Vec<ClusterInput>) -> Result<ConsensusCluster> {
-    let minimum_offset = group.iter().map(|input| input.offset).min().unwrap_or(0);
-    let maximum_end = group
+fn consensus_reference(counts: &[[u32; 5]]) -> Vec<u8> {
+    counts
         .iter()
-        .map(|input| input.offset as i64 + input.sequence.len() as i64)
-        .max()
-        .unwrap_or(0);
-    let reference_len = usize::try_from(maximum_end - minimum_offset as i64)
-        .map_err(|_| Error::InvalidInput("consensus reference too large".into()))?;
-    let mut counts = vec![[0u32; 5]; reference_len];
-    for input in &group {
-        let start = usize::try_from(input.offset - minimum_offset)
-            .map_err(|_| Error::InvalidInput("negative consensus offset".into()))?;
-        for (position, &base) in input.sequence.iter().enumerate() {
-            counts[start + position][base_index(base)] += 1;
-        }
-    }
-    let reference: Vec<u8> = counts
-        .into_iter()
         .map(|count| {
             let mut best = 0;
             for index in 1..5 {
@@ -636,12 +1184,15 @@ fn finish_cluster(mut group: Vec<ClusterInput>) -> Result<ConsensusCluster> {
             }
             [b'A', b'C', b'G', b'T', b'N'][best]
         })
-        .collect();
-    let mut reads = Vec::with_capacity(group.len());
-    for input in &mut group {
-        let offset = usize::try_from(input.offset - minimum_offset)
+        .collect()
+}
+
+fn finish_cluster(mut group: ClusterGroup) -> Result<ConsensusCluster> {
+    let mut reads = Vec::with_capacity(group.members.len());
+    for input in &mut group.members {
+        let offset = usize::try_from(input.offset - group.minimum_offset)
             .map_err(|_| Error::InvalidInput("negative consensus offset".into()))?;
-        let mismatches = reference[offset..offset + input.sequence.len()]
+        let mismatches = group.reference[offset..offset + input.sequence.len()]
             .iter()
             .zip(&input.sequence)
             .enumerate()
@@ -659,7 +1210,10 @@ fn finish_cluster(mut group: Vec<ClusterInput>) -> Result<ConsensusCluster> {
             mismatches,
         });
     }
-    Ok(ConsensusCluster { reference, reads })
+    Ok(ConsensusCluster {
+        reference: group.reference,
+        reads,
+    })
 }
 fn base_index(base: u8) -> usize {
     match base {
@@ -804,11 +1358,102 @@ fn put_varint<W: Write>(writer: &mut W, mut value: u64) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 struct RecordColumns {
     ids: StoredColumn,
     qualities: StoredColumn,
 }
 
+struct PreparedColumnBuilder {
+    ids: StoredColumn,
+    qualities: PreparedQualityWriter,
+}
+
+struct PreparedColumn {
+    ids: StoredColumn,
+    qualities: PreparedQuality,
+}
+
+struct PreparedQualityWriter {
+    output: Lz4ByteWriter,
+    values: Vec<Vec<u8>>,
+    width: Option<usize>,
+    block_count: u32,
+}
+
+struct PreparedQuality {
+    path: std::path::PathBuf,
+    block_count: u32,
+}
+
+impl PreparedColumnBuilder {
+    fn create(temp_dir: &Path, mate: usize) -> Result<Self> {
+        Ok(Self {
+            ids: StoredColumn::create(temp_dir, mate, "ids")?,
+            qualities: PreparedQualityWriter::create(temp_dir, mate)?,
+        })
+    }
+
+    fn finish(self) -> Result<PreparedColumn> {
+        Ok(PreparedColumn {
+            ids: self.ids,
+            qualities: self.qualities.finish()?,
+        })
+    }
+}
+
+impl PreparedQualityWriter {
+    const BLOCK_RECORDS: usize = 65_536;
+
+    fn create(temp_dir: &Path, mate: usize) -> Result<Self> {
+        Ok(Self {
+            output: Lz4ByteWriter::create(
+                temp_dir.join(format!("records.{mate}.quality-blocks.lz4")),
+                1,
+            )?,
+            values: Vec::with_capacity(Self::BLOCK_RECORDS),
+            width: None,
+            block_count: 0,
+        })
+    }
+
+    fn push(&mut self, quality: &[u8]) -> Result<()> {
+        if !self.values.is_empty()
+            && (self.values.len() == Self::BLOCK_RECORDS
+                || self.width.is_some_and(|width| width != quality.len()))
+        {
+            self.flush_block()?;
+        }
+        self.values.push(quality.to_vec());
+        self.width = Some(quality.len());
+        Ok(())
+    }
+
+    fn flush_block(&mut self) -> Result<()> {
+        if self.values.is_empty() {
+            return Ok(());
+        }
+        self.output
+            .write_all(&crate::quality_blocks::encode_block_bytes(&self.values)?)?;
+        self.block_count = self
+            .block_count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("too many quality blocks".into()))?;
+        self.values.clear();
+        self.width = None;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<PreparedQuality> {
+        self.flush_block()?;
+        Ok(PreparedQuality {
+            path: self.output.finish()?,
+            block_count: self.block_count,
+        })
+    }
+}
+
+#[cfg(test)]
 impl RecordColumns {
     fn create(temp_dir: &Path, mate: usize) -> Result<Self> {
         Ok(Self {
@@ -818,6 +1463,115 @@ impl RecordColumns {
     }
 }
 
+pub(crate) struct PreparedRecordsBuilder {
+    columns: [PreparedColumnBuilder; 2],
+    spools: [SequenceSpoolWriter; 2],
+    id_pattern: Option<PairedIdPattern>,
+    max_sortable_bytes: [usize; 2],
+    count: u64,
+}
+
+pub(crate) struct PreparedRecords {
+    columns: [PreparedColumn; 2],
+    spool_paths: [std::path::PathBuf; 2],
+    max_sortable_bytes: [usize; 2],
+    id_pattern: PairedIdPattern,
+    count: u64,
+}
+
+impl PreparedRecordsBuilder {
+    pub(crate) fn create(temp_dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(temp_dir)?;
+        Ok(Self {
+            columns: [
+                PreparedColumnBuilder::create(temp_dir, 0)?,
+                PreparedColumnBuilder::create(temp_dir, 1)?,
+            ],
+            spools: [
+                SequenceSpoolWriter::create(temp_dir.join("sequences.0.spool"))?,
+                SequenceSpoolWriter::create(temp_dir.join("sequences.1.spool"))?,
+            ],
+            id_pattern: None,
+            max_sortable_bytes: [0; 2],
+            count: 0,
+        })
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        first: &ReadRecord,
+        second: &ReadRecord,
+        options: &CompressionOptions,
+    ) -> Result<()> {
+        if self.count == u32::MAX as u64 {
+            return Err(Error::InvalidInput(
+                "RS3 supports at most u32::MAX paired records".into(),
+            ));
+        }
+        if first.sequence.len() > i32::MAX as usize || second.sequence.len() > i32::MAX as usize {
+            return Err(Error::InvalidInput(
+                "short-read consensus supports sequences up to i32::MAX bases".into(),
+            ));
+        }
+        if options.preserve_ids {
+            let current = PairedIdPattern::detect(&first.id, &second.id);
+            self.id_pattern = Some(match self.id_pattern {
+                None => current,
+                Some(previous) if previous == current => previous,
+                Some(_) => PairedIdPattern::Independent,
+            });
+            self.columns[0].ids.push(&first.id)?;
+            self.columns[1].ids.push(&second.id)?;
+        }
+        if options.preserve_quality {
+            self.columns[0]
+                .qualities
+                .push(first.quality.as_deref().unwrap_or(&[]))?;
+            self.columns[1]
+                .qualities
+                .push(second.quality.as_deref().unwrap_or(&[]))?;
+        }
+        for (mate, (spool, record)) in self.spools.iter_mut().zip([first, second]).enumerate() {
+            let assignment = crate::reorder::canonical_minimizers(
+                &record.sequence,
+                options.reorder.kmer_size,
+                options.reorder.window_size,
+            )
+            .into_iter()
+            .min_by_key(|(hash, position, reverse)| (*hash, *position, *reverse));
+            let (hash, position, reverse) = assignment.unwrap_or((u64::MAX, 0, false));
+            let sequence = PackedSequence::try_from_bytes(&record.sequence)?;
+            self.max_sortable_bytes[mate] = self.max_sortable_bytes[mate]
+                .max(std::mem::size_of::<SortableRead>() + sequence.encoded_size());
+            spool.push(&SortableRead {
+                hash,
+                original_id: self.count,
+                position,
+                reverse,
+                sequence,
+            })?;
+        }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("too many paired records".into()))?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<PreparedRecords> {
+        let [first, second] = self.spools;
+        let [first_columns, second_columns] = self.columns;
+        Ok(PreparedRecords {
+            columns: [first_columns.finish()?, second_columns.finish()?],
+            spool_paths: [first.finish()?, second.finish()?],
+            max_sortable_bytes: self.max_sortable_bytes,
+            id_pattern: self.id_pattern.unwrap_or(PairedIdPattern::Independent),
+            count: self.count,
+        })
+    }
+}
+
+#[cfg(test)]
 fn build_store_record_columns(
     store: &mut PairStore,
     options: &CompressionOptions,
@@ -849,6 +1603,7 @@ fn build_store_record_columns(
     Ok((columns, id_pattern.unwrap_or(PairedIdPattern::Independent)))
 }
 
+#[cfg(test)]
 fn write_store_record_columns<W: Write + Seek>(
     payload: &mut W,
     columns: RecordColumns,
@@ -884,9 +1639,46 @@ fn write_store_record_columns<W: Write + Seek>(
     Ok(())
 }
 
+fn write_prepared_record_columns<W: Write + Seek>(
+    payload: &mut W,
+    columns: PreparedColumn,
+    count: u64,
+    ids: bool,
+    quality: bool,
+) -> Result<()> {
+    let count =
+        u32::try_from(count).map_err(|_| Error::InvalidInput("too many records for RS3".into()))?;
+    put_u32_writer(payload, count)?;
+    columns.ids.write_to(payload, ids, count as usize)?;
+    let quality_length_position = payload.stream_position()?;
+    put_u64_writer(payload, 0)?;
+    let quality_start = payload.stream_position()?;
+    payload.write_all(&(PreparedQualityWriter::BLOCK_RECORDS as u32).to_le_bytes())?;
+    payload.write_all(
+        &if quality {
+            columns.qualities.block_count
+        } else {
+            0
+        }
+        .to_le_bytes(),
+    )?;
+    if quality {
+        copy_external_bytes(&columns.qualities.path, payload)?;
+    }
+    let quality_end = payload.stream_position()?;
+    let quality_len = quality_end
+        .checked_sub(quality_start)
+        .ok_or_else(|| Error::InvalidInput("invalid quality section length".into()))?;
+    payload.seek(SeekFrom::Start(quality_length_position))?;
+    put_u64_writer(payload, quality_len)?;
+    payload.seek(SeekFrom::Start(quality_end))?;
+    std::fs::remove_file(columns.qualities.path)?;
+    Ok(())
+}
+
 struct StoredColumn {
-    data: std::fs::File,
-    lengths: std::fs::File,
+    data: std::io::BufWriter<std::fs::File>,
+    lengths: std::io::BufWriter<std::fs::File>,
     common_length: Option<u32>,
     variable_length: bool,
     data_len: u64,
@@ -897,10 +1689,14 @@ struct StoredColumn {
 impl StoredColumn {
     fn create(temp_dir: &Path, mate: usize, name: &str) -> Result<Self> {
         Ok(Self {
-            data: create_temporary_column(&temp_dir.join(format!("records.{mate}.{name}.data")))?,
-            lengths: create_temporary_column(
-                &temp_dir.join(format!("records.{mate}.{name}.lengths")),
-            )?,
+            data: std::io::BufWriter::with_capacity(
+                1024 * 1024,
+                create_temporary_column(&temp_dir.join(format!("records.{mate}.{name}.data")))?,
+            ),
+            lengths: std::io::BufWriter::with_capacity(
+                1024 * 1024,
+                create_temporary_column(&temp_dir.join(format!("records.{mate}.{name}.lengths")))?,
+            ),
             common_length: None,
             variable_length: false,
             data_len: 0,
@@ -937,13 +1733,13 @@ impl StoredColumn {
             return Ok(());
         }
         self.data.flush()?;
-        self.data.seek(SeekFrom::Start(0))?;
+        self.data.get_mut().seek(SeekFrom::Start(0))?;
         if self.variable_length {
             payload.write_all(&[2])?;
             put_u64_writer(payload, self.data_len)?;
             self.lengths.flush()?;
-            self.lengths.seek(SeekFrom::Start(0))?;
-            std::io::copy(&mut self.lengths, payload)?;
+            self.lengths.get_mut().seek(SeekFrom::Start(0))?;
+            std::io::copy(self.lengths.get_mut(), payload)?;
         } else {
             payload.write_all(&[1])?;
             let width = self.common_length.unwrap_or(0);
@@ -956,10 +1752,11 @@ impl StoredColumn {
             }
             put_u64_writer(payload, self.data_len)?;
         }
-        std::io::copy(&mut self.data, payload)?;
+        std::io::copy(self.data.get_mut(), payload)?;
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_quality_blocks<W: Write + Seek>(
         mut self,
         blocks: &mut crate::quality_blocks::QualityBlockWriter<W>,
@@ -969,8 +1766,8 @@ impl StoredColumn {
         let block_records = block_records.max(1);
         self.lengths.flush()?;
         self.data.flush()?;
-        self.lengths.seek(SeekFrom::Start(0))?;
-        self.data.seek(SeekFrom::Start(0))?;
+        self.lengths.get_mut().seek(SeekFrom::Start(0))?;
+        self.data.get_mut().seek(SeekFrom::Start(0))?;
         if self.offsets_len() != count {
             return Err(Error::InvalidInput("record column length mismatch".into()));
         }
@@ -978,7 +1775,7 @@ impl StoredColumn {
         let mut width = None;
         for _ in 0..count {
             let mut length = [0u8; 4];
-            self.lengths.read_exact(&mut length)?;
+            self.lengths.get_mut().read_exact(&mut length)?;
             let length = u32::from_le_bytes(length) as usize;
             if !values.is_empty()
                 && (values.len() == block_records || width.is_some_and(|width| width != length))
@@ -987,7 +1784,7 @@ impl StoredColumn {
                 values.clear();
             }
             let mut value = vec![0; length];
-            self.data.read_exact(&mut value)?;
+            self.data.get_mut().read_exact(&mut value)?;
             values.push(value);
             width = Some(length);
         }
@@ -997,15 +1794,18 @@ impl StoredColumn {
         Ok(())
     }
 
+    #[cfg(test)]
     fn offsets_len(&self) -> usize {
         let len = self
             .lengths
+            .get_ref()
             .metadata()
             .map(|m| m.len() as usize)
             .unwrap_or(0);
         len / std::mem::size_of::<u32>()
     }
 
+    #[cfg(test)]
     fn write_packed_dna_to<W: Write>(mut self, payload: &mut W, count: usize) -> Result<()> {
         if self.variable_length {
             return self.write_to(payload, true, count);
@@ -1044,11 +1844,11 @@ impl StoredColumn {
             put_u64_writer(payload, encoded_len as u64)?;
         }
         self.data.flush()?;
-        self.data.seek(SeekFrom::Start(0))?;
+        self.data.get_mut().seek(SeekFrom::Start(0))?;
         let mut sequence = vec![0; width];
         let mut packed = vec![0; packed_width];
         for _ in 0..count {
-            self.data.read_exact(&mut sequence)?;
+            self.data.get_mut().read_exact(&mut sequence)?;
             let clean = sequence
                 .iter()
                 .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'));
@@ -1526,6 +2326,68 @@ fn decode_zigzag_delta(encoded: u64, previous: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_complete_sorted_id_permutations() {
+        assert!(valid_id_permutation(4, 4, 6, 14, 0));
+        assert!(!valid_id_permutation(4, 3, 3, 5, 3));
+        assert!(!valid_id_permutation(4, 4, 5, 9, 1));
+    }
+
+    #[test]
+    fn prepared_pipeline_matches_store_backed_archive_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let old_dir = directory.path().join("old");
+        let new_dir = directory.path().join("new");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let records = [
+            (
+                ReadRecord::new("r0/1", b"ACGTACG".to_vec(), Some(b"DDD9DDD".to_vec())),
+                ReadRecord::new("r0/2", b"TGCATGC".to_vec(), Some(b"DDDD9DD".to_vec())),
+            ),
+            (
+                ReadRecord::new("r1/1", b"ACGTACA".to_vec(), Some(b"DD,9DDD".to_vec())),
+                ReadRecord::new("r1/2", b"TGCATGA".to_vec(), Some(b"DD!D9DD".to_vec())),
+            ),
+            (
+                ReadRecord::new("r2/1", b"ACNTACG".to_vec(), Some(b"DDD9DDD".to_vec())),
+                ReadRecord::new("r2/2", b"TGCNTGC".to_vec(), Some(b"DDDD9DD".to_vec())),
+            ),
+        ];
+        let options = CompressionOptions {
+            threads: 1,
+            zstd_level: 3,
+            reorder: crate::ReorderOptions {
+                kmer_size: 3,
+                window_size: 3,
+                max_bucket_records: 2,
+                sort_chunk_size: 1,
+                sort_threads: 1,
+                temp_dir: None,
+            },
+            ..CompressionOptions::default()
+        };
+
+        let mut store = PairStore::create(old_dir.join("store")).unwrap();
+        let mut prepared = PreparedRecordsBuilder::create(&new_dir).unwrap();
+        for (first, second) in &records {
+            store.append(first, second).unwrap();
+            prepared.push(first, second, &options).unwrap();
+        }
+        let mut old_archive = Vec::new();
+        write_reordered_store_profiled(&mut store, &mut old_archive, &options, &old_dir).unwrap();
+        let mut new_archive = Vec::new();
+        write_prepared_profiled(
+            prepared.finish().unwrap(),
+            &mut new_archive,
+            &options,
+            &new_dir,
+        )
+        .unwrap();
+
+        assert_eq!(new_archive, old_archive);
+    }
 
     #[test]
     fn similar_store_reads_share_consensus_and_split_at_limit() {

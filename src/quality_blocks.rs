@@ -94,6 +94,7 @@ impl QualityBlocks {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct QualityBlockWriter<W> {
     output: W,
     block_records: usize,
@@ -101,6 +102,7 @@ pub(crate) struct QualityBlockWriter<W> {
     block_count: u32,
 }
 
+#[cfg(test)]
 impl<W: std::io::Write + std::io::Seek> QualityBlockWriter<W> {
     pub(crate) fn new(mut output: W, block_records: usize) -> Result<Self> {
         let block_records = block_records.max(1);
@@ -296,6 +298,13 @@ fn encode_block(block: &[Vec<u8>]) -> Result<Block> {
         alphabet: chosen_alphabet,
         body: chosen_body,
     })
+}
+
+pub(crate) fn encode_block_bytes(block: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let block = encode_block(block)?;
+    let mut bytes = Vec::new();
+    write_block(&mut bytes, &block)?;
+    Ok(bytes)
 }
 
 fn decode_block(

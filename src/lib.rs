@@ -6,15 +6,19 @@
 
 mod codec;
 mod consensus_archive;
+mod external_bytes;
 mod fastx;
+mod packed_sequence;
 mod quality_blocks;
 mod record_store;
 pub mod reorder;
+mod sequence_spool;
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub use fastx::{gzip_reader, gzip_writer, FastxReader, FastxWriter, Format};
@@ -251,6 +255,16 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     options: &CompressionOptions,
     temp_dir: impl AsRef<Path>,
 ) -> Result<(CompressionMetadata, CompressionProfile)> {
+    let temp_root = temp_dir.as_ref();
+    reorder::validate_options(&options.reorder)?;
+    let output = output.as_ref();
+    let partial_output =
+        output.with_extension(match output.extension().and_then(|value| value.to_str()) {
+            Some(extension) => format!("{extension}.partial"),
+            None => "partial".into(),
+        });
+    let mut guard = CompressionGuard::new(create_workspace(temp_root)?, partial_output);
+    let temp_dir = guard.workspace().to_path_buf();
     let ingest_start = std::time::Instant::now();
     let reader_1 = FastxReader::new(
         BufReader::new(gzip_reader(BufReader::new(File::open(input_1)?))),
@@ -260,21 +274,20 @@ pub fn compress_reordered_paired_fastq_files_profiled(
         BufReader::new(gzip_reader(BufReader::new(File::open(input_2)?))),
         Format::Fastq,
     );
-    let store_root = temp_dir.as_ref().join("spring-rs-record-store");
-    let mut store = PairStore::create(&store_root)?;
+    let mut prepared = consensus_archive::PreparedRecordsBuilder::create(&temp_dir)?;
     let mut first = reader_1;
     let mut second = reader_2;
     loop {
         match (first.next(), second.next()) {
             (None, None) => break,
             (Some(Ok(mut first)), Some(Ok(mut second))) => {
-                first.validate(options.preserve_quality)?;
-                second.validate(options.preserve_quality)?;
+                first.validate(true)?;
+                second.validate(true)?;
                 if options.preserve_quality {
                     apply_quality(&mut first, &options.quality_mode);
                     apply_quality(&mut second, &options.quality_mode);
                 }
-                store.append(&first, &second)?;
+                prepared.push(&first, &second, options)?;
             }
             (None, Some(_)) | (Some(_), None) => {
                 return Err(Error::InvalidInput(
@@ -284,13 +297,81 @@ pub fn compress_reordered_paired_fastq_files_profiled(
             (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
         }
     }
+    let prepared = prepared.finish()?;
     let ingest = ingest_start.elapsed();
-    let archive = File::create(output)?;
+    let archive = File::create(guard.partial_output())?;
     let (metadata, mut profile) =
-        consensus_archive::write_reordered_store_profiled(&mut store, archive, options, temp_dir)?;
+        consensus_archive::write_prepared_profiled(prepared, archive, options, &temp_dir)?;
+    profile.store_bytes = directory_size(&temp_dir)?;
     profile.ingest = ingest;
-    profile.store_bytes = directory_size(store.root())?;
+    guard.commit(output)?;
     Ok((metadata, profile))
+}
+
+struct CompressionGuard {
+    workspace: Option<std::path::PathBuf>,
+    partial_output: Option<std::path::PathBuf>,
+}
+
+impl CompressionGuard {
+    fn new(workspace: std::path::PathBuf, partial_output: std::path::PathBuf) -> Self {
+        Self {
+            workspace: Some(workspace),
+            partial_output: Some(partial_output),
+        }
+    }
+
+    fn workspace(&self) -> &Path {
+        self.workspace.as_deref().unwrap()
+    }
+
+    fn partial_output(&self) -> &Path {
+        self.partial_output.as_deref().unwrap()
+    }
+
+    fn commit(&mut self, output: &Path) -> Result<()> {
+        if let Some(workspace) = self.workspace.take() {
+            if let Err(error) = std::fs::remove_dir_all(&workspace) {
+                self.workspace = Some(workspace);
+                return Err(Error::Io(error));
+            }
+        }
+        let partial_output = self.partial_output.take().unwrap();
+        if let Err(error) = std::fs::rename(&partial_output, output) {
+            self.partial_output = Some(partial_output);
+            return Err(Error::Io(error));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CompressionGuard {
+    fn drop(&mut self) {
+        if let Some(workspace) = self.workspace.take() {
+            let _ = std::fs::remove_dir_all(workspace);
+        }
+        if let Some(partial_output) = self.partial_output.take() {
+            let _ = std::fs::remove_file(partial_output);
+        }
+    }
+}
+
+fn create_workspace(root: &Path) -> Result<std::path::PathBuf> {
+    static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
+
+    std::fs::create_dir_all(root)?;
+    for _ in 0..1000 {
+        let sequence = NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed);
+        let workspace = root.join(format!("run-{}-{sequence}", std::process::id()));
+        match std::fs::create_dir(&workspace) {
+            Ok(()) => return Ok(workspace),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    Err(Error::InvalidInput(
+        "unable to allocate a unique compression workspace".into(),
+    ))
 }
 
 fn directory_size(path: &Path) -> Result<u64> {
@@ -451,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn reordered_file_api_uses_store_and_forced_spills() {
+    fn reordered_file_api_uses_sequence_spools_and_forced_spills() {
         use std::io::Write;
 
         let directory = tempfile::tempdir().unwrap();
@@ -486,6 +567,12 @@ mod tests {
             ..CompressionOptions::default()
         };
         compress_paired_fastq_files(&input_1, &input_2, &output, &options).unwrap();
+        let work = options.reorder.temp_dir.as_ref().unwrap();
+        assert!(!work.join("spring-rs-record-store").exists());
+        assert!(!work.join("sequences.0.spool").exists());
+        assert!(!work.join("sequences.1.spool").exists());
+        assert_eq!(std::fs::read_dir(work).unwrap().count(), 0);
+        assert!(!output.with_extension("spring-rs.partial").exists());
         let decoded = decompress(
             BufReader::new(File::open(output).unwrap()),
             &DecompressionOptions::default(),
@@ -511,6 +598,35 @@ mod tests {
         assert!(decoded.streams[1]
             .iter()
             .all(|record| record.quality.as_deref() == Some(b"IIIIIIII")));
+    }
+
+    #[test]
+    fn failed_file_compression_cleans_workspace_and_partial_output() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let input_1 = directory.path().join("reads.1.fastq.gz");
+        let input_2 = directory.path().join("reads.2.fastq.gz");
+        let output = directory.path().join("reads.spring-rs");
+        let work = directory.path().join("work");
+        let mut first = gzip_writer(File::create(&input_1).unwrap(), 1);
+        let mut second = gzip_writer(File::create(&input_2).unwrap(), 1);
+        first.write_all(b"@r0/1\nACGT\n+\nIIII\n").unwrap();
+        second.write_all(b"").unwrap();
+        first.finish().unwrap();
+        second.finish().unwrap();
+        let options = CompressionOptions {
+            reorder: ReorderOptions {
+                temp_dir: Some(work.clone()),
+                ..ReorderOptions::default()
+            },
+            ..CompressionOptions::default()
+        };
+
+        assert!(compress_paired_fastq_files(input_1, input_2, &output, &options).is_err());
+        assert!(!output.exists());
+        assert!(!output.with_extension("spring-rs.partial").exists());
+        assert_eq!(std::fs::read_dir(work).unwrap().count(), 0);
     }
 
     #[test]

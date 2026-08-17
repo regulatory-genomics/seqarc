@@ -5,7 +5,9 @@ use crate::{Error, ReadRecord, ReorderOptions, Result};
 use bed_utils::extsort::ExternalSorterBuilder;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::VecDeque;
+#[cfg(test)]
 use std::fs::{File, OpenOptions};
+#[cfg(test)]
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -192,11 +194,13 @@ pub fn sort_store_minimizers(
         .collect()
 }
 
+#[cfg(test)]
 const ASSIGNMENT_SIZE: usize = 21;
 
 /// Writes one externally sorted primary-minimizer assignment per read.
 /// The returned fixed-width file can be replayed without retaining the global
 /// permutation or minimizer index in memory.
+#[cfg(test)]
 pub(crate) fn write_store_assignments(
     store: &mut PairStore,
     options: &ReorderOptions,
@@ -257,10 +261,12 @@ pub(crate) fn write_store_assignments(
     Ok(path)
 }
 
+#[cfg(test)]
 pub(crate) struct AssignmentReader {
     file: File,
 }
 
+#[cfg(test)]
 impl AssignmentReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
@@ -269,6 +275,7 @@ impl AssignmentReader {
     }
 }
 
+#[cfg(test)]
 impl Iterator for AssignmentReader {
     type Item = Result<MinimizerEntry>;
 
@@ -287,7 +294,7 @@ impl Iterator for AssignmentReader {
     }
 }
 
-fn validate_options(options: &ReorderOptions) -> Result<()> {
+pub(crate) fn validate_options(options: &ReorderOptions) -> Result<()> {
     if options.kmer_size == 0 || options.window_size == 0 {
         return Err(Error::InvalidInput(
             "minimizer k and window must be nonzero".into(),

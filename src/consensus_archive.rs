@@ -107,7 +107,10 @@ fn read_payload_v7(
     if streams == 0 || streams != payload_streams {
         return Err(Error::InvalidFormat("RS3 stream count mismatch".into()));
     }
-    let _quality_mode = cursor.u8()?;
+    let quality_mode = cursor.u8()?;
+    if quality_mode > 1 {
+        return Err(Error::InvalidFormat("unknown RS3 quality mode".into()));
+    }
     let id_pattern = PairedIdPattern::try_from(cursor.u8()?)?;
     let has_ids = flags & 1 != 0;
     let has_quality = flags & 2 != 0;
@@ -121,7 +124,11 @@ fn read_payload_v7(
         let clusters = cursor.clusters_v7()?;
         let ids_stored =
             has_ids && (stream_index == 0 || id_pattern == PairedIdPattern::Independent);
-        let mut metadata = cursor.columnar_records(ids_stored, has_quality)?;
+        let mut metadata = if quality_mode == 0 {
+            cursor.columnar_records(ids_stored, has_quality)?
+        } else {
+            cursor.record_metadata_v7(ids_stored, has_quality)?
+        };
         if metadata.len() != records {
             return Err(Error::InvalidFormat("RS3 record count mismatch".into()));
         }
@@ -142,14 +149,14 @@ fn read_payload_v7(
         }
         decoded_streams.push(metadata);
     }
+    if cursor.position != payload.len() {
+        return Err(Error::InvalidFormat("trailing data in RS3 payload".into()));
+    }
     if has_ids && id_pattern != PairedIdPattern::Independent {
         let (first, rest) = decoded_streams.split_at_mut(1);
         for (first, second) in first[0].iter().zip(&mut rest[0]) {
             second.id = id_pattern.derive_second(&first.id)?;
         }
-    }
-    if cursor.position != payload.len() {
-        return Err(Error::InvalidFormat("trailing RS3 payload data".into()));
     }
     finish_decoding(decoded_streams, options)
 }
@@ -200,7 +207,7 @@ pub fn write_reordered_store_profiled<W: Write>(
         .open(&payload_path)?;
     put_u64_writer(&mut payload, store.count())?;
     put_u16_writer(&mut payload, 2)?;
-    payload.write_all(&[0])?;
+    payload.write_all(&[1])?;
     payload.write_all(&[id_pattern as u8])?;
     for (mate, (assignment_path, columns)) in assignments.iter().zip(record_columns).enumerate() {
         let stats = write_store_clusters(
@@ -221,6 +228,7 @@ pub fn write_reordered_store_profiled<W: Write>(
             store.count(),
             ids_stored,
             options.preserve_quality,
+            65_536,
         )?;
     }
     payload.flush()?;
@@ -498,13 +506,20 @@ struct ClusterInput {
     offset: i32,
 }
 
+struct ClusterGroup {
+    anchor: i32,
+    minimum_offset: i32,
+    reference: Vec<u8>,
+    members: Vec<ClusterInput>,
+}
+
 fn cluster_bucket(
     store: &mut PairStore,
     mate: usize,
     kmer_size: usize,
     assignments: &[AssignedRead],
 ) -> Result<Vec<ConsensusCluster>> {
-    let mut groups: Vec<(i32, Vec<ClusterInput>)> = Vec::new();
+    let mut groups: Vec<ClusterGroup> = Vec::new();
     for assignment in assignments {
         let mut sequence = store.read_sequence(assignment.id, mate)?;
         if assignment.reverse {
@@ -529,36 +544,52 @@ fn cluster_bucket(
             0
         };
         let mut best = None;
-        for (index, (group_anchor, group)) in groups.iter().enumerate() {
-            let offset = *group_anchor - anchor;
-            let (overlap, distance) = overlap_distance(&group[0].sequence, &sequence, offset);
-            let minimum_overlap = group[0].sequence.len().min(sequence.len()).div_ceil(2);
+        for (index, group) in groups.iter().enumerate() {
+            let offset = group.anchor - anchor;
+            let consensus_offset = offset - group.minimum_offset;
+            let (overlap, distance) =
+                overlap_distance(&group.reference, &sequence, consensus_offset);
+            let minimum_overlap = group.reference.len().min(sequence.len()).div_ceil(2);
             if overlap >= minimum_overlap && distance <= 4 {
                 best = Some((index, offset));
                 break;
             }
         }
         match best {
-            Some((index, offset)) => groups[index].1.push(ClusterInput {
-                id: assignment.id,
-                sequence,
-                reverse: assignment.reverse,
-                offset,
-            }),
-            None => groups.push((
-                anchor,
-                vec![ClusterInput {
+            Some((index, offset)) => {
+                let group = &mut groups[index];
+                group.members.push(ClusterInput {
                     id: assignment.id,
                     sequence,
                     reverse: assignment.reverse,
-                    offset: 0,
-                }],
-            )),
+                    offset,
+                });
+                group.minimum_offset = group
+                    .members
+                    .iter()
+                    .map(|input| input.offset)
+                    .min()
+                    .unwrap_or(0);
+                group.reference = finish_cluster(group.members.clone())?.reference;
+            }
+            None => {
+                groups.push(ClusterGroup {
+                    anchor,
+                    minimum_offset: 0,
+                    reference: sequence.clone(),
+                    members: vec![ClusterInput {
+                        id: assignment.id,
+                        sequence,
+                        reverse: assignment.reverse,
+                        offset: 0,
+                    }],
+                });
+            }
         }
     }
     groups
         .into_iter()
-        .map(|(_, group)| finish_cluster(group))
+        .map(|group| finish_cluster(group.members))
         .collect()
 }
 
@@ -669,7 +700,7 @@ fn partition_clusters_v7(
                 || !read.mismatches.is_empty()
             {
                 return Err(Error::InvalidInput(
-                    "V5 singleton consensus invariant violated".into(),
+                    "singleton consensus invariant violated".into(),
                 ));
             }
             let sequence = if read.reverse {
@@ -818,20 +849,38 @@ fn build_store_record_columns(
     Ok((columns, id_pattern.unwrap_or(PairedIdPattern::Independent)))
 }
 
-fn write_store_record_columns<W: Write>(
+fn write_store_record_columns<W: Write + Seek>(
     payload: &mut W,
     columns: RecordColumns,
     count: u64,
     ids: bool,
     quality: bool,
+    quality_blocks_records: usize,
 ) -> Result<()> {
     let count =
         u32::try_from(count).map_err(|_| Error::InvalidInput("too many records for RS3".into()))?;
     put_u32_writer(payload, count)?;
-    columns.ids.write_to(payload, ids, count as usize)?;
-    columns
-        .qualities
-        .write_to(payload, quality, count as usize)?;
+    let RecordColumns {
+        ids: id_column,
+        qualities,
+    } = columns;
+    id_column.write_to(payload, ids, count as usize)?;
+    let quality_length_position = payload.stream_position()?;
+    put_u64_writer(payload, 0)?;
+    let quality_start = payload.stream_position()?;
+    let mut blocks =
+        crate::quality_blocks::QualityBlockWriter::new(&mut *payload, quality_blocks_records)?;
+    if quality {
+        qualities.write_quality_blocks(&mut blocks, count as usize, quality_blocks_records)?;
+    }
+    blocks.finish()?;
+    let quality_end = payload.stream_position()?;
+    let quality_len = quality_end
+        .checked_sub(quality_start)
+        .ok_or_else(|| Error::InvalidInput("invalid quality section length".into()))?;
+    payload.seek(SeekFrom::Start(quality_length_position))?;
+    put_u64_writer(payload, quality_len)?;
+    payload.seek(SeekFrom::Start(quality_end))?;
     Ok(())
 }
 
@@ -909,6 +958,52 @@ impl StoredColumn {
         }
         std::io::copy(&mut self.data, payload)?;
         Ok(())
+    }
+
+    fn write_quality_blocks<W: Write + Seek>(
+        mut self,
+        blocks: &mut crate::quality_blocks::QualityBlockWriter<W>,
+        count: usize,
+        block_records: usize,
+    ) -> Result<()> {
+        let block_records = block_records.max(1);
+        self.lengths.flush()?;
+        self.data.flush()?;
+        self.lengths.seek(SeekFrom::Start(0))?;
+        self.data.seek(SeekFrom::Start(0))?;
+        if self.offsets_len() != count {
+            return Err(Error::InvalidInput("record column length mismatch".into()));
+        }
+        let mut values = Vec::with_capacity(block_records.min(count));
+        let mut width = None;
+        for _ in 0..count {
+            let mut length = [0u8; 4];
+            self.lengths.read_exact(&mut length)?;
+            let length = u32::from_le_bytes(length) as usize;
+            if !values.is_empty()
+                && (values.len() == block_records || width.is_some_and(|width| width != length))
+            {
+                blocks.push(&values)?;
+                values.clear();
+            }
+            let mut value = vec![0; length];
+            self.data.read_exact(&mut value)?;
+            values.push(value);
+            width = Some(length);
+        }
+        if !values.is_empty() {
+            blocks.push(&values)?;
+        }
+        Ok(())
+    }
+
+    fn offsets_len(&self) -> usize {
+        let len = self
+            .lengths
+            .metadata()
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        len / std::mem::size_of::<u32>()
     }
 
     fn write_packed_dna_to<W: Write>(mut self, payload: &mut W, count: usize) -> Result<()> {
@@ -1216,6 +1311,33 @@ impl<'a> Cursor<'a> {
         }
         Err(Error::InvalidFormat("unterminated RS3 varint".into()))
     }
+    fn record_metadata_v7(&mut self, ids: bool, quality: bool) -> Result<Vec<ReadRecord>> {
+        let count = self.u32()? as usize;
+        let id_values = self.column(count, ids, "ID")?;
+        let quality_len = usize_from(self.u64()?, "quality blocks")?;
+        let quality_bytes = self.take(quality_len)?;
+        let quality_values = crate::quality_blocks::QualityBlocks::decode(quality_bytes)?;
+        if quality_values.len() != if quality { count } else { 0 } {
+            return Err(Error::InvalidFormat(
+                "RS3 quality block record count mismatch".into(),
+            ));
+        }
+        let quality_values = if quality {
+            quality_values
+        } else {
+            (0..count).map(|_| Vec::new()).collect()
+        };
+        Ok(id_values
+            .into_iter()
+            .zip(quality_values)
+            .map(|(id, quality_value)| ReadRecord {
+                id,
+                sequence: Vec::new(),
+                quality: quality.then_some(quality_value),
+            })
+            .collect())
+    }
+
     fn columnar_records(&mut self, ids: bool, quality: bool) -> Result<Vec<ReadRecord>> {
         let count = self.u32()? as usize;
         let id_values = self.column(count, ids, "ID")?;

@@ -7,6 +7,7 @@
 mod codec;
 mod consensus_archive;
 mod fastx;
+mod quality_blocks;
 mod record_store;
 pub mod reorder;
 

@@ -12,6 +12,7 @@ mod packed_sequence;
 mod quality_blocks;
 mod record_store;
 pub mod reorder;
+#[allow(dead_code)]
 mod sequence_spool;
 
 use std::collections::BTreeMap;
@@ -164,7 +165,7 @@ impl Default for ReorderOptions {
             kmer_size: 21,
             window_size: 31,
             max_bucket_records: 4_096,
-            sort_chunk_size: 2_000_000,
+            sort_chunk_size: 10_000_000,
             sort_threads: 16,
             temp_dir: None,
         }
@@ -280,7 +281,7 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     let mut guard = CompressionGuard::new(create_workspace(temp_root)?, partial_output);
     let temp_dir = guard.workspace().to_path_buf();
     let ingest_start = std::time::Instant::now();
-    let mut prepared = consensus_archive::PreparedRecordsBuilder::create(&temp_dir)?;
+    let mut prepared = consensus_archive::PreparedRecordsBuilder::create_metadata(&temp_dir)?;
     let input_1 = input_1.as_ref().to_path_buf();
     let input_2 = input_2.as_ref().to_path_buf();
     let workers = options.threads.max(1);
@@ -290,110 +291,163 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     let (result_tx, result_rx) = crossbeam_channel::bounded::<
         Result<(usize, Vec<consensus_archive::PreparedPair>)>,
     >(queue_capacity);
+    let (sort_0_tx, sort_0_rx) = crossbeam_channel::bounded(queue_capacity);
+    let (sort_1_tx, sort_1_rx) = crossbeam_channel::bounded(queue_capacity);
     let mut pending = BTreeMap::new();
     let mut next_batch = 0usize;
-    std::thread::scope(|scope| -> Result<()> {
-        let producer_results = result_tx.clone();
-        let producer_options = options.clone();
-        scope.spawn(move || {
-            let result = (|| -> Result<()> {
-                let first = FastxReader::new(
-                    BufReader::new(gzip_reader(BufReader::new(File::open(input_1)?))),
-                    Format::Fastq,
-                );
-                let second = FastxReader::new(
-                    BufReader::new(gzip_reader(BufReader::new(File::open(input_2)?))),
-                    Format::Fastq,
-                );
-                let mut first = first;
-                let mut second = second;
-                let mut batch = Vec::with_capacity(2048);
-                let mut batch_index = 0usize;
-                let mut original_id = 0u64;
-                loop {
-                    match (first.next(), second.next()) {
-                        (None, None) => break,
-                        (Some(Ok(mut first)), Some(Ok(mut second))) => {
-                            first.validate(true)?;
-                            second.validate(true)?;
-                            if producer_options.preserve_quality {
-                                apply_quality(&mut first, &producer_options.quality_mode);
-                                apply_quality(&mut second, &producer_options.quality_mode);
-                            }
-                            batch.push((original_id, first, second));
-                            original_id += 1;
-                            if batch.len() == 2048 {
-                                job_tx
-                                    .send((batch_index, std::mem::take(&mut batch)))
-                                    .map_err(|_| {
-                                        Error::InvalidInput("preparation workers exited".into())
-                                    })?;
-                                batch_index += 1;
-                                batch = Vec::with_capacity(2048);
-                            }
-                        }
-                        (None, Some(_)) | (Some(_), None) => {
-                            return Err(Error::InvalidInput(
-                                "paired streams have different record counts".into(),
-                            ));
-                        }
-                        (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
-                    }
-                }
-                if !batch.is_empty() {
-                    job_tx
-                        .send((batch_index, batch))
-                        .map_err(|_| Error::InvalidInput("preparation workers exited".into()))?;
-                }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                let _ = producer_results.send(Err(error));
-            }
-        });
-        for _ in 0..workers {
-            let job_rx = job_rx.clone();
-            let result_tx = result_tx.clone();
-            let worker_options = options.clone();
+    let sections = std::thread::scope(
+        |scope| -> Result<[consensus_archive::PreparedMateSection; 2]> {
+            let sort_options = options.clone();
+            let sort_temp_dir = temp_dir.clone();
+            let sort_0_handle = scope.spawn(move || {
+                consensus_archive::sort_and_write_mate(
+                    sort_0_rx,
+                    u64::MAX,
+                    0,
+                    &sort_options,
+                    &sort_temp_dir,
+                )
+            });
+            let sort_options = options.clone();
+            let sort_temp_dir = temp_dir.clone();
+            let sort_1_handle = scope.spawn(move || {
+                consensus_archive::sort_and_write_mate(
+                    sort_1_rx,
+                    u64::MAX,
+                    1,
+                    &sort_options,
+                    &sort_temp_dir,
+                )
+            });
+            let producer_results = result_tx.clone();
+            let producer_options = options.clone();
             scope.spawn(move || {
-                while let Ok((batch_index, batch)) = job_rx.recv() {
-                    let result = batch
-                        .into_iter()
-                        .map(|(original_id, first, second)| {
-                            consensus_archive::prepare_pair(
-                                first,
-                                second,
-                                original_id,
-                                &worker_options,
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()
-                        .map(|pairs| (batch_index, pairs));
-                    if result_tx.send(result).is_err() {
-                        break;
+                let result = (|| -> Result<()> {
+                    let first = FastxReader::new(
+                        BufReader::with_capacity(
+                            8 * 1024 * 1024,
+                            gzip_reader(BufReader::with_capacity(
+                                1024 * 1024,
+                                File::open(input_1)?,
+                            )),
+                        ),
+                        Format::Fastq,
+                    );
+                    let second = FastxReader::new(
+                        BufReader::with_capacity(
+                            8 * 1024 * 1024,
+                            gzip_reader(BufReader::with_capacity(
+                                1024 * 1024,
+                                File::open(input_2)?,
+                            )),
+                        ),
+                        Format::Fastq,
+                    );
+                    let mut first = first;
+                    let mut second = second;
+                    let mut batch = Vec::with_capacity(2048);
+                    let mut batch_index = 0usize;
+                    let mut original_id = 0u64;
+                    loop {
+                        match (first.next(), second.next()) {
+                            (None, None) => break,
+                            (Some(Ok(mut first)), Some(Ok(mut second))) => {
+                                first.validate(true)?;
+                                second.validate(true)?;
+                                if producer_options.preserve_quality {
+                                    apply_quality(&mut first, &producer_options.quality_mode);
+                                    apply_quality(&mut second, &producer_options.quality_mode);
+                                }
+                                batch.push((original_id, first, second));
+                                original_id += 1;
+                                if batch.len() == 2048 {
+                                    job_tx
+                                        .send((batch_index, std::mem::take(&mut batch)))
+                                        .map_err(|_| {
+                                            Error::InvalidInput("preparation workers exited".into())
+                                        })?;
+                                    batch_index += 1;
+                                    batch = Vec::with_capacity(2048);
+                                }
+                            }
+                            (None, Some(_)) | (Some(_), None) => {
+                                return Err(Error::InvalidInput(
+                                    "paired streams have different record counts".into(),
+                                ));
+                            }
+                            (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
+                        }
                     }
+                    if !batch.is_empty() {
+                        job_tx.send((batch_index, batch)).map_err(|_| {
+                            Error::InvalidInput("preparation workers exited".into())
+                        })?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let _ = producer_results.send(Err(error));
                 }
             });
-        }
-        drop(job_rx);
-        drop(result_tx);
-        while let Ok(result) = result_rx.recv() {
-            let (batch_index, pairs) = result?;
-            pending.insert(batch_index, pairs);
-            while let Some(pairs) = pending.remove(&next_batch) {
-                for pair in pairs {
-                    prepared.push_prepared(pair, options)?;
-                }
-                next_batch += 1;
+            for _ in 0..workers {
+                let job_rx = job_rx.clone();
+                let result_tx = result_tx.clone();
+                let worker_options = options.clone();
+                scope.spawn(move || {
+                    while let Ok((batch_index, batch)) = job_rx.recv() {
+                        let result = batch
+                            .into_iter()
+                            .map(|(original_id, first, second)| {
+                                consensus_archive::prepare_pair(
+                                    first,
+                                    second,
+                                    original_id,
+                                    &worker_options,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()
+                            .map(|pairs| (batch_index, pairs));
+                        if result_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                });
             }
-        }
-        Ok(())
-    })?;
-    let prepared = prepared.finish()?;
+            drop(job_rx);
+            drop(result_tx);
+            while let Ok(result) = result_rx.recv() {
+                let (batch_index, pairs) = result?;
+                pending.insert(batch_index, pairs);
+                while let Some(pairs) = pending.remove(&next_batch) {
+                    for pair in pairs {
+                        let [read_0, read_1] = prepared.push_metadata(pair, options)?;
+                        sort_0_tx
+                            .send(read_0)
+                            .map_err(|_| Error::InvalidInput("mate-1 sorter exited".into()))?;
+                        sort_1_tx
+                            .send(read_1)
+                            .map_err(|_| Error::InvalidInput("mate-2 sorter exited".into()))?;
+                    }
+                    next_batch += 1;
+                }
+            }
+            drop(sort_0_tx);
+            drop(sort_1_tx);
+            let section_0 = sort_0_handle
+                .join()
+                .map_err(|_| Error::InvalidInput("mate-1 sorter panicked".into()))??;
+            let section_1 = sort_1_handle
+                .join()
+                .map_err(|_| Error::InvalidInput("mate-2 sorter panicked".into()))??;
+            Ok([section_0, section_1])
+        },
+    )?;
+    let prepared = prepared.finish_metadata()?;
     let ingest = ingest_start.elapsed();
     let archive = File::create(guard.partial_output())?;
-    let (metadata, mut profile) =
-        consensus_archive::write_prepared_profiled(prepared, archive, options, &temp_dir)?;
+    let (metadata, mut profile) = consensus_archive::write_streamed_profiled(
+        prepared, sections, archive, options, &temp_dir,
+    )?;
     profile.store_bytes = directory_size(&temp_dir)?;
     profile.ingest = ingest;
     guard.commit(output)?;

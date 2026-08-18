@@ -37,7 +37,7 @@ pub(crate) struct SequenceSpoolWriter {
 impl SequenceSpoolWriter {
     pub(crate) fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = BufWriter::with_capacity(1024 * 1024, File::create(&path)?);
+        let mut file = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&path)?);
         file.write_all(MAGIC)?;
         file.write_all(&0u64.to_le_bytes())?;
         Ok(Self {
@@ -91,7 +91,7 @@ impl SequenceSpoolReader {
                 "truncated sequence spool header".into(),
             ));
         }
-        let mut file = BufReader::with_capacity(1024 * 1024, file);
+        let mut file = BufReader::with_capacity(8 * 1024 * 1024, file);
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
         if magic != *MAGIC {

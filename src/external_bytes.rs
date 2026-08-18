@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 pub(crate) struct Lz4ByteWriter {
     path: PathBuf,

@@ -9,6 +9,7 @@ pub(crate) struct PackedSequence {
     packed: bool,
 }
 
+#[allow(dead_code)]
 impl PackedSequence {
     pub(crate) fn try_from_bytes(sequence: &[u8]) -> Result<Self> {
         let length = u32::try_from(sequence.len())

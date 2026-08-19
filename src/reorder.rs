@@ -78,6 +78,21 @@ pub fn canonical_minimizers(sequence: &[u8], k: usize, window: usize) -> Vec<(u6
     result
 }
 
+/// Pick the deterministic primary seed used to group reads for consensus.
+pub(crate) fn primary_minimizer(
+    sequence: &[u8],
+    k: usize,
+    window: usize,
+) -> Option<(u64, u32, bool)> {
+    let minimizers = canonical_minimizers(sequence, k, window);
+    if minimizers.is_empty() {
+        return None;
+    }
+    minimizers
+        .into_iter()
+        .min_by_key(|(hash, position, reverse)| (*hash, *position, *reverse))
+}
+
 fn canonical_kmers(sequence: &[u8], k: usize) -> Vec<Option<(u64, bool)>> {
     if k > 32 {
         return (0..=sequence.len() - k)
@@ -226,9 +241,7 @@ pub(crate) fn write_store_assignments(
             .read_sequence(read_id, mate)
             .ok()
             .and_then(|sequence| {
-                canonical_minimizers(&sequence, options.kmer_size, options.window_size)
-                    .into_iter()
-                    .min_by_key(|(hash, position, reverse)| (*hash, *position, *reverse))
+                primary_minimizer(&sequence, options.kmer_size, options.window_size)
             });
         match entry {
             Some((hash, position, reverse)) => MinimizerEntry {

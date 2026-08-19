@@ -19,11 +19,11 @@ pub(crate) struct SortableRead {
 
 impl SortableRead {
     pub(crate) fn compare(left: &Self, right: &Self) -> std::cmp::Ordering {
-        (left.hash, left.original_id, left.position, left.reverse).cmp(&(
+        (left.hash, left.position, left.reverse, left.original_id).cmp(&(
             right.hash,
-            right.original_id,
             right.position,
             right.reverse,
+            right.original_id,
         ))
     }
 }

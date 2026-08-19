@@ -20,8 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SPRNG-RS3";
-const VERSION: u32 = 7;
+const VERSION: u32 = 10;
 const LONG_DISTANCE_WINDOW_LOG: u32 = 27;
+const ORDER_ENTRY_SIZE: usize = 9;
+const MAX_OVERLAP_MISMATCHES: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PairedIdPattern {
@@ -101,10 +103,10 @@ pub fn read_reordered<R: Read>(
     if checksum(&payload) != expected {
         return Err(Error::InvalidFormat("RS3 checksum failure".into()));
     }
-    read_payload_v7(&payload, streams, flags, options)
+    read_payload_v8(&payload, streams, flags, options)
 }
 
-fn read_payload_v7(
+fn read_payload_v8(
     payload: &[u8],
     streams: usize,
     flags: u16,
@@ -130,31 +132,38 @@ fn read_payload_v7(
     }
     let mut decoded_streams = Vec::with_capacity(streams);
     for stream_index in 0..streams {
-        let clusters = cursor.clusters_v7()?;
+        let clusters = cursor.clusters_v8()?;
+        let order = cursor.order_v8(records)?;
         let ids_stored =
             has_ids && (stream_index == 0 || id_pattern == PairedIdPattern::Independent);
         let mut metadata = if quality_mode == 0 {
             cursor.columnar_records(ids_stored, has_quality)?
         } else {
-            cursor.record_metadata_v7(ids_stored, has_quality)?
+            cursor.record_metadata_v8(ids_stored, has_quality)?
         };
         if metadata.len() != records {
             return Err(Error::InvalidFormat("RS3 record count mismatch".into()));
         }
-        let mut seen = vec![false; records];
-        for cluster in &clusters {
-            for read in &cluster.reads {
-                let original_id = usize_from(read.original_id, "original read ID")?;
-                if original_id >= records || seen[original_id] {
-                    return Err(Error::InvalidFormat("invalid RS3 original read ID".into()));
-                }
-                metadata[original_id].sequence =
-                    crate::reorder::decode_consensus_read(cluster, read)?;
-                seen[original_id] = true;
-            }
-        }
-        if seen.iter().any(|seen| !seen) {
-            return Err(Error::InvalidFormat("incomplete RS3 residuals".into()));
+        let multi_count = clusters
+            .iter()
+            .filter(|cluster| cluster.reads.len() > 1)
+            .count();
+        for (original_id, entry) in order.into_iter().enumerate() {
+            let cluster_index = if entry.singleton {
+                multi_count
+                    .checked_add(entry.cluster as usize)
+                    .ok_or_else(|| Error::InvalidFormat("invalid RS3 singleton index".into()))?
+            } else {
+                entry.cluster as usize
+            };
+            let cluster = clusters
+                .get(cluster_index)
+                .ok_or_else(|| Error::InvalidFormat("invalid RS3 order cluster index".into()))?;
+            let read = cluster
+                .reads
+                .get(entry.read as usize)
+                .ok_or_else(|| Error::InvalidFormat("invalid RS3 order read index".into()))?;
+            metadata[original_id].sequence = crate::reorder::decode_consensus_read(cluster, read)?;
         }
         decoded_streams.push(metadata);
     }
@@ -392,6 +401,9 @@ pub(crate) fn write_prepared_profiled<W: Write>(
         if let Some(error) = source_error.borrow_mut().take() {
             return Err(error);
         }
+        let order_path = temp_dir.join(format!("prepared.{mate}.order"));
+        let mut order = std::fs::File::create(&order_path)?;
+        order.set_len(count.saturating_mul(ORDER_ENTRY_SIZE as u64))?;
         let metrics = write_sorted_clusters(
             &mut payload,
             sorted,
@@ -400,7 +412,11 @@ pub(crate) fn write_prepared_profiled<W: Write>(
             options.threads,
             temp_dir,
             count,
+            &mut order,
         )?;
+        order.flush()?;
+        append_compact_order(&mut payload, &order_path, count, temp_dir)?;
+        std::fs::remove_file(order_path)?;
         consensus_metrics.merge(metrics);
         let ids_stored =
             options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
@@ -503,6 +519,7 @@ fn worker_count(workers: usize) -> Result<u32> {
 
 pub(crate) struct PreparedMateSection {
     path: std::path::PathBuf,
+    order_path: std::path::PathBuf,
     assignment_time: std::time::Duration,
     metrics: ConsensusMetrics,
 }
@@ -527,6 +544,8 @@ pub(crate) fn sort_and_write_mate(
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let assignment_time = sort_started.elapsed();
     let path = temp_dir.join(format!("mate.{mate}.section"));
+    let order_path = temp_dir.join(format!("mate.{mate}.order"));
+    let mut order = std::fs::File::create(&order_path)?;
     let file = std::fs::File::create(&path)?;
     let mut output = std::io::BufWriter::with_capacity(16 * 1024 * 1024, file);
     let metrics = write_sorted_clusters(
@@ -537,10 +556,20 @@ pub(crate) fn sort_and_write_mate(
         options.threads.div_ceil(2).max(1),
         temp_dir,
         expected_count,
+        &mut order,
     )?;
+    order.set_len(
+        metrics
+            .source_records
+            .saturating_mul(ORDER_ENTRY_SIZE as u64),
+    )?;
+    output.flush()?;
+    order.flush()?;
+    append_compact_order(&mut output, &order_path, metrics.source_records, temp_dir)?;
     output.flush()?;
     Ok(PreparedMateSection {
         path,
+        order_path,
         assignment_time,
         metrics,
     })
@@ -588,6 +617,7 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
         let mut section_file = std::fs::File::open(&section.path)?;
         std::io::copy(&mut section_file, &mut payload)?;
         std::fs::remove_file(section.path)?;
+        std::fs::remove_file(section.order_path)?;
         let ids_stored =
             options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
         write_prepared_record_columns(
@@ -664,12 +694,10 @@ fn write_store_clusters<W: Write>(
     let body_path = temp_dir.join(format!("clusters.{mate}.multi.body"));
     let mut multi_body =
         std::io::BufWriter::with_capacity(8 * 1024 * 1024, std::fs::File::create(&body_path)?);
-    let singleton_ids_path = temp_dir.join(format!("clusters.{mate}.singleton.ids"));
-    let mut singleton_ids = std::io::BufWriter::with_capacity(
-        8 * 1024 * 1024,
-        create_temporary_column(&singleton_ids_path)?,
-    );
     let mut singleton_sequences = StoredColumn::create(temp_dir, mate, "singleton-sequences")?;
+    let order_path = temp_dir.join(format!("clusters.{mate}.order"));
+    let mut order = std::fs::File::create(&order_path)?;
+    order.set_len(store.count().saturating_mul(ORDER_ENTRY_SIZE as u64))?;
     let workers = threads.max(1);
     let queue_capacity = workers.div_ceil(2).max(1);
     let in_flight = workers + queue_capacity;
@@ -704,13 +732,18 @@ fn write_store_clusters<W: Write>(
                         let result =
                             cluster_bucket(&mut worker_store, mate, reorder.kmer_size, &ids)
                                 .and_then(|clusters| {
-                                    let (multi_bytes, multi_cluster_count, singletons) =
-                                        partition_clusters_v7(&clusters)?;
+                                    let (
+                                        multi_bytes,
+                                        multi_cluster_count,
+                                        singletons,
+                                        order_entries,
+                                    ) = partition_clusters_v8(&clusters)?;
                                     Ok(ConsensusBucket {
                                         index,
                                         multi_cluster_count,
                                         multi_bytes,
                                         singletons,
+                                        order_entries,
                                         stats: worker_store.stats(),
                                         overlap_comparisons: 0,
                                         source_records: ids.len() as u64,
@@ -730,8 +763,8 @@ fn write_store_clusters<W: Write>(
                 done_rx,
                 permit_tx,
                 &mut multi_body,
-                &mut singleton_ids,
                 &mut singleton_sequences,
+                &mut order,
             )?;
             Ok((result.counts, result.max_pending_buckets, result.stats))
         })?;
@@ -741,13 +774,10 @@ fn write_store_clusters<W: Write>(
     let mut multi_body = std::fs::File::open(body_path)?;
     std::io::copy(&mut multi_body, payload)?;
     put_u32_writer(payload, cluster_count.1)?;
-    singleton_ids.flush()?;
-    let singleton_file = singleton_ids.get_mut();
-    let singleton_id_bytes = singleton_file.seek(SeekFrom::End(0))?;
-    singleton_file.seek(SeekFrom::Start(0))?;
-    put_u64_writer(payload, singleton_id_bytes)?;
-    std::io::copy(singleton_file, payload)?;
     singleton_sequences.write_packed_dna_to(payload, cluster_count.1 as usize)?;
+    order.flush()?;
+    append_compact_order(payload, &order_path, store.count(), temp_dir)?;
+    std::fs::remove_file(order_path)?;
     Ok(stats)
 }
 
@@ -756,6 +786,7 @@ struct ConsensusBucket {
     multi_cluster_count: u32,
     multi_bytes: Vec<u8>,
     singletons: Vec<(u64, PackedSequence)>,
+    order_entries: Vec<(u64, OrderEntry)>,
     #[cfg(test)]
     stats: StoreStats,
     overlap_comparisons: u64,
@@ -900,25 +931,6 @@ impl SingletonRecordWriter {
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
         drop(chunk);
         put_u32_writer(payload, count as u32)?;
-        let mut id_bytes = 0u64;
-        let mut previous_id = None;
-        for_each_singleton(&path, count, |record| {
-            let encoded =
-                previous_id.map_or(record.id, |previous| zigzag_delta(record.id, previous));
-            previous_id = Some(record.id);
-            id_bytes = id_bytes
-                .checked_add(varint_len(encoded) as u64)
-                .ok_or_else(|| Error::InvalidInput("singleton ID column too large".into()))?;
-            Ok(())
-        })?;
-        put_u64_writer(payload, id_bytes)?;
-        let mut previous_id = None;
-        for_each_singleton(&path, count, |record| {
-            let encoded =
-                previous_id.map_or(record.id, |previous| zigzag_delta(record.id, previous));
-            previous_id = Some(record.id);
-            put_varint(payload, encoded)
-        })?;
         if variable_length {
             payload.write_all(&[2])?;
             put_u64_writer(payload, data_len)?;
@@ -967,15 +979,6 @@ impl SingletonRecordWriter {
     }
 }
 
-fn varint_len(mut value: u64) -> usize {
-    let mut length = 1;
-    while value >= 0x80 {
-        value >>= 7;
-        length += 1;
-    }
-    length
-}
-
 fn for_each_singleton<F>(path: &Path, expected_count: usize, mut visit: F) -> Result<()>
 where
     F: FnMut(SingletonRecord) -> Result<()>,
@@ -1004,6 +1007,7 @@ fn write_sorted_clusters<W, I, E>(
     threads: usize,
     temp_dir: &Path,
     expected_count: u64,
+    order_output: &mut std::fs::File,
 ) -> Result<ConsensusMetrics>
 where
     W: Write + Seek,
@@ -1075,6 +1079,7 @@ where
                 permit_tx,
                 payload,
                 &mut singleton_sequences,
+                order_output,
             )?;
             let metrics = ConsensusMetrics {
                 producer: std::time::Duration::from_nanos(producer_nanos.load(Ordering::Relaxed)),
@@ -1117,6 +1122,14 @@ fn process_consensus_bucket(
             multi_cluster_count: 0,
             multi_bytes: Vec::new(),
             singletons: vec![(read.id, PackedSequence::try_from_bytes(&read.sequence)?)],
+            order_entries: vec![(
+                read.id,
+                OrderEntry {
+                    cluster: 0,
+                    read: 0,
+                    singleton: true,
+                },
+            )],
             #[cfg(test)]
             stats: StoreStats::default(),
             overlap_comparisons: 0,
@@ -1126,12 +1139,14 @@ fn process_consensus_bucket(
     }
     let (clusters, overlap_comparisons) = cluster_sequences_profiled(kmer_size, reads)?;
     let groups = clusters.len() as u64;
-    let (multi_bytes, multi_cluster_count, singletons) = partition_clusters_v7(&clusters)?;
+    let (multi_bytes, multi_cluster_count, singletons, order_entries) =
+        partition_clusters_v8(&clusters)?;
     Ok(ConsensusBucket {
         index,
         multi_cluster_count,
         multi_bytes,
         singletons,
+        order_entries,
         #[cfg(test)]
         stats: StoreStats::default(),
         overlap_comparisons,
@@ -1153,7 +1168,6 @@ where
     E: std::fmt::Display,
 {
     let mut bucket = Vec::with_capacity(limit);
-    let mut current_hash = None;
     let mut index = 0usize;
     let mut record_count = 0u64;
     let mut id_sum = 0u128;
@@ -1172,7 +1186,7 @@ where
         id_sum += read.original_id as u128;
         id_square_sum += (read.original_id as u128) * (read.original_id as u128);
         id_xor ^= read.original_id;
-        if current_hash.is_some_and(|hash| hash != read.hash) || bucket.len() == limit {
+        if bucket.len() == limit {
             let wait_started = std::time::Instant::now();
             permit_rx.recv().map_err(|_| {
                 Error::InvalidInput("consensus workers exited before all buckets were sent".into())
@@ -1190,7 +1204,6 @@ where
             bucket = Vec::with_capacity(limit);
             index += 1;
         }
-        current_hash = Some(read.hash);
         bucket.push(AssignedSequence {
             id: read.original_id,
             position: read.position,
@@ -1258,11 +1271,10 @@ fn produce_consensus_buckets(
     job_tx: crossbeam_channel::Sender<(usize, Vec<AssignedRead>)>,
 ) -> Result<()> {
     let mut bucket = Vec::with_capacity(limit);
-    let mut current_hash = None;
     let mut index = 0usize;
     for assignment in crate::reorder::AssignmentReader::open(assignments)? {
         let assignment = assignment?;
-        if current_hash.is_some_and(|hash| hash != assignment.hash) || bucket.len() == limit {
+        if bucket.len() == limit {
             permit_rx.recv().map_err(|_| {
                 Error::InvalidInput("consensus workers exited before all buckets were sent".into())
             })?;
@@ -1276,7 +1288,6 @@ fn produce_consensus_buckets(
             bucket = Vec::with_capacity(limit);
             index += 1;
         }
-        current_hash = Some(assignment.hash);
         bucket.push(AssignedRead {
             id: assignment.read_id,
             position: assignment.position,
@@ -1300,6 +1311,7 @@ fn write_stream_consensus_buckets<W: Write>(
     permit_tx: crossbeam_channel::Sender<()>,
     multi_output: &mut W,
     singleton_sequences: &mut SingletonRecordWriter,
+    order_output: &mut std::fs::File,
 ) -> Result<ConsensusWriteResult> {
     let mut pending = BTreeMap::new();
     let mut next_to_write = 0usize;
@@ -1326,6 +1338,24 @@ fn write_stream_consensus_buckets<W: Write>(
         pending.insert(bucket.index, bucket);
         max_pending_buckets = max_pending_buckets.max(pending.len() as u64);
         while let Some(bucket) = pending.remove(&next_to_write) {
+            for (original_id, entry) in &bucket.order_entries {
+                let offset = original_id
+                    .checked_mul(ORDER_ENTRY_SIZE as u64)
+                    .ok_or_else(|| Error::InvalidInput("order index too large".into()))?;
+                order_output.seek(SeekFrom::Start(offset))?;
+                order_output.write_all(&[entry.singleton as u8])?;
+                let cluster = if entry.singleton {
+                    singleton_count
+                        .checked_add(entry.cluster)
+                        .ok_or_else(|| Error::InvalidInput("singleton index overflow".into()))?
+                } else {
+                    multi_cluster_count
+                        .checked_add(entry.cluster)
+                        .ok_or_else(|| Error::InvalidInput("cluster index overflow".into()))?
+                };
+                order_output.write_all(&cluster.to_le_bytes())?;
+                order_output.write_all(&entry.read.to_le_bytes())?;
+            }
             multi_output.write_all(&bucket.multi_bytes)?;
             multi_cluster_count = multi_cluster_count
                 .checked_add(bucket.multi_cluster_count)
@@ -1362,18 +1392,17 @@ fn write_stream_consensus_buckets<W: Write>(
 }
 
 #[cfg(test)]
-fn write_consensus_buckets<W: Write, I: Write, S: SingletonSequenceSink>(
+fn write_consensus_buckets<W: Write, S: SingletonSequenceSink>(
     done_rx: crossbeam_channel::Receiver<Result<ConsensusBucket>>,
     permit_tx: crossbeam_channel::Sender<()>,
     multi_output: &mut W,
-    singleton_ids: &mut I,
     singleton_sequences: &mut S,
+    order_output: &mut std::fs::File,
 ) -> Result<ConsensusWriteResult> {
     let mut pending = BTreeMap::new();
     let mut next_to_write = 0usize;
     let mut multi_cluster_count = 0u32;
     let mut singleton_count = 0u32;
-    let mut previous_singleton_id = None;
     let mut max_pending_buckets = 0u64;
     #[cfg(test)]
     let mut stats = StoreStats::default();
@@ -1401,16 +1430,30 @@ fn write_consensus_buckets<W: Write, I: Write, S: SingletonSequenceSink>(
         pending.insert(bucket.index, bucket);
         max_pending_buckets = max_pending_buckets.max(pending.len() as u64);
         while let Some(bucket) = pending.remove(&next_to_write) {
+            for (original_id, entry) in &bucket.order_entries {
+                let offset = original_id
+                    .checked_mul(ORDER_ENTRY_SIZE as u64)
+                    .ok_or_else(|| Error::InvalidInput("order index too large".into()))?;
+                order_output.seek(SeekFrom::Start(offset))?;
+                order_output.write_all(&[entry.singleton as u8])?;
+                let cluster = if entry.singleton {
+                    singleton_count
+                        .checked_add(entry.cluster)
+                        .ok_or_else(|| Error::InvalidInput("singleton index overflow".into()))?
+                } else {
+                    multi_cluster_count
+                        .checked_add(entry.cluster)
+                        .ok_or_else(|| Error::InvalidInput("cluster index overflow".into()))?
+                };
+                order_output.write_all(&cluster.to_le_bytes())?;
+                order_output.write_all(&entry.read.to_le_bytes())?;
+            }
             multi_output.write_all(&bucket.multi_bytes)?;
             multi_cluster_count = multi_cluster_count
                 .checked_add(bucket.multi_cluster_count)
                 .ok_or_else(|| Error::InvalidInput("too many consensus clusters".into()))?;
-            for (original_id, sequence) in bucket.singletons {
-                let encoded_id = previous_singleton_id
-                    .map_or(original_id, |previous| zigzag_delta(original_id, previous));
-                put_varint(singleton_ids, encoded_id)?;
+            for (_, sequence) in bucket.singletons {
                 singleton_sequences.push_sequence(sequence)?;
-                previous_singleton_id = Some(original_id);
                 singleton_count = singleton_count
                     .checked_add(1)
                     .ok_or_else(|| Error::InvalidInput("too many consensus clusters".into()))?;
@@ -1501,7 +1544,13 @@ fn cluster_sequences_profiled(
     assignments: Vec<AssignedSequence>,
 ) -> Result<(Vec<ConsensusCluster>, u64)> {
     let mut groups: Vec<ClusterGroup> = Vec::new();
+    let mut groups_by_anchor: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
     let mut overlap_comparisons = 0u64;
+    let max_read_length = assignments
+        .iter()
+        .map(|assignment| assignment.sequence.len())
+        .max()
+        .unwrap_or(0) as i32;
     for assignment in assignments {
         let mut sequence = assignment.sequence;
         if assignment.reverse {
@@ -1525,21 +1574,33 @@ fn cluster_sequences_profiled(
         } else {
             0
         };
-        let mut best = None;
-        for (index, group) in groups.iter().enumerate() {
+        let lower_anchor = anchor.saturating_sub(max_read_length);
+        let upper_anchor = anchor.saturating_add(max_read_length);
+        let mut best: Option<(usize, i32, usize, usize)> = None;
+        let candidate_indices = groups_by_anchor
+            .range(lower_anchor..=upper_anchor)
+            .flat_map(|(_, indices)| indices.iter().copied())
+            .collect::<Vec<_>>();
+        for index in candidate_indices {
+            let group = &groups[index];
             overlap_comparisons += 1;
             let offset = group.anchor - anchor;
             let consensus_offset = offset - group.minimum_offset;
             let (overlap, distance) =
                 overlap_distance(&group.reference, &sequence, consensus_offset);
             let minimum_overlap = group.reference.len().min(sequence.len()).div_ceil(2);
-            if overlap >= minimum_overlap && distance <= 4 {
-                best = Some((index, offset));
-                break;
+            if overlap >= minimum_overlap && distance <= MAX_OVERLAP_MISMATCHES {
+                let replace = best.is_none_or(|(_, _, best_overlap, best_distance)| {
+                    distance < best_distance
+                        || (distance == best_distance && overlap > best_overlap)
+                });
+                if replace {
+                    best = Some((index, offset, overlap, distance));
+                }
             }
         }
         match best {
-            Some((index, offset)) => {
+            Some((index, offset, _, _)) => {
                 let group = &mut groups[index];
                 add_cluster_member(
                     group,
@@ -1560,6 +1621,7 @@ fn cluster_sequences_profiled(
                         count
                     })
                     .collect();
+                let index = groups.len();
                 groups.push(ClusterGroup {
                     anchor,
                     minimum_offset: 0,
@@ -1572,6 +1634,7 @@ fn cluster_sequences_profiled(
                         offset: 0,
                     }],
                 });
+                groups_by_anchor.entry(anchor).or_default().push(index);
             }
         }
     }
@@ -1628,7 +1691,7 @@ fn overlap_distance(reference: &[u8], sequence: &[u8], offset: i32) -> (usize, u
         .zip(&sequence[sequence_start..sequence_start + overlap])
     {
         distance += (left != right) as usize;
-        if distance > 4 {
+        if distance > MAX_OVERLAP_MISMATCHES {
             break;
         }
     }
@@ -1711,12 +1774,21 @@ fn reverse_complement_in_place(sequence: &mut [u8]) {
 
 type SingletonSequence = (u64, PackedSequence);
 
-fn partition_clusters_v7(
+#[derive(Clone, Copy)]
+struct OrderEntry {
+    cluster: u32,
+    read: u32,
+    singleton: bool,
+}
+
+fn partition_clusters_v8(
     clusters: &[ConsensusCluster],
-) -> Result<(Vec<u8>, u32, Vec<SingletonSequence>)> {
+) -> Result<(Vec<u8>, u32, Vec<SingletonSequence>, Vec<(u64, OrderEntry)>)> {
     let mut multi_bytes = Vec::new();
     let mut multi_cluster_count = 0u32;
     let mut singletons = Vec::new();
+    let mut order = Vec::new();
+    let mut multi_index = 0u32;
     for cluster in clusters {
         if cluster.reads.len() == 1 {
             let read = &cluster.reads[0];
@@ -1733,32 +1805,45 @@ fn partition_clusters_v7(
             } else {
                 cluster.reference.clone()
             };
+            let singleton_index = singletons.len() as u32;
             singletons.push((read.original_id, PackedSequence::try_from_bytes(&sequence)?));
+            order.push((
+                read.original_id,
+                OrderEntry {
+                    cluster: singleton_index,
+                    read: 0,
+                    singleton: true,
+                },
+            ));
         } else {
-            put_cluster_bodies_v7(&mut multi_bytes, std::slice::from_ref(cluster))?;
+            put_cluster_bodies_v8(&mut multi_bytes, std::slice::from_ref(cluster))?;
+            for (read_index, read) in cluster.reads.iter().enumerate() {
+                order.push((
+                    read.original_id,
+                    OrderEntry {
+                        cluster: multi_index,
+                        read: read_index as u32,
+                        singleton: false,
+                    },
+                ));
+            }
             multi_cluster_count = multi_cluster_count
                 .checked_add(1)
                 .ok_or_else(|| Error::InvalidInput("too many consensus clusters".into()))?;
+            multi_index += 1;
         }
     }
-    Ok((multi_bytes, multi_cluster_count, singletons))
+    Ok((multi_bytes, multi_cluster_count, singletons, order))
 }
 
-fn put_cluster_bodies_v7<W: Write>(writer: &mut W, clusters: &[ConsensusCluster]) -> Result<()> {
+fn put_cluster_bodies_v8<W: Write>(writer: &mut W, clusters: &[ConsensusCluster]) -> Result<()> {
     for cluster in clusters {
         if cluster.reads.len() < 2 {
-            return Err(Error::InvalidInput("V7 multi cluster is too small".into()));
+            return Err(Error::InvalidInput("RS3 multi cluster is too small".into()));
         }
-        put_reference_v7(writer, &cluster.reference)?;
+        put_reference_v8(writer, &cluster.reference)?;
         put_u32_writer(writer, cluster.reads.len() as u32)?;
-        let mut previous_id = 0u64;
-        for (index, read) in cluster.reads.iter().enumerate() {
-            if index == 0 {
-                put_varint(writer, read.original_id)?;
-            } else {
-                put_varint(writer, zigzag_delta(read.original_id, previous_id))?;
-            }
-            previous_id = read.original_id;
+        for read in &cluster.reads {
             writer.write_all(&[read.reverse as u8])?;
             put_varint(writer, read.offset as u64)?;
             put_varint(writer, read.length as u64)?;
@@ -1779,7 +1864,7 @@ fn put_cluster_bodies_v7<W: Write>(writer: &mut W, clusters: &[ConsensusCluster]
     Ok(())
 }
 
-fn put_reference_v7<W: Write>(writer: &mut W, reference: &[u8]) -> Result<()> {
+fn put_reference_v8<W: Write>(writer: &mut W, reference: &[u8]) -> Result<()> {
     let clean = reference
         .iter()
         .all(|base| matches!(base, b'A' | b'C' | b'G' | b'T'));
@@ -1807,14 +1892,6 @@ fn put_reference_v7<W: Write>(writer: &mut W, reference: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn zigzag_delta(value: u64, previous: u64) -> u64 {
-    if value >= previous {
-        (value - previous) << 1
-    } else {
-        ((previous - value) << 1) - 1
-    }
-}
-
 fn put_varint<W: Write>(writer: &mut W, mut value: u64) -> Result<()> {
     let mut bytes = [0u8; 10];
     let mut length = 0;
@@ -1827,6 +1904,40 @@ fn put_varint<W: Write>(writer: &mut W, mut value: u64) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+fn append_compact_order<W: Write>(
+    payload: &mut W,
+    order_path: &Path,
+    records: u64,
+    temp_dir: &Path,
+) -> Result<()> {
+    let compact_path = temp_dir.join(format!(
+        "{}.compact",
+        order_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::InvalidInput("invalid order path".into()))?
+    ));
+    let mut input = std::fs::File::open(order_path)?;
+    let mut compact = std::fs::File::create(&compact_path)?;
+    let mut slot = [0u8; ORDER_ENTRY_SIZE];
+    for _ in 0..records {
+        input.read_exact(&mut slot)?;
+        let singleton = slot[0] != 0;
+        let cluster = u32::from_le_bytes(slot[1..5].try_into().unwrap());
+        let read = u32::from_le_bytes(slot[5..9].try_into().unwrap());
+        put_varint(&mut compact, ((cluster as u64) << 1) | singleton as u64)?;
+        if !singleton {
+            put_varint(&mut compact, read as u64)?;
+        }
+    }
+    compact.flush()?;
+    let mut compact = std::fs::File::open(&compact_path)?;
+    put_u64_writer(payload, compact.metadata()?.len())?;
+    std::io::copy(&mut compact, payload)?;
+    std::fs::remove_file(compact_path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2083,13 +2194,11 @@ pub(crate) fn prepare_pair(
     let records = [first, second];
     let mut reads = Vec::with_capacity(2);
     for record in &records {
-        let assignment = crate::reorder::canonical_minimizers(
+        let assignment = crate::reorder::primary_minimizer(
             &record.sequence,
             options.reorder.kmer_size,
             options.reorder.window_size,
-        )
-        .into_iter()
-        .min_by_key(|(hash, position, reverse)| (*hash, *position, *reverse));
+        );
         let (hash, position, reverse) = assignment.unwrap_or((u64::MAX, 0, false));
         reads.push(SortableRead {
             hash,
@@ -2729,50 +2838,42 @@ impl<'a> Cursor<'a> {
         let length = usize_from(self.u32()? as u64, "field")?;
         Ok(self.take(length)?.to_vec())
     }
-    fn multi_clusters_v7(&mut self) -> Result<Vec<ConsensusCluster>> {
+    fn multi_clusters_v8(&mut self) -> Result<Vec<ConsensusCluster>> {
         let count = self.u32()? as usize;
         let mut clusters = Vec::with_capacity(count);
         for _ in 0..count {
-            let reference = self.reference_v7()?;
+            let reference = self.reference_v8()?;
             let reads_count = self.u32()? as usize;
             if reads_count < 2 {
-                return Err(Error::InvalidFormat("invalid V7 multi cluster".into()));
+                return Err(Error::InvalidFormat("invalid RS3 multi cluster".into()));
             }
             let mut reads = Vec::with_capacity(reads_count);
-            let mut previous_id = 0u64;
-            for index in 0..reads_count {
-                let encoded_id = self.varint()?;
-                let original_id = if index == 0 {
-                    encoded_id
-                } else {
-                    decode_zigzag_delta(encoded_id, previous_id)?
-                };
-                previous_id = original_id;
+            for _ in 0..reads_count {
                 let reverse = self.u8()? != 0;
                 let offset = u32::try_from(self.varint()?)
-                    .map_err(|_| Error::InvalidFormat("V7 offset too large".into()))?;
+                    .map_err(|_| Error::InvalidFormat("RS3 offset too large".into()))?;
                 let length = u32::try_from(self.varint()?)
-                    .map_err(|_| Error::InvalidFormat("V7 read length too large".into()))?;
+                    .map_err(|_| Error::InvalidFormat("RS3 read length too large".into()))?;
                 let mismatch_count = usize_from(self.varint()?, "mismatch count")?;
                 let mut mismatches = Vec::with_capacity(mismatch_count);
                 let mut position = 0u32;
                 for _ in 0..mismatch_count {
                     let delta = u32::try_from(self.varint()?).map_err(|_| {
-                        Error::InvalidFormat("V7 mismatch position too large".into())
+                        Error::InvalidFormat("RS3 mismatch position too large".into())
                     })?;
                     position = position.checked_add(delta).ok_or_else(|| {
-                        Error::InvalidFormat("V7 mismatch position overflow".into())
+                        Error::InvalidFormat("RS3 mismatch position overflow".into())
                     })?;
                     mismatches.push((position, self.u8()?));
                 }
                 let end = (offset as usize)
                     .checked_add(length as usize)
-                    .ok_or_else(|| Error::InvalidFormat("V7 read range overflow".into()))?;
+                    .ok_or_else(|| Error::InvalidFormat("RS3 read range overflow".into()))?;
                 if end > reference.len() {
-                    return Err(Error::InvalidFormat("V7 read exceeds reference".into()));
+                    return Err(Error::InvalidFormat("RS3 read exceeds reference".into()));
                 }
                 reads.push(ConsensusRead {
-                    original_id,
+                    original_id: 0,
                     offset,
                     reverse,
                     length,
@@ -2784,35 +2885,17 @@ impl<'a> Cursor<'a> {
         Ok(clusters)
     }
 
-    fn clusters_v7(&mut self) -> Result<Vec<ConsensusCluster>> {
-        let mut clusters = self.multi_clusters_v7()?;
+    fn clusters_v8(&mut self) -> Result<Vec<ConsensusCluster>> {
+        let mut clusters = self.multi_clusters_v8()?;
         let singleton_count = self.u32()? as usize;
-        let id_bytes_len = usize_from(self.u64()?, "singleton ID column")?;
-        let id_bytes = self.take(id_bytes_len)?;
-        let mut id_cursor = Cursor::new(id_bytes);
-        let mut singleton_ids = Vec::with_capacity(singleton_count);
-        let mut previous_id = 0u64;
-        for index in 0..singleton_count {
-            let encoded = id_cursor.varint()?;
-            let original_id = if index == 0 {
-                encoded
-            } else {
-                decode_zigzag_delta(encoded, previous_id)?
-            };
-            singleton_ids.push(original_id);
-            previous_id = original_id;
-        }
-        if id_cursor.position != id_bytes.len() {
-            return Err(Error::InvalidFormat("trailing V7 singleton ID data".into()));
-        }
         let sequences = self.column(singleton_count, true, "singleton sequence")?;
-        for (original_id, reference) in singleton_ids.into_iter().zip(sequences) {
+        for reference in sequences {
             let length = u32::try_from(reference.len())
-                .map_err(|_| Error::InvalidFormat("V7 reference too large".into()))?;
+                .map_err(|_| Error::InvalidFormat("RS3 reference too large".into()))?;
             clusters.push(ConsensusCluster {
                 reference,
                 reads: vec![ConsensusRead {
-                    original_id,
+                    original_id: 0,
                     offset: 0,
                     reverse: false,
                     length,
@@ -2823,15 +2906,43 @@ impl<'a> Cursor<'a> {
         Ok(clusters)
     }
 
-    fn reference_v7(&mut self) -> Result<Vec<u8>> {
+    fn order_v8(&mut self, records: usize) -> Result<Vec<OrderEntry>> {
+        let byte_len = usize_from(self.u64()?, "RS3 order index")?;
+        let bytes = self.take(byte_len)?;
+        let mut entries = Vec::with_capacity(records);
+        let mut order = Cursor::new(bytes);
+        for _ in 0..records {
+            let code = order.varint()?;
+            let singleton = code & 1 != 0;
+            let cluster = u32::try_from(code >> 1)
+                .map_err(|_| Error::InvalidFormat("RS3 order cluster too large".into()))?;
+            let read = if singleton {
+                0
+            } else {
+                u32::try_from(order.varint()?)
+                    .map_err(|_| Error::InvalidFormat("RS3 order read too large".into()))?
+            };
+            entries.push(OrderEntry {
+                singleton,
+                cluster,
+                read,
+            });
+        }
+        if order.position != bytes.len() {
+            return Err(Error::InvalidFormat("trailing RS3 order index data".into()));
+        }
+        Ok(entries)
+    }
+
+    fn reference_v8(&mut self) -> Result<Vec<u8>> {
         match self.u8()? {
             0 => self.bytes(),
             1 => {
                 let width = self.u32()? as usize;
                 let packed_width = width.div_ceil(4);
-                let data_len = usize_from(self.u64()?, "V7 reference")?;
+                let data_len = usize_from(self.u64()?, "RS3 reference")?;
                 if data_len != packed_width {
-                    return Err(Error::InvalidFormat("invalid V7 packed reference".into()));
+                    return Err(Error::InvalidFormat("invalid RS3 packed reference".into()));
                 }
                 let packed = self.take(data_len)?;
                 let bases = [b'A', b'C', b'G', b'T'];
@@ -2842,7 +2953,7 @@ impl<'a> Cursor<'a> {
                 }
                 Ok(reference)
             }
-            _ => Err(Error::InvalidFormat("invalid V7 reference mode".into())),
+            _ => Err(Error::InvalidFormat("invalid RS3 reference mode".into())),
         }
     }
 
@@ -2860,7 +2971,7 @@ impl<'a> Cursor<'a> {
         }
         Err(Error::InvalidFormat("unterminated RS3 varint".into()))
     }
-    fn record_metadata_v7(&mut self, ids: bool, quality: bool) -> Result<Vec<ReadRecord>> {
+    fn record_metadata_v8(&mut self, ids: bool, quality: bool) -> Result<Vec<ReadRecord>> {
         let count = self.u32()? as usize;
         let id_values = self.column(count, ids, "ID")?;
         let quality_len = usize_from(self.u64()?, "quality blocks")?;
@@ -3056,19 +3167,6 @@ impl<'a> Cursor<'a> {
                 "invalid RS3 {field} column mode"
             ))),
         }
-    }
-}
-
-fn decode_zigzag_delta(encoded: u64, previous: u64) -> Result<u64> {
-    let magnitude = (encoded >> 1) + (encoded & 1);
-    if encoded & 1 == 0 {
-        previous
-            .checked_add(magnitude)
-            .ok_or_else(|| Error::InvalidFormat("RS3 read ID overflow".into()))
-    } else {
-        previous
-            .checked_sub(magnitude)
-            .ok_or_else(|| Error::InvalidFormat("RS3 read ID underflow".into()))
     }
 }
 
@@ -3372,9 +3470,10 @@ mod tests {
                 }],
             })
             .collect::<Vec<_>>();
-        let (multi, count, singletons) = partition_clusters_v7(&clusters).unwrap();
+        let (multi, count, singletons, order) = partition_clusters_v8(&clusters).unwrap();
         assert!(multi.is_empty());
         assert_eq!(count, 0);
         assert_eq!(singletons.len(), clusters.len());
+        assert_eq!(order.len(), clusters.len());
     }
 }

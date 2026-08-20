@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SPRNG-RS4";
-const VERSION: u32 = 5;
+const VERSION: u32 = 8;
 const LONG_DISTANCE_WINDOW_LOG: u32 = 27;
 const ORDER_ENTRY_SIZE: usize = 9;
 const MAX_OVERLAP_MISMATCHES: usize = 4;
@@ -116,8 +116,13 @@ fn read_payload_collect<R: Read>(
     flags: u16,
     options: &DecompressionOptions,
 ) -> Result<ArchiveRecords> {
-    let mut decoded = (0..streams)
-        .map(|_| Vec::<(u64, ReadRecord)>::new())
+    let decoded = std::cell::RefCell::new(
+        (0..streams)
+            .map(|_| Vec::<(u64, ReadRecord)>::new())
+            .collect::<Vec<_>>(),
+    );
+    let mut quality_indices = (0..streams)
+        .map(|_| HashMap::<u64, usize>::new())
         .collect::<Vec<_>>();
     let (records, id_pattern) = decode_payload_records(
         payload,
@@ -126,10 +131,41 @@ fn read_payload_collect<R: Read>(
         streams,
         flags,
         |stream, original_id, record| {
-            decoded[stream].push((original_id, record));
+            decoded.borrow_mut()[stream].push((original_id, record));
+            Ok(())
+        },
+        |stream, original_id, quality| {
+            let mut decoded = decoded.borrow_mut();
+            if quality_indices[stream].is_empty() {
+                quality_indices[stream] = decoded[stream]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (id, _))| (*id, index))
+                    .collect();
+            }
+            let index = *quality_indices[stream]
+                .get(&original_id)
+                .ok_or_else(|| Error::InvalidFormat("quality original ID mismatch".into()))?;
+            let record = &mut decoded[stream][index].1;
+            record.quality = Some(quality);
+            Ok(())
+        },
+        |stream, original_id, id| {
+            let mut decoded = decoded.borrow_mut();
+            let index = decoded[stream]
+                .iter()
+                .position(|(id, _)| *id == original_id)
+                .ok_or_else(|| Error::InvalidFormat("ID stream original ID mismatch".into()))?;
+            if index >= decoded[stream].len() {
+                return Err(Error::InvalidFormat(
+                    "ID stream original ID mismatch".into(),
+                ));
+            }
+            decoded[stream][index].1.id = id;
             Ok(())
         },
     )?;
+    let mut decoded = decoded.into_inner();
     if flags & 1 != 0 && id_pattern != PairedIdPattern::Independent {
         let first_ids = decoded[0]
             .iter()
@@ -193,6 +229,14 @@ pub(crate) fn read_paired_into<R: Read, S: crate::PairedRecordSink>(
             RunWriter::new(workspace.join("mate-0"))?,
             RunWriter::new(workspace.join("mate-1"))?,
         ];
+        let mut quality_writers = [
+            QualityRunWriter::new(workspace.join("quality-0"))?,
+            QualityRunWriter::new(workspace.join("quality-1"))?,
+        ];
+        let mut id_writers = [
+            IdRunWriter::new(workspace.join("ids-0"))?,
+            IdRunWriter::new(workspace.join("ids-1"))?,
+        ];
         let (pairs, id_pattern) = decode_payload_records(
             &mut decoder,
             raw_len,
@@ -200,9 +244,18 @@ pub(crate) fn read_paired_into<R: Read, S: crate::PairedRecordSink>(
             streams,
             flags,
             |stream, original_id, record| run_writers[stream].push(original_id, record),
+            |stream, original_id, quality| quality_writers[stream].push(original_id, quality),
+            |stream, original_id, id| id_writers[stream].push(original_id, id),
         )?;
         let [first_writer, second_writer] = run_writers;
         let [first_runs, second_runs] = [first_writer.finish()?, second_writer.finish()?];
+        let [first_quality_writer, second_quality_writer] = quality_writers;
+        let [first_quality, second_quality] = [
+            first_quality_writer.finish()?,
+            second_quality_writer.finish()?,
+        ];
+        let [first_id_writer, second_id_writer] = id_writers;
+        let [first_ids, second_ids] = [first_id_writer.finish()?, second_id_writer.finish()?];
         merge_paired_runs(
             first_runs,
             second_runs,
@@ -212,6 +265,8 @@ pub(crate) fn read_paired_into<R: Read, S: crate::PairedRecordSink>(
             id_pattern,
             options,
             sink,
+            [first_quality, second_quality],
+            [first_ids, second_ids],
         )?;
         sink.finish()?;
         Ok(crate::DecompressionMetadata {
@@ -224,13 +279,20 @@ pub(crate) fn read_paired_into<R: Read, S: crate::PairedRecordSink>(
     result
 }
 
-fn decode_payload_records<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>(
+fn decode_payload_records<
+    R: Read,
+    F: FnMut(usize, u64, ReadRecord) -> Result<()>,
+    Q: FnMut(usize, u64, Vec<u8>) -> Result<()>,
+    I: FnMut(usize, u64, Vec<u8>) -> Result<()>,
+>(
     payload: &mut R,
     raw_len: u64,
     expected: u32,
     streams: usize,
     flags: u16,
     mut visit: F,
+    mut visit_quality: Q,
+    mut visit_id: I,
 ) -> Result<(u64, PairedIdPattern)> {
     let mut payload = ChecksummedReader::new(payload, raw_len);
     let records = payload.u64()?;
@@ -256,8 +318,6 @@ fn decode_payload_records<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()
                 "RS4 section record count mismatch".into(),
             ));
         }
-        let ids_enabled =
-            has_ids && (stream_index == 0 || id_pattern == PairedIdPattern::Independent);
         let mut decoded_multi = 0u64;
         for _ in 0..multi_groups {
             decoded_multi += decode_payload_group(
@@ -265,8 +325,8 @@ fn decode_payload_records<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()
                 stream_index,
                 multi_records,
                 0,
-                ids_enabled,
-                has_quality,
+                false,
+                false,
                 &mut visit,
             )?;
         }
@@ -277,8 +337,8 @@ fn decode_payload_records<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()
                 stream_index,
                 singleton_records,
                 2,
-                ids_enabled,
-                has_quality,
+                false,
+                false,
                 &mut visit,
             )?;
         }
@@ -286,6 +346,36 @@ fn decode_payload_records<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()
             return Err(Error::InvalidFormat(
                 "RS4 section group count mismatch".into(),
             ));
+        }
+        let id_count = payload.u64()?;
+        let ids_enabled =
+            has_ids && (stream_index == 0 || id_pattern == PairedIdPattern::Independent);
+        if id_count != if ids_enabled { records } else { 0 } {
+            return Err(Error::InvalidFormat(
+                "RS4 ID stream record count mismatch".into(),
+            ));
+        }
+        if id_count != 0 {
+            read_id_metadata_stream(&mut payload, id_count, |original_id, id| {
+                visit_id(stream_index, original_id, id)
+            })?;
+        }
+        if has_quality {
+            let mut blocks = crate::quality_blocks::QualityBlockReader::new(&mut payload)?;
+            let mut quality_records = 0u64;
+            while let Some(block) = blocks.next()? {
+                for quality in block {
+                    let original_id = quality_records;
+                    visit_quality(stream_index, original_id, quality)?;
+                    quality_records += 1;
+                }
+            }
+            blocks.finish()?;
+            if quality_records != records {
+                return Err(Error::InvalidFormat(
+                    "RS4 quality stream record count mismatch".into(),
+                ));
+            }
         }
     }
     payload.finish(expected)?;
@@ -298,7 +388,7 @@ fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>
     section_records: u64,
     expected_kind: u8,
     ids_enabled: bool,
-    has_quality: bool,
+    _has_quality: bool,
     visit: &mut F,
 ) -> Result<u64> {
     let group_records = payload.varint()?;
@@ -309,21 +399,40 @@ fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>
     }
     let kind = payload.u8()?;
     let singleton = expected_kind == 2;
-    if (singleton && !(kind == 1 || kind == 2 || kind == 3)) || (!singleton && kind != 0) {
+    if (singleton && !(kind == 1 || kind == 2 || kind == 3))
+        || (!singleton && !(kind == 0 || kind == 4))
+    {
         return Err(Error::InvalidFormat(format!(
             "invalid RS4 section group kind {kind} (expected {expected_kind})"
         )));
     }
-    let reference = if kind == 0 {
+    let reference = if kind == 0 || kind == 4 {
         read_reference_stream(payload)?
     } else {
         Vec::new()
     };
-    let fixed_length = if kind == 2 || kind == 3 {
+    let fixed_length = if kind == 2 || kind == 3 || kind == 4 {
         Some(
             u32::try_from(payload.varint()?)
                 .map_err(|_| Error::InvalidFormat("sequence too large".into()))?,
         )
+    } else {
+        None
+    };
+    let reverse_flags = if kind == 4 {
+        let flag_bytes = usize_from(group_records.div_ceil(8), "reverse flags")?;
+        let mut flags = vec![0; flag_bytes];
+        payload.read_exact(&mut flags)?;
+        if group_records % 8 != 0
+            && flags
+                .last()
+                .is_some_and(|last| *last & !((1 << (group_records % 8)) - 1) != 0)
+        {
+            return Err(Error::InvalidFormat(
+                "nonzero unused reverse flag bits".into(),
+            ));
+        }
+        Some(flags)
     } else {
         None
     };
@@ -345,7 +454,33 @@ fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>
             payload.read_exact(&mut bytes)?;
             PackedSequence::from_encoded(length, kind == 2, bytes)?.decode()
         } else {
-            let read = read_consensus_read_stream(payload, original_id)?;
+            let read = if kind == 4 {
+                let index = records_in_group.len();
+                let reverse = reverse_flags.as_ref().unwrap()[index / 8] & (1 << (index % 8)) != 0;
+                let offset = u32::try_from(payload.varint()?)
+                    .map_err(|_| Error::InvalidFormat("read offset too large".into()))?;
+                let mismatch_count = payload.varint()?;
+                let mut mismatches = Vec::with_capacity(usize_from(mismatch_count, "mismatches")?);
+                let mut previous_position = 0u32;
+                for _ in 0..mismatch_count {
+                    let position = previous_position
+                        .checked_add(u32::try_from(payload.varint()?).map_err(|_| {
+                            Error::InvalidFormat("mismatch position too large".into())
+                        })?)
+                        .ok_or_else(|| Error::InvalidFormat("mismatch position overflow".into()))?;
+                    mismatches.push((position, payload.u8()?));
+                    previous_position = position;
+                }
+                ConsensusRead {
+                    original_id,
+                    offset,
+                    reverse,
+                    length: fixed_length.unwrap(),
+                    mismatches,
+                }
+            } else {
+                read_consensus_read_stream(payload, original_id)?
+            };
             crate::reorder::decode_consensus_read(
                 &ConsensusCluster {
                     reference: reference.clone(),
@@ -356,16 +491,12 @@ fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>
         };
         records_in_group.push((original_id, sequence));
     }
-    let ids = if ids_enabled {
-        read_group_metadata(payload, group_records, false)?
-    } else {
-        vec![Vec::new(); usize_from(group_records, "group")?]
-    };
-    let qualities = if has_quality {
-        read_group_metadata(payload, group_records, true)?
-    } else {
-        vec![Vec::new(); usize_from(group_records, "group")?]
-    };
+    if ids_enabled {
+        return Err(Error::InvalidFormat(
+            "inline RS4 IDs are not supported in v8".into(),
+        ));
+    }
+    let ids = vec![Vec::new(); usize_from(group_records, "group")?];
     for (index, (original_id, sequence)) in records_in_group.into_iter().enumerate() {
         visit(
             stream_index,
@@ -373,11 +504,7 @@ fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>
             ReadRecord {
                 id: ids[index].clone(),
                 sequence,
-                quality: if has_quality {
-                    Some(qualities[index].clone())
-                } else {
-                    None
-                },
+                quality: None,
             },
         )?;
     }
@@ -557,6 +684,149 @@ fn read_run_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
     Ok(field)
 }
 
+struct QualityRunWriter {
+    path: std::path::PathBuf,
+    output: std::io::BufWriter<File>,
+    count: u64,
+}
+
+impl QualityRunWriter {
+    fn new(path: std::path::PathBuf) -> Result<Self> {
+        Ok(Self {
+            output: std::io::BufWriter::new(File::create(&path)?),
+            path,
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, original_id: u64, quality: Vec<u8>) -> Result<()> {
+        if original_id != self.count {
+            return Err(Error::InvalidFormat(
+                "quality stream original ID mismatch".into(),
+            ));
+        }
+        self.output
+            .write_all(&(quality.len() as u64).to_le_bytes())?;
+        self.output.write_all(&quality)?;
+        self.count += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<QualityRun> {
+        self.output.flush()?;
+        Ok(QualityRun {
+            path: self.path,
+            count: self.count,
+        })
+    }
+}
+
+struct QualityRun {
+    path: std::path::PathBuf,
+    count: u64,
+}
+
+struct IdRunWriter {
+    path: std::path::PathBuf,
+    output: std::io::BufWriter<File>,
+    count: u64,
+}
+
+impl IdRunWriter {
+    fn new(path: std::path::PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&path)?;
+        let path = path.join("run-00000000.bin");
+        let mut output = std::io::BufWriter::new(File::create(&path)?);
+        output.write_all(&0u64.to_le_bytes())?;
+        Ok(Self {
+            output,
+            path,
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, original_id: u64, id: Vec<u8>) -> Result<()> {
+        self.output.write_all(&original_id.to_le_bytes())?;
+        self.output.write_all(&(id.len() as u64).to_le_bytes())?;
+        self.output.write_all(&id)?;
+        self.count += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<IdRun> {
+        self.output.flush()?;
+        self.output.get_mut().seek(SeekFrom::Start(0))?;
+        self.output.get_mut().write_all(&self.count.to_le_bytes())?;
+        self.output.flush()?;
+        Ok(IdRun {
+            path: self.path,
+            count: self.count,
+        })
+    }
+}
+
+struct IdRun {
+    path: std::path::PathBuf,
+    count: u64,
+}
+
+struct IdRunReader {
+    input: BufReader<File>,
+    remaining: u64,
+}
+
+impl IdRunReader {
+    fn open(run: &IdRun) -> Result<Self> {
+        let mut input = BufReader::new(File::open(&run.path)?);
+        let mut count = [0; 8];
+        input.read_exact(&mut count)?;
+        if u64::from_le_bytes(count) != run.count {
+            return Err(Error::InvalidFormat("ID run record count mismatch".into()));
+        }
+        Ok(Self {
+            input,
+            remaining: run.count,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let mut original_id = [0; 8];
+        self.input.read_exact(&mut original_id)?;
+        let id = read_run_field(&mut self.input)?;
+        self.remaining -= 1;
+        Ok(Some((u64::from_le_bytes(original_id), id)))
+    }
+}
+
+struct QualityRunReader {
+    input: BufReader<File>,
+    remaining: u64,
+}
+
+impl QualityRunReader {
+    fn open(run: &QualityRun) -> Result<Self> {
+        Ok(Self {
+            input: BufReader::new(File::open(&run.path)?),
+            remaining: run.count,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let mut length = [0; 8];
+        self.input.read_exact(&mut length)?;
+        let mut quality = vec![0; usize_from(u64::from_le_bytes(length), "quality")?];
+        self.input.read_exact(&mut quality)?;
+        self.remaining -= 1;
+        Ok(Some(quality))
+    }
+}
+
 struct HeapEntry {
     original_id: u64,
     run: usize,
@@ -683,6 +953,8 @@ fn merge_paired_runs<S: crate::PairedRecordSink>(
     id_pattern: PairedIdPattern,
     options: &DecompressionOptions,
     sink: &mut S,
+    quality_runs: [QualityRun; 2],
+    id_runs: [IdRun; 2],
 ) -> Result<()> {
     if first_set.records != pairs || second_set.records != pairs {
         return Err(Error::InvalidFormat(
@@ -693,8 +965,16 @@ fn merge_paired_runs<S: crate::PairedRecordSink>(
     compact_run_set(&mut second_set, workspace)?;
     let mut first = RunMerger::open(&first_set.paths)?;
     let mut second = RunMerger::open(&second_set.paths)?;
+    let mut qualities = [
+        QualityRunReader::open(&quality_runs[0])?,
+        QualityRunReader::open(&quality_runs[1])?,
+    ];
+    let mut ids = [
+        IdRunReader::open(&id_runs[0])?,
+        IdRunReader::open(&id_runs[1])?,
+    ];
     for expected_id in 0..pairs {
-        let (first_id, first_record) = first
+        let (first_id, mut first_record) = first
             .next()?
             .ok_or_else(|| Error::InvalidFormat("truncated first mate runs".into()))?;
         let (second_id, mut second_record) = second
@@ -704,6 +984,40 @@ fn merge_paired_runs<S: crate::PairedRecordSink>(
             return Err(Error::InvalidFormat(
                 "paired run original ID mismatch".into(),
             ));
+        }
+        if flags & 2 != 0 {
+            first_record.quality = Some(
+                qualities[0]
+                    .next()?
+                    .ok_or_else(|| Error::InvalidFormat("truncated first quality run".into()))?,
+            );
+            second_record.quality = Some(
+                qualities[1]
+                    .next()?
+                    .ok_or_else(|| Error::InvalidFormat("truncated second quality run".into()))?,
+            );
+        }
+        if flags & 1 != 0 {
+            let first_stream_id = ids[0]
+                .next()?
+                .ok_or_else(|| Error::InvalidFormat("truncated first ID run".into()))?;
+            if first_stream_id.0 != expected_id {
+                return Err(Error::InvalidFormat(
+                    "first ID run original ID mismatch".into(),
+                ));
+            }
+            first_record.id = first_stream_id.1;
+            if id_pattern == PairedIdPattern::Independent {
+                let second_stream_id = ids[1]
+                    .next()?
+                    .ok_or_else(|| Error::InvalidFormat("truncated second ID run".into()))?;
+                if second_stream_id.0 != expected_id {
+                    return Err(Error::InvalidFormat(
+                        "second ID run original ID mismatch".into(),
+                    ));
+                }
+                second_record.id = second_stream_id.1;
+            }
         }
         if flags & 1 != 0 && id_pattern != PairedIdPattern::Independent {
             second_record.id = id_pattern.derive_second(&first_record.id)?;
@@ -718,6 +1032,18 @@ fn merge_paired_runs<S: crate::PairedRecordSink>(
     }
     if first.next()?.is_some() || second.next()?.is_some() {
         return Err(Error::InvalidFormat("trailing paired run records".into()));
+    }
+    if qualities[0].next()?.is_some() || qualities[1].next()?.is_some() {
+        return Err(Error::InvalidFormat("trailing quality run records".into()));
+    }
+    if ids[0].next()?.is_some() || ids[1].next()?.is_some() {
+        return Err(Error::InvalidFormat("trailing ID run records".into()));
+    }
+    for run in quality_runs {
+        std::fs::remove_file(run.path)?;
+    }
+    for run in id_runs {
+        std::fs::remove_file(run.path)?;
     }
     Ok(())
 }
@@ -812,7 +1138,7 @@ pub fn write_reordered_store_profiled<W: Write>(
             .open(&encoded_path)?;
         let zstd_start = std::time::Instant::now();
         let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
-        encoder.multithread(worker_count(options.threads)?)?;
+        encoder.multithread(worker_count(options.zstd_threads)?)?;
         if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
             encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
                 LONG_DISTANCE_WINDOW_LOG,
@@ -1037,7 +1363,7 @@ pub(crate) fn write_prepared_profiled<W: Write>(
             .open(&encoded_path)?;
         let zstd_start = std::time::Instant::now();
         let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
-        encoder.multithread(worker_count(options.threads)?)?;
+        encoder.multithread(worker_count(options.zstd_threads)?)?;
         if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
             encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
                 LONG_DISTANCE_WINDOW_LOG,
@@ -1232,11 +1558,12 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
         qualities,
         columns: _,
     } = prepared;
+    let empty_qualities: &[Vec<u8>] = &[];
     output.write_all(&[0; 37])?;
     let encoded_start = output.stream_position()?;
     let zstd_started = std::time::Instant::now();
     let mut encoder = zstd::stream::Encoder::new(&mut output, options.zstd_level)?;
-    encoder.multithread(worker_count(options.threads)?)?;
+    encoder.multithread(worker_count(options.zstd_threads)?)?;
     encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
         LONG_DISTANCE_WINDOW_LOG,
     ))?;
@@ -1264,11 +1591,18 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
             &mut payload,
             count,
             mate,
-            &ids[mate],
-            &qualities[mate],
+            &[],
+            empty_qualities,
             options,
             id_pattern,
         )?;
+        let store_ids =
+            options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
+        write_id_stream(&mut payload, &ids[mate], count, store_ids)?;
+        if options.preserve_quality {
+            write_quality_stream(&mut payload, &qualities[mate])?;
+        }
+        std::fs::remove_file(&qualities[mate].path)?;
         std::fs::remove_file(section.path)?;
         std::fs::remove_file(section.order_path)?;
     }
@@ -1324,6 +1658,130 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
     ))
 }
 
+fn write_quality_stream<W: Write>(output: &mut W, quality: &PreparedQuality) -> Result<()> {
+    output.write_all(&(PreparedQualityWriter::BLOCK_RECORDS as u32).to_le_bytes())?;
+    output.write_all(&quality.block_count.to_le_bytes())?;
+    copy_external_bytes(&quality.path, output)?;
+    Ok(())
+}
+
+fn write_id_stream<W: Write>(
+    output: &mut W,
+    ids: &[Vec<u8>],
+    count: u64,
+    enabled: bool,
+) -> Result<()> {
+    let count = if enabled { count } else { 0 };
+    put_u64_writer(output, count)?;
+    if !enabled || count == 0 {
+        return Ok(());
+    }
+    if ids.len() != usize_from(count, "ID stream")? {
+        return Err(Error::InvalidInput(
+            "ID column record count mismatch".into(),
+        ));
+    }
+    let values = ids.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let fixed = values
+        .first()
+        .is_none_or(|first| values.iter().all(|value| value.len() == first.len()));
+    let prefix = values.first().map_or(0, |first| {
+        values.iter().skip(1).fold(first.len(), |length, value| {
+            length.min(
+                value
+                    .iter()
+                    .zip(first.iter())
+                    .take(length)
+                    .take_while(|(left, right)| left == right)
+                    .count(),
+            )
+        })
+    });
+    let fixed_size = 1
+        + varint_len(values.first().map_or(0, |value| value.len() as u64))
+        + values.iter().map(|value| value.len()).sum::<usize>();
+    let variable_size = 1 + values
+        .iter()
+        .map(|value| varint_len(value.len() as u64) + value.len())
+        .sum::<usize>();
+    let prefix_size = 1
+        + varint_len(prefix as u64)
+        + prefix
+        + values
+            .iter()
+            .map(|value| varint_len((value.len() - prefix) as u64) + value.len() - prefix)
+            .sum::<usize>();
+    if prefix_size < fixed_size.min(variable_size) {
+        output.write_all(&[2])?;
+        put_varint(output, prefix as u64)?;
+        if let Some(first) = values.first() {
+            output.write_all(&first[..prefix])?;
+        }
+        for value in values {
+            put_varint(output, (value.len() - prefix) as u64)?;
+            output.write_all(&value[prefix..])?;
+        }
+    } else if fixed && fixed_size <= variable_size {
+        output.write_all(&[1])?;
+        put_varint(output, values.first().map_or(0, |value| value.len() as u64))?;
+        for value in values {
+            output.write_all(value)?;
+        }
+    } else {
+        output.write_all(&[0])?;
+        for value in values {
+            put_varint(output, value.len() as u64)?;
+            output.write_all(value)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_id_metadata_stream<R: Read, F: FnMut(u64, Vec<u8>) -> Result<()>>(
+    reader: &mut ChecksummedReader<'_, R>,
+    count: u64,
+    mut visit: F,
+) -> Result<()> {
+    let count = usize_from(count, "ID stream")?;
+    match reader.u8()? {
+        0 => {
+            for index in 0..count {
+                let length = usize_from(reader.varint()?, "ID")?;
+                let mut id = vec![0; length];
+                reader.read_exact(&mut id)?;
+                visit(index as u64, id)?;
+            }
+        }
+        1 => {
+            let width = usize_from(reader.varint()?, "ID")?;
+            for index in 0..count {
+                let mut id = vec![0; width];
+                reader.read_exact(&mut id)?;
+                visit(index as u64, id)?;
+            }
+        }
+        2 => {
+            let prefix_length = usize_from(reader.varint()?, "ID prefix")?;
+            let mut prefix = vec![0; prefix_length];
+            reader.read_exact(&mut prefix)?;
+            for index in 0..count {
+                let suffix_length = usize_from(reader.varint()?, "ID suffix")?;
+                let mut id = prefix.clone();
+                id.resize(
+                    prefix_length
+                        .checked_add(suffix_length)
+                        .ok_or_else(|| Error::InvalidFormat("ID too large".into()))?,
+                    0,
+                );
+                reader.read_exact(&mut id[prefix_length..])?;
+                visit(index as u64, id)?;
+            }
+        }
+        _ => return Err(Error::InvalidFormat("unsupported RS4 ID encoding".into())),
+    }
+    Ok(())
+}
+
 struct SingletonTailCounts {
     multi_groups: u64,
     multi_records: u64,
@@ -1337,7 +1795,7 @@ fn write_singleton_tail_section<R: Read + Seek, W: Write>(
     output: &mut W,
     count: u64,
     mate: usize,
-    ids: &[Vec<u8>],
+    _ids: &[Vec<u8>],
     qualities: &[Vec<u8>],
     options: &CompressionOptions,
     id_pattern: PairedIdPattern,
@@ -1380,9 +1838,7 @@ fn write_singleton_tail_section<R: Read + Seek, W: Write>(
                 output.write_all(&[read_one(input)?])?;
             }
         }
-        write_group_metadata(
-            output, &group_ids, ids, qualities, options, mate, id_pattern,
-        )?;
+        let _ = (&group_ids, options, mate, id_pattern);
         records += group_records;
     }
 
@@ -1415,7 +1871,7 @@ fn write_singleton_tail_section<R: Read + Seek, W: Write>(
                         flush_singleton_tail_batch(
                             output,
                             pending.take(),
-                            ids,
+                            &[],
                             qualities,
                             options,
                             mate,
@@ -1437,7 +1893,7 @@ fn write_singleton_tail_section<R: Read + Seek, W: Write>(
             }
             records += group_records;
         }
-        flush_singleton_tail_batch(output, pending, ids, qualities, options, mate, id_pattern)?;
+        flush_singleton_tail_batch(output, pending, &[], qualities, options, mate, id_pattern)?;
     }
     Ok(())
 }
@@ -2756,11 +3212,9 @@ fn copy_group_descriptors<R: Read, W: Write>(
                 mate,
                 id_pattern,
             )?;
-            put_varint(output, group_count)?;
-            output.write_all(&[kind])?;
-            put_reference_v8(output, &reference)?;
         }
         let mut group_ids = Vec::with_capacity(usize_from(group_count, "group")?);
+        let mut multi_reads = Vec::with_capacity(usize_from(group_count, "group")?);
         let mut previous_id = 0u64;
         for _ in 0..group_count {
             let original_id = zigzag_decode(read_varint(input)?, previous_id)?;
@@ -2783,15 +3237,7 @@ fn copy_group_descriptors<R: Read, W: Write>(
                     output.write_all(&[1])?;
                     put_varint(output, zigzag_delta(original_id, 0))?;
                     write_packed_sequence(output, &sequence)?;
-                    write_group_metadata(
-                        output,
-                        &[original_id],
-                        ids,
-                        qualities,
-                        options,
-                        mate,
-                        id_pattern,
-                    )?;
+                    write_group_metadata(output, &[original_id], ids, options, mate, id_pattern)?;
                     records += 1;
                     continue;
                 }
@@ -2827,37 +3273,69 @@ fn copy_group_descriptors<R: Read, W: Write>(
                 batch.ids.push(original_id);
                 batch.bodies.push(sequence.encoded_bytes().to_vec());
             } else {
-                put_varint(
-                    output,
-                    zigzag_delta(
-                        original_id,
-                        if group_ids.len() == 1 {
-                            0
-                        } else {
-                            group_ids[group_ids.len() - 2]
-                        },
-                    ),
-                )?;
-                let reverse = read_one(input)?;
-                output.write_all(&[reverse])?;
-                let offset = read_varint(input)?;
-                let length = read_varint(input)?;
+                let reverse = read_one(input)? != 0;
+                let offset = u32::try_from(read_varint(input)?)
+                    .map_err(|_| Error::InvalidFormat("read offset too large".into()))?;
+                let length = u32::try_from(read_varint(input)?)
+                    .map_err(|_| Error::InvalidFormat("read length too large".into()))?;
                 let mismatch_count = read_varint(input)?;
-                put_varint(output, offset)?;
-                put_varint(output, length)?;
-                put_varint(output, mismatch_count)?;
+                let mut mismatches = Vec::with_capacity(usize_from(mismatch_count, "mismatches")?);
+                let mut previous_position = 0u32;
                 for _ in 0..mismatch_count {
-                    let delta = read_varint(input)?;
+                    let position = previous_position
+                        .checked_add(u32::try_from(read_varint(input)?).map_err(|_| {
+                            Error::InvalidFormat("mismatch position too large".into())
+                        })?)
+                        .ok_or_else(|| Error::InvalidFormat("mismatch position overflow".into()))?;
                     let base = read_one(input)?;
-                    put_varint(output, delta)?;
-                    output.write_all(&[base])?;
+                    mismatches.push((position, base));
+                    previous_position = position;
                 }
+                multi_reads.push(ConsensusRead {
+                    original_id,
+                    offset,
+                    reverse,
+                    length,
+                    mismatches,
+                });
             }
         }
         if kind == 0 {
-            write_group_metadata(
-                output, &group_ids, ids, qualities, options, mate, id_pattern,
-            )?;
+            put_varint(output, group_count)?;
+            let fixed_length = multi_reads
+                .first()
+                .map(|read| read.length)
+                .filter(|&length| multi_reads.iter().all(|read| read.length == length));
+            output.write_all(&[if fixed_length.is_some() { 4 } else { 0 }])?;
+            put_reference_v8(output, &reference)?;
+            if let Some(length) = fixed_length {
+                put_varint(output, length as u64)?;
+                let mut flags = vec![0u8; multi_reads.len().div_ceil(8)];
+                for (index, read) in multi_reads.iter().enumerate() {
+                    flags[index / 8] |= (read.reverse as u8) << (index % 8);
+                }
+                output.write_all(&flags)?;
+            }
+            let mut previous_id = 0u64;
+            for read in &multi_reads {
+                put_varint(output, zigzag_delta(read.original_id, previous_id))?;
+                previous_id = read.original_id;
+                if fixed_length.is_none() {
+                    output.write_all(&[read.reverse as u8])?;
+                    put_varint(output, read.offset as u64)?;
+                    put_varint(output, read.length as u64)?;
+                } else {
+                    put_varint(output, read.offset as u64)?;
+                }
+                put_varint(output, read.mismatches.len() as u64)?;
+                let mut previous_position = 0u32;
+                for &(position, base) in &read.mismatches {
+                    put_varint(output, (position - previous_position) as u64)?;
+                    output.write_all(&[base])?;
+                    previous_position = position;
+                }
+            }
+            write_group_metadata(output, &group_ids, ids, options, mate, id_pattern)?;
             records += group_count;
         } else {
             records += 1;
@@ -2879,7 +3357,7 @@ fn flush_singleton_batch<W: Write>(
     output: &mut W,
     batch: Option<PendingSingletonBatch>,
     ids: &[Vec<u8>],
-    qualities: &[Vec<u8>],
+    _qualities: &[Vec<u8>],
     options: &CompressionOptions,
     mate: usize,
     id_pattern: PairedIdPattern,
@@ -2893,12 +3371,11 @@ fn flush_singleton_batch<W: Write>(
             output,
             &PackedSequence::from_encoded(batch.length, batch.packed, batch.bodies[0].clone())?,
         )?;
-        return write_group_metadata(
-            output, &batch.ids, ids, qualities, options, mate, id_pattern,
-        );
+        let _ = (ids, options, mate, id_pattern);
+        return Ok(());
     }
     put_varint(output, batch.ids.len() as u64)?;
-    output.write_all(&[2])?;
+    output.write_all(&[if batch.packed { 2 } else { 3 }])?;
     put_varint(output, batch.length as u64)?;
     let mut previous_id = 0;
     for (&id, body) in batch.ids.iter().zip(&batch.bodies) {
@@ -2906,9 +3383,8 @@ fn flush_singleton_batch<W: Write>(
         previous_id = id;
         output.write_all(body)?;
     }
-    write_group_metadata(
-        output, &batch.ids, ids, qualities, options, mate, id_pattern,
-    )
+    let _ = (ids, options, mate, id_pattern);
+    Ok(())
 }
 
 fn flush_singleton_tail_batch<W: Write>(
@@ -3036,7 +3512,6 @@ fn write_group_metadata<W: Write>(
     output: &mut W,
     group_ids: &[u64],
     ids: &[Vec<u8>],
-    qualities: &[Vec<u8>],
     options: &CompressionOptions,
     mate: usize,
     id_pattern: PairedIdPattern,
@@ -3050,17 +3525,6 @@ fn write_group_metadata<W: Write>(
                 ids.get(id as usize)
                     .map(Vec::as_slice)
                     .ok_or_else(|| Error::InvalidFormat("missing ID metadata".into()))
-            }),
-        )?;
-    }
-    if options.preserve_quality {
-        write_quality_metadata(
-            output,
-            group_ids.iter().map(|&id| {
-                qualities
-                    .get(id as usize)
-                    .map(Vec::as_slice)
-                    .ok_or_else(|| Error::InvalidFormat("missing quality metadata".into()))
             }),
         )?;
     }
@@ -3398,7 +3862,7 @@ where
     Ok(())
 }
 
-fn load_prepared_metadata(column: &PreparedColumn) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+fn load_prepared_metadata(column: &PreparedColumn) -> Result<(Vec<Vec<u8>>, PreparedQuality)> {
     let mut ids = Vec::new();
     if column.ids.count != 0 {
         for_each_id(&column.ids.path, column.ids.count, |id| {
@@ -3406,19 +3870,7 @@ fn load_prepared_metadata(column: &PreparedColumn) -> Result<(Vec<Vec<u8>>, Vec<
             Ok(())
         })?;
     }
-    let qualities = if column.qualities.block_count == 0 {
-        Vec::new()
-    } else {
-        let mut bytes = Vec::new();
-        copy_external_bytes(&column.qualities.path, &mut bytes)?;
-        let mut encoded = Vec::with_capacity(8 + bytes.len());
-        encoded.extend_from_slice(&(PreparedQualityWriter::BLOCK_RECORDS as u32).to_le_bytes());
-        encoded.extend_from_slice(&column.qualities.block_count.to_le_bytes());
-        encoded.extend_from_slice(&bytes);
-        let values = crate::quality_blocks::QualityBlocks::decode(&encoded)?;
-        values
-    };
-    Ok((ids, qualities))
+    Ok((ids, column.qualities.clone()))
 }
 
 struct PreparedQualityWriter {
@@ -3429,6 +3881,7 @@ struct PreparedQualityWriter {
     encoded_len: u64,
 }
 
+#[derive(Clone)]
 struct PreparedQuality {
     path: std::path::PathBuf,
     block_count: u32,
@@ -3582,7 +4035,7 @@ pub(crate) struct PreparedMetadata {
     id_pattern: PairedIdPattern,
     count: u64,
     ids: [Vec<Vec<u8>>; 2],
-    qualities: [Vec<Vec<u8>>; 2],
+    qualities: [PreparedQuality; 2],
 }
 
 impl PreparedRecordsBuilder {
@@ -4698,6 +5151,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn id_stream_round_trips_fixed_variable_prefix_and_arbitrary_values() {
+        let cases = [
+            vec![b"aa".to_vec(), b"bb".to_vec()],
+            vec![b"a".to_vec(), b"longer".to_vec(), b"".to_vec()],
+            vec![b"sample-00".to_vec(), b"sample-01".to_vec()],
+            vec![vec![0, 255, 1], vec![128, 0]],
+        ];
+        for ids in cases {
+            let mut encoded = Vec::new();
+            write_id_stream(&mut encoded, &ids, ids.len() as u64, true).unwrap();
+            let mut input = std::io::Cursor::new(encoded);
+            let length = input.get_ref().len() as u64;
+            let mut payload = ChecksummedReader::new(&mut input, length);
+            let count = payload.u64().unwrap();
+            let mut decoded = Vec::new();
+            read_id_metadata_stream(&mut payload, count, |_, id| {
+                decoded.push(id);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(decoded, ids);
+        }
+    }
+
+    #[test]
+    fn id_stream_rejects_truncated_record_count() {
+        let mut encoded = Vec::new();
+        put_u64_writer(&mut encoded, 2).unwrap();
+        encoded.extend_from_slice(&[1, 1, b'x']);
+        let length = encoded.len() as u64;
+        let mut input = std::io::Cursor::new(encoded);
+        let mut payload = ChecksummedReader::new(&mut input, length);
+        let count = payload.u64().unwrap();
+        let error = read_id_metadata_stream(&mut payload, count, |_, _| Ok(())).unwrap_err();
+        assert!(matches!(error, Error::Io(_) | Error::InvalidFormat(_)));
+    }
+
+    #[test]
     fn overlap_distance_stops_after_rejection_threshold() {
         assert_eq!(overlap_distance(b"AAAAAAAA", b"AAAACCCC", 0), (8, 4));
         assert_eq!(overlap_distance(b"AAAAAAAA", b"CCCCCCCC", 0), (8, 5));
@@ -4830,6 +5321,76 @@ mod tests {
         assert_eq!(read_one(&mut output).unwrap(), 1);
         assert_eq!(read_varint(&mut output).unwrap(), 6);
         assert_eq!(read_packed_sequence(&mut output).unwrap(), sequences[3]);
+    }
+
+    #[test]
+    fn compact_multi_descriptors_round_trip_fixed_lengths_and_flags() {
+        let mut input = Vec::new();
+        put_varint(&mut input, 2).unwrap();
+        input.write_all(&[0]).unwrap();
+        put_reference_v8(&mut input, b"ACGTAC").unwrap();
+        put_varint(&mut input, zigzag_delta(7, 0)).unwrap();
+        input.write_all(&[0]).unwrap();
+        put_varint(&mut input, 0).unwrap();
+        put_varint(&mut input, 4).unwrap();
+        put_varint(&mut input, 0).unwrap();
+        put_varint(&mut input, zigzag_delta(11, 7)).unwrap();
+        input.write_all(&[1]).unwrap();
+        put_varint(&mut input, 2).unwrap();
+        put_varint(&mut input, 4).unwrap();
+        put_varint(&mut input, 1).unwrap();
+        put_varint(&mut input, 1).unwrap();
+        input.write_all(b"N").unwrap();
+
+        let mut output = Vec::new();
+        let options = CompressionOptions {
+            preserve_ids: false,
+            preserve_quality: false,
+            ..CompressionOptions::default()
+        };
+        copy_group_descriptors(
+            &mut std::io::Cursor::new(input),
+            &mut output,
+            2,
+            0,
+            &[],
+            &[],
+            &options,
+            PairedIdPattern::Independent,
+        )
+        .unwrap();
+
+        let mut cursor = std::io::Cursor::new(&output);
+        let mut payload = ChecksummedReader::new(&mut cursor, output.len() as u64);
+        let mut decoded = Vec::new();
+        decode_payload_group(&mut payload, 0, 2, 0, false, false, &mut |_, id, record| {
+            decoded.push((id, record.sequence));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(decoded, vec![(7, b"ACGT".to_vec()), (11, b"GTNC".to_vec())]);
+    }
+
+    #[test]
+    fn compact_multi_descriptors_reject_nonzero_flag_padding() {
+        let mut encoded = Vec::new();
+        put_varint(&mut encoded, 1).unwrap();
+        encoded.write_all(&[4]).unwrap();
+        put_reference_v8(&mut encoded, b"ACGT").unwrap();
+        put_varint(&mut encoded, 4).unwrap();
+        encoded.write_all(&[2]).unwrap();
+        put_varint(&mut encoded, zigzag_delta(0, 0)).unwrap();
+        put_varint(&mut encoded, 0).unwrap();
+        put_varint(&mut encoded, 0).unwrap();
+        let mut cursor = std::io::Cursor::new(encoded);
+        let encoded_len = cursor.get_ref().len() as u64;
+        let mut payload = ChecksummedReader::new(&mut cursor, encoded_len);
+        let error =
+            decode_payload_group(&mut payload, 0, 1, 0, false, false, &mut |_, _, _| Ok(()))
+                .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidFormat(message) if message.contains("unused reverse"))
+        );
     }
 
     #[test]

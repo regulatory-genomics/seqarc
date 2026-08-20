@@ -21,6 +21,67 @@ pub(crate) struct QualityBlocks {
     block_records: u32,
 }
 
+pub(crate) struct QualityBlockReader<R> {
+    input: R,
+    block_records: u32,
+    block_count: u32,
+    blocks_read: u32,
+}
+
+impl<R: std::io::Read> QualityBlockReader<R> {
+    pub(crate) fn new(mut input: R) -> Result<Self> {
+        let block_records = read_u32_reader(&mut input)?;
+        if block_records == 0 {
+            return Err(Error::InvalidFormat("invalid quality block size".into()));
+        }
+        let block_count = read_u32_reader(&mut input)?;
+        Ok(Self {
+            input,
+            block_records,
+            block_count,
+            blocks_read: 0,
+        })
+    }
+
+    pub(crate) fn next(&mut self) -> Result<Option<Vec<Vec<u8>>>> {
+        if self.blocks_read == self.block_count {
+            return Ok(None);
+        }
+        let mode = match read_u8_reader(&mut self.input)? {
+            0 => BlockMode::Raw,
+            1 => BlockMode::DensePacked,
+            other => {
+                return Err(Error::InvalidFormat(format!(
+                    "unknown quality block mode {other}"
+                )))
+            }
+        };
+        let width = read_u32_reader(&mut self.input)?;
+        let records = read_u32_reader(&mut self.input)? as usize;
+        if records == 0 || records > self.block_records as usize {
+            return Err(Error::InvalidFormat(
+                "invalid quality block record count".into(),
+            ));
+        }
+        let alphabet_len = read_u16_reader(&mut self.input)? as usize;
+        let mut alphabet = vec![0; alphabet_len];
+        self.input.read_exact(&mut alphabet)?;
+        let body_len = usize::try_from(read_u64_reader(&mut self.input)?)
+            .map_err(|_| Error::InvalidFormat("quality block body too large".into()))?;
+        let mut body = vec![0; body_len];
+        self.input.read_exact(&mut body)?;
+        self.blocks_read += 1;
+        decode_block(mode, width, records, &alphabet, &body).map(Some)
+    }
+
+    pub(crate) fn finish(self) -> Result<R> {
+        if self.blocks_read != self.block_count {
+            return Err(Error::InvalidFormat("quality block count mismatch".into()));
+        }
+        Ok(self.input)
+    }
+}
+
 impl QualityBlocks {
     #[cfg(test)]
     pub(crate) fn new(block_records: usize) -> Self {
@@ -171,6 +232,30 @@ fn read_u8(buf: &[u8], cursor: &mut usize) -> Result<u8> {
     let v = buf[*cursor];
     *cursor += 1;
     Ok(v)
+}
+
+fn read_u8_reader<R: std::io::Read>(reader: &mut R) -> Result<u8> {
+    let mut value = [0; 1];
+    reader.read_exact(&mut value)?;
+    Ok(value[0])
+}
+
+fn read_u16_reader<R: std::io::Read>(reader: &mut R) -> Result<u16> {
+    let mut value = [0; 2];
+    reader.read_exact(&mut value)?;
+    Ok(u16::from_le_bytes(value))
+}
+
+fn read_u32_reader<R: std::io::Read>(reader: &mut R) -> Result<u32> {
+    let mut value = [0; 4];
+    reader.read_exact(&mut value)?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn read_u64_reader<R: std::io::Read>(reader: &mut R) -> Result<u64> {
+    let mut value = [0; 8];
+    reader.read_exact(&mut value)?;
+    Ok(u64::from_le_bytes(value))
 }
 
 fn read_u16(buf: &[u8], cursor: &mut usize) -> Result<u16> {
@@ -541,5 +626,25 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(QualityBlocks::decode(&actual).unwrap(), qualities);
+    }
+
+    #[test]
+    fn streaming_reader_round_trips_packed_and_raw_blocks() {
+        let packed = vec![b"DD9D".to_vec(), b"9DDD".to_vec(), b"DD,D".to_vec()];
+        let raw = (0..4)
+            .map(|row| (0..32).map(|column| row + column).collect::<Vec<u8>>())
+            .collect::<Vec<_>>();
+        let mut writer = QualityBlockWriter::new(std::io::Cursor::new(Vec::new()), 3).unwrap();
+        writer.push(&packed).unwrap();
+        writer.push(&raw).unwrap();
+        let encoded = writer.finish().unwrap().into_inner();
+
+        let mut reader = QualityBlockReader::new(std::io::Cursor::new(encoded)).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(block) = reader.next().unwrap() {
+            decoded.extend(block);
+        }
+        reader.finish().unwrap();
+        assert_eq!(decoded, packed.into_iter().chain(raw).collect::<Vec<_>>());
     }
 }

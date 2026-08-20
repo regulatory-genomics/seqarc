@@ -144,6 +144,7 @@ pub struct CompressionOptions {
     pub preserve_order: bool,
     pub quality_mode: QualityMode,
     pub threads: usize,
+    pub zstd_threads: usize,
     pub zstd_level: i32,
     pub reorder: ReorderOptions,
 }
@@ -179,6 +180,7 @@ impl Default for CompressionOptions {
             preserve_order: true,
             quality_mode: QualityMode::Lossless,
             threads: 16,
+            zstd_threads: 16,
             zstd_level: 19,
             reorder: ReorderOptions::default(),
         }
@@ -594,9 +596,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_sixteen_workers_and_large_chunks() {
+    fn defaults_use_sixteen_workers_and_zstd_threads() {
         let options = CompressionOptions::default();
         assert_eq!(options.threads, 16);
+        assert_eq!(options.zstd_threads, 16);
         assert_eq!(options.zstd_level, 19);
     }
 
@@ -753,7 +756,8 @@ mod tests {
             &mut store,
             &mut archive,
             &CompressionOptions {
-                threads: 4,
+                threads: 1,
+                zstd_threads: 4,
                 zstd_level: 19,
                 reorder: ReorderOptions {
                     kmer_size: 3,

@@ -307,6 +307,41 @@ pub(crate) fn encode_block_bytes(block: &[Vec<u8>]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+pub(crate) fn encode_blocks_bytes(qualities: &[&[u8]], block_records: usize) -> Result<Vec<u8>> {
+    let block_records = block_records.max(1);
+    let block_records_u32 = u32::try_from(block_records)
+        .map_err(|_| Error::InvalidInput("quality block size exceeds u32".into()))?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&block_records_u32.to_le_bytes());
+    let block_count_position = encoded.len();
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    let mut block_count = 0u32;
+    let mut start = 0;
+    while start < qualities.len() {
+        let width = qualities[start].len();
+        let end = qualities[start..]
+            .iter()
+            .take(block_records)
+            .position(|quality| quality.len() != width)
+            .map_or_else(
+                || (start + block_records).min(qualities.len()),
+                |offset| start + offset,
+            );
+        let block_values = qualities[start..end]
+            .iter()
+            .map(|quality| (*quality).to_vec())
+            .collect::<Vec<_>>();
+        write_block(&mut encoded, &encode_block(&block_values)?)?;
+        block_count = block_count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("too many quality blocks".into()))?;
+        start = end;
+    }
+    encoded[block_count_position..block_count_position + 4]
+        .copy_from_slice(&block_count.to_le_bytes());
+    Ok(encoded)
+}
+
 fn decode_block(
     mode: BlockMode,
     width: u32,
@@ -440,6 +475,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn bounded_group_encoding_preserves_packed_and_raw_modes() {
+        let packed = vec![b"DD9D".as_slice(), b"9DDD", b"DD,D"];
+        let encoded = encode_blocks_bytes(&packed, 2).unwrap();
+        assert_eq!(encoded[8], BlockMode::DensePacked as u8);
+        assert_eq!(
+            QualityBlocks::decode(&encoded).unwrap(),
+            packed
+                .iter()
+                .map(|value| value.to_vec())
+                .collect::<Vec<_>>()
+        );
+
+        let raw = (0..16)
+            .map(|row| (0..32).map(|column| row + column).collect::<Vec<u8>>())
+            .collect::<Vec<_>>();
+        let raw_refs = raw.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let encoded = encode_blocks_bytes(&raw_refs, 8).unwrap();
+        assert_eq!(encoded[8], BlockMode::Raw as u8);
+        assert_eq!(QualityBlocks::decode(&encoded).unwrap(), raw);
     }
 
     #[test]

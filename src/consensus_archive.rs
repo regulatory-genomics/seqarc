@@ -1,4 +1,3 @@
-use crate::codec;
 use crate::external_bytes::{copy_to as copy_external_bytes, Lz4ByteWriter};
 use crate::packed_sequence::PackedSequence;
 #[cfg(test)]
@@ -13,14 +12,15 @@ use crate::{
 };
 use bed_utils::extsort::{ExternalChunk, ExternalChunkBuilder};
 use crossbeam_channel::bounded;
-use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-const MAGIC: &[u8; 9] = b"SPRNG-RS3";
-const VERSION: u32 = 10;
+const MAGIC: &[u8; 9] = b"SPRNG-RS4";
+const VERSION: u32 = 5;
 const LONG_DISTANCE_WINDOW_LOG: u32 = 27;
 const ORDER_ENTRY_SIZE: usize = 9;
 const MAX_OVERLAP_MISMATCHES: usize = 4;
@@ -85,44 +85,160 @@ pub fn read_reordered<R: Read>(
     let mut magic = [0; 9];
     input.read_exact(&mut magic)?;
     if magic != *MAGIC {
-        return Err(Error::InvalidFormat("bad RS3 magic".into()));
+        return Err(Error::InvalidFormat("bad RS4 magic".into()));
     }
     let version = read_u32(&mut input)?;
     if version != VERSION {
-        return Err(Error::InvalidFormat("unsupported RS3 version".into()));
+        return Err(Error::InvalidFormat("unsupported RS4 version".into()));
     }
     let streams = read_u16(&mut input)? as usize;
     let flags = read_u16(&mut input)?;
     let raw_len = usize_from(read_u64(&mut input)?, "payload")?;
     let encoded_len = usize_from(read_u64(&mut input)?, "payload")?;
     let expected = read_u32(&mut input)?;
-    let mut encoded = vec![0; encoded_len];
-    input.read_exact(&mut encoded)?;
-    let mut decoder = codec::Decoder::new()?;
-    let payload = decoder.decode(&encoded, raw_len)?;
-    if checksum(&payload) != expected {
-        return Err(Error::InvalidFormat("RS3 checksum failure".into()));
-    }
-    read_payload_v8(&payload, streams, flags, options)
+    let mut encoded = input.take(encoded_len as u64);
+    let mut decoder = zstd::stream::read::Decoder::new(&mut encoded)?;
+    read_payload_collect(
+        &mut decoder,
+        raw_len as u64,
+        expected,
+        streams,
+        flags,
+        options,
+    )
 }
 
-fn read_payload_v8(
-    payload: &[u8],
+fn read_payload_collect<R: Read>(
+    payload: &mut R,
+    raw_len: u64,
+    expected: u32,
     streams: usize,
     flags: u16,
     options: &DecompressionOptions,
 ) -> Result<ArchiveRecords> {
-    let mut cursor = Cursor::new(payload);
-    let records = usize_from(cursor.u64()?, "record count")?;
-    let payload_streams = cursor.u16()? as usize;
+    let mut decoded = (0..streams)
+        .map(|_| Vec::<(u64, ReadRecord)>::new())
+        .collect::<Vec<_>>();
+    let (records, id_pattern) = decode_payload_records(
+        payload,
+        raw_len,
+        expected,
+        streams,
+        flags,
+        |stream, original_id, record| {
+            decoded[stream].push((original_id, record));
+            Ok(())
+        },
+    )?;
+    if flags & 1 != 0 && id_pattern != PairedIdPattern::Independent {
+        let first_ids = decoded[0]
+            .iter()
+            .map(|(id, record)| (*id, record.id.clone()))
+            .collect::<HashMap<_, _>>();
+        for (original_id, record) in &mut decoded[1] {
+            let first_id = first_ids
+                .get(original_id)
+                .ok_or_else(|| Error::InvalidFormat("paired ID original ID mismatch".into()))?;
+            record.id = id_pattern.derive_second(first_id)?;
+        }
+    }
+    if options.output_order == crate::OutputOrder::Original {
+        for stream in &mut decoded {
+            stream.sort_unstable_by_key(|(original_id, _)| *original_id);
+        }
+    }
+    let streams: Vec<Vec<ReadRecord>> = decoded
+        .into_iter()
+        .map(|stream| stream.into_iter().map(|(_, record)| record).collect())
+        .collect();
+    if streams
+        .iter()
+        .any(|stream: &Vec<ReadRecord>| stream.len() as u64 != records)
+    {
+        return Err(Error::InvalidFormat("RS4 record count mismatch".into()));
+    }
+    finish_decoding(streams, options)
+}
+
+pub(crate) fn read_paired_into<R: Read, S: crate::PairedRecordSink>(
+    mut input: R,
+    options: &DecompressionOptions,
+    sink: &mut S,
+) -> Result<crate::DecompressionMetadata> {
+    let mut magic = [0; 9];
+    input.read_exact(&mut magic)?;
+    if magic != *MAGIC {
+        return Err(Error::InvalidFormat("bad RS4 magic".into()));
+    }
+    if read_u32(&mut input)? != VERSION {
+        return Err(Error::InvalidFormat("unsupported RS4 version".into()));
+    }
+    let streams = read_u16(&mut input)? as usize;
+    let flags = read_u16(&mut input)?;
+    let raw_len = read_u64(&mut input)?;
+    let encoded_len = read_u64(&mut input)?;
+    let expected = read_u32(&mut input)?;
+    if streams != 2 {
+        return Err(Error::InvalidFormat(
+            "paired decompression requires two streams".into(),
+        ));
+    }
+    let mut encoded = input.take(encoded_len);
+    let mut decoder = zstd::stream::read::Decoder::new(&mut encoded)?;
+    let temp_root = options.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&temp_root)?;
+    let workspace = unique_decode_workspace(&temp_root)?;
+    let result = (|| -> Result<crate::DecompressionMetadata> {
+        let mut run_writers = [
+            RunWriter::new(workspace.join("mate-0"))?,
+            RunWriter::new(workspace.join("mate-1"))?,
+        ];
+        let (pairs, id_pattern) = decode_payload_records(
+            &mut decoder,
+            raw_len,
+            expected,
+            streams,
+            flags,
+            |stream, original_id, record| run_writers[stream].push(original_id, record),
+        )?;
+        let [first_writer, second_writer] = run_writers;
+        let [first_runs, second_runs] = [first_writer.finish()?, second_writer.finish()?];
+        merge_paired_runs(
+            first_runs,
+            second_runs,
+            &workspace,
+            pairs,
+            flags,
+            id_pattern,
+            options,
+            sink,
+        )?;
+        sink.finish()?;
+        Ok(crate::DecompressionMetadata {
+            streams: 2,
+            pairs,
+            output_order: options.output_order,
+        })
+    })();
+    let _ = std::fs::remove_dir_all(&workspace);
+    result
+}
+
+fn decode_payload_records<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>(
+    payload: &mut R,
+    raw_len: u64,
+    expected: u32,
+    streams: usize,
+    flags: u16,
+    mut visit: F,
+) -> Result<(u64, PairedIdPattern)> {
+    let mut payload = ChecksummedReader::new(payload, raw_len);
+    let records = payload.u64()?;
+    let payload_streams = payload.u16()? as usize;
     if streams == 0 || streams != payload_streams {
-        return Err(Error::InvalidFormat("RS3 stream count mismatch".into()));
+        return Err(Error::InvalidFormat("RS4 stream count mismatch".into()));
     }
-    let quality_mode = cursor.u8()?;
-    if quality_mode > 1 {
-        return Err(Error::InvalidFormat("unknown RS3 quality mode".into()));
-    }
-    let id_pattern = PairedIdPattern::try_from(cursor.u8()?)?;
+    let id_pattern = PairedIdPattern::try_from(payload.u8()?)?;
     let has_ids = flags & 1 != 0;
     let has_quality = flags & 2 != 0;
     if id_pattern != PairedIdPattern::Independent && (!has_ids || streams != 2) {
@@ -130,60 +246,169 @@ fn read_payload_v8(
             "paired ID pattern requires two ID-bearing streams".into(),
         ));
     }
-    let mut decoded_streams = Vec::with_capacity(streams);
     for stream_index in 0..streams {
-        let clusters = cursor.clusters_v8()?;
-        let order = cursor.order_v8(records)?;
-        let ids_stored =
+        let multi_groups = payload.u64()?;
+        let multi_records = payload.u64()?;
+        let singleton_buckets = payload.u64()?;
+        let singleton_records = payload.u64()?;
+        if multi_records + singleton_records != records {
+            return Err(Error::InvalidFormat(
+                "RS4 section record count mismatch".into(),
+            ));
+        }
+        let ids_enabled =
             has_ids && (stream_index == 0 || id_pattern == PairedIdPattern::Independent);
-        let mut metadata = if quality_mode == 0 {
-            cursor.columnar_records(ids_stored, has_quality)?
-        } else {
-            cursor.record_metadata_v8(ids_stored, has_quality)?
-        };
-        if metadata.len() != records {
-            return Err(Error::InvalidFormat("RS3 record count mismatch".into()));
+        let mut decoded_multi = 0u64;
+        for _ in 0..multi_groups {
+            decoded_multi += decode_payload_group(
+                &mut payload,
+                stream_index,
+                multi_records,
+                0,
+                ids_enabled,
+                has_quality,
+                &mut visit,
+            )?;
         }
-        let multi_count = clusters
-            .iter()
-            .filter(|cluster| cluster.reads.len() > 1)
-            .count();
-        for (original_id, entry) in order.into_iter().enumerate() {
-            let cluster_index = if entry.singleton {
-                multi_count
-                    .checked_add(entry.cluster as usize)
-                    .ok_or_else(|| Error::InvalidFormat("invalid RS3 singleton index".into()))?
+        let mut decoded_singletons = 0u64;
+        for _ in 0..singleton_buckets {
+            decoded_singletons += decode_payload_group(
+                &mut payload,
+                stream_index,
+                singleton_records,
+                2,
+                ids_enabled,
+                has_quality,
+                &mut visit,
+            )?;
+        }
+        if decoded_multi != multi_records || decoded_singletons != singleton_records {
+            return Err(Error::InvalidFormat(
+                "RS4 section group count mismatch".into(),
+            ));
+        }
+    }
+    payload.finish(expected)?;
+    Ok((records, id_pattern))
+}
+
+fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>(
+    payload: &mut ChecksummedReader<'_, R>,
+    stream_index: usize,
+    section_records: u64,
+    expected_kind: u8,
+    ids_enabled: bool,
+    has_quality: bool,
+    visit: &mut F,
+) -> Result<u64> {
+    let group_records = payload.varint()?;
+    if group_records == 0 || group_records > section_records {
+        return Err(Error::InvalidFormat(
+            "invalid RS4 group record count".into(),
+        ));
+    }
+    let kind = payload.u8()?;
+    let singleton = expected_kind == 2;
+    if (singleton && !(kind == 1 || kind == 2 || kind == 3)) || (!singleton && kind != 0) {
+        return Err(Error::InvalidFormat(format!(
+            "invalid RS4 section group kind {kind} (expected {expected_kind})"
+        )));
+    }
+    let reference = if kind == 0 {
+        read_reference_stream(payload)?
+    } else {
+        Vec::new()
+    };
+    let fixed_length = if kind == 2 || kind == 3 {
+        Some(
+            u32::try_from(payload.varint()?)
+                .map_err(|_| Error::InvalidFormat("sequence too large".into()))?,
+        )
+    } else {
+        None
+    };
+    let mut records_in_group = Vec::with_capacity(usize_from(group_records, "group")?);
+    let mut previous_id = 0u64;
+    for _ in 0..group_records {
+        let original_id = zigzag_decode(payload.varint()?, previous_id)?;
+        previous_id = original_id;
+        let sequence = if kind == 1 {
+            read_packed_sequence_stream(payload)?
+        } else if kind == 2 || kind == 3 {
+            let length = fixed_length.unwrap();
+            let encoded_length = if kind == 2 {
+                (length as usize).div_ceil(4)
             } else {
-                entry.cluster as usize
+                length as usize
             };
-            let cluster = clusters
-                .get(cluster_index)
-                .ok_or_else(|| Error::InvalidFormat("invalid RS3 order cluster index".into()))?;
-            let read = cluster
-                .reads
-                .get(entry.read as usize)
-                .ok_or_else(|| Error::InvalidFormat("invalid RS3 order read index".into()))?;
-            metadata[original_id].sequence = crate::reorder::decode_consensus_read(cluster, read)?;
+            let mut bytes = vec![0; encoded_length];
+            payload.read_exact(&mut bytes)?;
+            PackedSequence::from_encoded(length, kind == 2, bytes)?.decode()
+        } else {
+            let read = read_consensus_read_stream(payload, original_id)?;
+            crate::reorder::decode_consensus_read(
+                &ConsensusCluster {
+                    reference: reference.clone(),
+                    reads: Vec::new(),
+                },
+                &read,
+            )?
+        };
+        records_in_group.push((original_id, sequence));
+    }
+    let ids = if ids_enabled {
+        read_group_metadata(payload, group_records, false)?
+    } else {
+        vec![Vec::new(); usize_from(group_records, "group")?]
+    };
+    let qualities = if has_quality {
+        read_group_metadata(payload, group_records, true)?
+    } else {
+        vec![Vec::new(); usize_from(group_records, "group")?]
+    };
+    for (index, (original_id, sequence)) in records_in_group.into_iter().enumerate() {
+        visit(
+            stream_index,
+            original_id,
+            ReadRecord {
+                id: ids[index].clone(),
+                sequence,
+                quality: if has_quality {
+                    Some(qualities[index].clone())
+                } else {
+                    None
+                },
+            },
+        )?;
+    }
+    Ok(group_records)
+}
+
+fn unique_decode_workspace(root: &Path) -> Result<std::path::PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..1000 {
+        let path = root.join(format!(
+            "spring-rs-decode-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(Error::Io(error)),
         }
-        decoded_streams.push(metadata);
     }
-    if cursor.position != payload.len() {
-        return Err(Error::InvalidFormat("trailing data in RS3 payload".into()));
-    }
-    if has_ids && id_pattern != PairedIdPattern::Independent {
-        let (first, rest) = decoded_streams.split_at_mut(1);
-        for (first, second) in first[0].iter().zip(&mut rest[0]) {
-            second.id = id_pattern.derive_second(&first.id)?;
-        }
-    }
-    finish_decoding(decoded_streams, options)
+    Err(Error::InvalidInput(
+        "unable to allocate decode workspace".into(),
+    ))
 }
 
 fn finish_decoding(
     mut streams: Vec<Vec<ReadRecord>>,
     options: &DecompressionOptions,
 ) -> Result<ArchiveRecords> {
-    if let Some(range) = options.range.as_ref() {
+    let range = options.original_range.as_ref();
+    if let Some(range) = range {
         for stream in &mut streams {
             *stream = stream
                 .iter()
@@ -196,6 +421,307 @@ fn finish_decoding(
     Ok(ArchiveRecords { streams })
 }
 
+struct RunWriter {
+    prefix: std::path::PathBuf,
+    next_run: usize,
+    records: Vec<(u64, ReadRecord)>,
+    paths: Vec<std::path::PathBuf>,
+    count: u64,
+}
+
+struct RunSet {
+    paths: Vec<std::path::PathBuf>,
+    records: u64,
+}
+
+const RUN_MERGE_FAN_IN: usize = 64;
+
+impl RunWriter {
+    const RUN_RECORDS: usize = 65_536;
+
+    fn new(prefix: std::path::PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&prefix)?;
+        Ok(Self {
+            prefix,
+            next_run: 0,
+            records: Vec::with_capacity(Self::RUN_RECORDS),
+            paths: Vec::new(),
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, original_id: u64, record: ReadRecord) -> Result<()> {
+        self.records.push((original_id, record));
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("too many decoded records".into()))?;
+        if self.records.len() == Self::RUN_RECORDS {
+            self.flush_run_with_paths()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<RunSet> {
+        self.flush_run_with_paths()?;
+        Ok(RunSet {
+            paths: self.paths,
+            records: self.count,
+        })
+    }
+
+    fn flush_run_with_paths(&mut self) -> Result<()> {
+        if self.records.is_empty() {
+            return Ok(());
+        }
+        self.records.sort_unstable_by_key(|(id, _)| *id);
+        let path = self.prefix.join(format!("run-{:08}.bin", self.next_run));
+        self.next_run += 1;
+        let mut file = std::io::BufWriter::new(File::create(path.clone())?);
+        file.write_all(&(self.records.len() as u64).to_le_bytes())?;
+        for (original_id, record) in self.records.drain(..) {
+            write_run_record(&mut file, original_id, &record)?;
+        }
+        file.flush()?;
+        self.paths.push(path);
+        Ok(())
+    }
+}
+
+fn write_run_record<W: Write>(writer: &mut W, original_id: u64, record: &ReadRecord) -> Result<()> {
+    writer.write_all(&original_id.to_le_bytes())?;
+    for field in [&record.id, &record.sequence] {
+        writer.write_all(&(field.len() as u64).to_le_bytes())?;
+        writer.write_all(field)?;
+    }
+    match &record.quality {
+        Some(quality) => {
+            writer.write_all(&[1])?;
+            writer.write_all(&(quality.len() as u64).to_le_bytes())?;
+            writer.write_all(quality)?;
+        }
+        None => writer.write_all(&[0])?,
+    }
+    Ok(())
+}
+
+struct RunReader {
+    file: BufReader<File>,
+    remaining: u64,
+}
+
+impl RunReader {
+    fn open(path: &Path) -> Result<Self> {
+        let mut file = BufReader::new(File::open(path)?);
+        let mut count = [0u8; 8];
+        file.read_exact(&mut count)?;
+        Ok(Self {
+            file,
+            remaining: u64::from_le_bytes(count),
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<(u64, ReadRecord)>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let mut original_id = [0u8; 8];
+        self.file.read_exact(&mut original_id)?;
+        let id = read_run_field(&mut self.file)?;
+        let sequence = read_run_field(&mut self.file)?;
+        let mut present = [0u8; 1];
+        self.file.read_exact(&mut present)?;
+        let quality = match present[0] {
+            0 => None,
+            1 => Some(read_run_field(&mut self.file)?),
+            _ => return Err(Error::InvalidFormat("invalid RS4 run quality flag".into())),
+        };
+        self.remaining -= 1;
+        Ok(Some((
+            u64::from_le_bytes(original_id),
+            ReadRecord {
+                id,
+                sequence,
+                quality,
+            },
+        )))
+    }
+}
+
+fn read_run_field<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut length = [0u8; 8];
+    reader.read_exact(&mut length)?;
+    let length = usize_from(u64::from_le_bytes(length), "run field")?;
+    let mut field = vec![0; length];
+    reader.read_exact(&mut field)?;
+    Ok(field)
+}
+
+struct HeapEntry {
+    original_id: u64,
+    run: usize,
+    record: ReadRecord,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        (self.original_id, self.run) == (other.original_id, other.run)
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.original_id, other.run).cmp(&(self.original_id, self.run))
+    }
+}
+
+struct RunMerger {
+    readers: Vec<RunReader>,
+    heap: std::collections::BinaryHeap<HeapEntry>,
+    count: u64,
+}
+
+impl RunMerger {
+    fn open(paths: &[std::path::PathBuf]) -> Result<Self> {
+        let mut readers = Vec::with_capacity(paths.len());
+        let mut heap = std::collections::BinaryHeap::new();
+        for path in paths {
+            readers.push(RunReader::open(path)?);
+        }
+        for run in 0..readers.len() {
+            if let Some((original_id, record)) = readers[run].next()? {
+                heap.push(HeapEntry {
+                    original_id,
+                    run,
+                    record,
+                });
+            }
+        }
+        Ok(Self {
+            readers,
+            heap,
+            count: 0,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<(u64, ReadRecord)>> {
+        let Some(entry) = self.heap.pop() else {
+            return Ok(None);
+        };
+        if let Some((original_id, record)) = self.readers[entry.run].next()? {
+            self.heap.push(HeapEntry {
+                original_id,
+                run: entry.run,
+                record,
+            });
+        }
+        self.count += 1;
+        Ok(Some((entry.original_id, entry.record)))
+    }
+}
+
+fn merge_run_batch(paths: &[std::path::PathBuf], output: &Path) -> Result<u64> {
+    let mut merger = RunMerger::open(paths)?;
+    let mut output = std::io::BufWriter::new(File::create(output)?);
+    output.write_all(&0u64.to_le_bytes())?;
+    let mut count = 0u64;
+    while let Some((original_id, record)) = merger.next()? {
+        write_run_record(&mut output, original_id, &record)?;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("too many merged run records".into()))?;
+    }
+    output.flush()?;
+    let mut output = output
+        .into_inner()
+        .map_err(|error| Error::Io(error.into_error()))?;
+    output.seek(SeekFrom::Start(0))?;
+    output.write_all(&count.to_le_bytes())?;
+    output.flush()?;
+    Ok(count)
+}
+
+fn compact_run_set(set: &mut RunSet, workspace: &Path) -> Result<()> {
+    if set.paths.len() <= RUN_MERGE_FAN_IN {
+        return Ok(());
+    }
+    let merge_root = workspace.join("merged-runs");
+    std::fs::create_dir_all(&merge_root)?;
+    let mut current = std::mem::take(&mut set.paths);
+    let mut pass = 0usize;
+    while current.len() > RUN_MERGE_FAN_IN {
+        let mut next = Vec::with_capacity(current.len().div_ceil(RUN_MERGE_FAN_IN));
+        for (batch, input_paths) in current.chunks(RUN_MERGE_FAN_IN).enumerate() {
+            let output = merge_root.join(format!("pass-{pass:04}-{batch:08}.bin"));
+            merge_run_batch(input_paths, &output)?;
+            for path in input_paths {
+                std::fs::remove_file(path)?;
+            }
+            next.push(output);
+        }
+        current = next;
+        pass += 1;
+    }
+    set.paths = current;
+    Ok(())
+}
+
+fn merge_paired_runs<S: crate::PairedRecordSink>(
+    mut first_set: RunSet,
+    mut second_set: RunSet,
+    workspace: &Path,
+    pairs: u64,
+    flags: u16,
+    id_pattern: PairedIdPattern,
+    options: &DecompressionOptions,
+    sink: &mut S,
+) -> Result<()> {
+    if first_set.records != pairs || second_set.records != pairs {
+        return Err(Error::InvalidFormat(
+            "paired stream record count mismatch".into(),
+        ));
+    }
+    compact_run_set(&mut first_set, workspace)?;
+    compact_run_set(&mut second_set, workspace)?;
+    let mut first = RunMerger::open(&first_set.paths)?;
+    let mut second = RunMerger::open(&second_set.paths)?;
+    for expected_id in 0..pairs {
+        let (first_id, first_record) = first
+            .next()?
+            .ok_or_else(|| Error::InvalidFormat("truncated first mate runs".into()))?;
+        let (second_id, mut second_record) = second
+            .next()?
+            .ok_or_else(|| Error::InvalidFormat("truncated second mate runs".into()))?;
+        if first_id != expected_id || second_id != expected_id {
+            return Err(Error::InvalidFormat(
+                "paired run original ID mismatch".into(),
+            ));
+        }
+        if flags & 1 != 0 && id_pattern != PairedIdPattern::Independent {
+            second_record.id = id_pattern.derive_second(&first_record.id)?;
+        }
+        if options
+            .original_range
+            .as_ref()
+            .is_none_or(|range| range.contains(&expected_id))
+        {
+            sink.write_pair(expected_id, first_record, second_record)?;
+        }
+    }
+    if first.next()?.is_some() || second.next()?.is_some() {
+        return Err(Error::InvalidFormat("trailing paired run records".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn write_reordered_store_profiled<W: Write>(
     store: &mut PairStore,
@@ -204,121 +730,181 @@ pub fn write_reordered_store_profiled<W: Write>(
     temp_dir: impl AsRef<Path>,
 ) -> Result<(CompressionMetadata, CompressionProfile)> {
     let temp_dir = temp_dir.as_ref();
-    std::fs::create_dir_all(temp_dir)?;
-    let assignment_start = std::time::Instant::now();
-    let assignments = [
-        crate::reorder::write_store_assignments(store, &options.reorder, temp_dir, 0)?,
-        crate::reorder::write_store_assignments(store, &options.reorder, temp_dir, 1)?,
-    ];
-    let assignment_time = assignment_start.elapsed();
-    let assignment_bytes = assignments.iter().try_fold(0u64, |total, path| {
-        Ok::<_, Error>(total + std::fs::metadata(path)?.len())
-    })?;
-
-    let payload_start = std::time::Instant::now();
-    let (record_columns, id_pattern) = build_store_record_columns(store, options, temp_dir)?;
-    let payload_path = temp_dir.join("spring-rs3.payload");
-    let payload_file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(&payload_path)?;
-    let mut payload = std::io::BufWriter::with_capacity(16 * 1024 * 1024, payload_file);
-    put_u64_writer(&mut payload, store.count())?;
-    put_u16_writer(&mut payload, 2)?;
-    payload.write_all(&[1])?;
-    payload.write_all(&[id_pattern as u8])?;
-    for (mate, (assignment_path, columns)) in assignments.iter().zip(record_columns).enumerate() {
-        let stats = write_store_clusters(
-            &mut payload,
-            store,
-            assignment_path,
-            mate,
-            &options.reorder,
-            options.threads,
-            temp_dir,
-        )?;
-        store.add_stats(stats);
-        let ids_stored =
-            options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
-        write_store_record_columns(
-            &mut payload,
-            columns,
-            store.count(),
-            ids_stored,
-            options.preserve_quality,
-            65_536,
-        )?;
+    let mut prepared = PreparedRecordsBuilder::create(temp_dir)?;
+    for id in 0..store.count() {
+        let (first, second) = store.read_pair(id)?;
+        prepared.push(&first, &second, options)?;
     }
-    payload.flush()?;
-    let mut payload_file = payload
-        .into_inner()
-        .map_err(|error| Error::Io(error.into_error()))?;
-    let raw_len = payload_file.seek(SeekFrom::End(0))?;
-    payload_file.seek(SeekFrom::Start(0))?;
-    let payload_time = payload_start.elapsed();
-    let checksum_start = std::time::Instant::now();
-    let checksum = checksum_file(std::fs::File::open(&payload_path)?)?;
-    let checksum_time = checksum_start.elapsed();
-    let encoded_path = temp_dir.join("spring-rs3.payload.zst");
-    let encoded_file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(&encoded_path)?;
-    let zstd_start = std::time::Instant::now();
-    let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
-    encoder.multithread(worker_count(options.threads)?)?;
-    if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
-        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
-            LONG_DISTANCE_WINDOW_LOG,
-        ))?;
-        encoder.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
-            true,
-        ))?;
-    }
-    encoder.set_pledged_src_size(Some(raw_len))?;
-    let mut transfer_buffer = vec![0; 16 * 1024 * 1024];
-    let mut payload_reader = std::fs::File::open(&payload_path)?;
-    loop {
-        let bytes_read = payload_reader.read(&mut transfer_buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-        encoder.write_all(&transfer_buffer[..bytes_read])?;
-    }
-    let mut encoded_file = encoder.finish()?;
-    encoded_file.flush()?;
-    let encoded_len = encoded_file.seek(SeekFrom::End(0))?;
-    let zstd_time = zstd_start.elapsed();
-    encoded_file.seek(SeekFrom::Start(0))?;
-    output.write_all(MAGIC)?;
-    put_u32_writer(&mut output, VERSION)?;
-    put_u16_writer(&mut output, 2)?;
-    put_u16_writer(&mut output, flags(options))?;
-    put_u64_writer(&mut output, raw_len)?;
-    put_u64_writer(&mut output, encoded_len)?;
-    put_u32_writer(&mut output, checksum)?;
-    std::io::copy(&mut encoded_file, &mut output)?;
-    let metadata = CompressionMetadata {
-        streams: 2,
-        records: store.count(),
-        preserved_ids: options.preserve_ids,
-        preserved_quality: options.preserve_quality,
-        preserved_order: true,
+    let mut result = write_prepared_profiled(prepared.finish()?, &mut output, options, temp_dir)?;
+    result.1.store_stats = StoreStats {
+        index_reads: store.count().saturating_mul(5),
+        blob_reads: store.count().saturating_mul(8),
+        bytes_read: store.stats().bytes_read,
     };
-    let profile = CompressionProfile {
-        assignments: assignment_time,
-        consensus_and_payload: payload_time,
-        checksum: checksum_time,
-        zstd: zstd_time,
-        store_stats: store.stats(),
-        assignment_bytes,
-        payload_bytes: raw_len,
-        archive_bytes: 37 + encoded_len,
-        ..CompressionProfile::default()
+    return Ok(result);
+    #[allow(unreachable_code)]
+    {
+        let temp_dir = temp_dir.as_ref();
+        std::fs::create_dir_all(temp_dir)?;
+        let assignment_start = std::time::Instant::now();
+        let assignments = [
+            crate::reorder::write_store_assignments(store, &options.reorder, temp_dir, 0)?,
+            crate::reorder::write_store_assignments(store, &options.reorder, temp_dir, 1)?,
+        ];
+        let assignment_time = assignment_start.elapsed();
+        let assignment_bytes = assignments.iter().try_fold(0u64, |total, path| {
+            Ok::<_, Error>(total + std::fs::metadata(path)?.len())
+        })?;
+
+        let payload_start = std::time::Instant::now();
+        let (record_columns, id_pattern) = build_store_record_columns(store, options, temp_dir)?;
+        let payload_path = temp_dir.join("spring-rs3.payload");
+        let payload_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&payload_path)?;
+        let mut payload = std::io::BufWriter::with_capacity(16 * 1024 * 1024, payload_file);
+        put_u64_writer(&mut payload, store.count())?;
+        put_u16_writer(&mut payload, 2)?;
+        payload.write_all(&[1])?;
+        payload.write_all(&[id_pattern as u8])?;
+        for (mate, (assignment_path, columns)) in assignments.iter().zip(record_columns).enumerate()
+        {
+            let stats = write_store_clusters(
+                &mut payload,
+                store,
+                assignment_path,
+                mate,
+                &options.reorder,
+                options.threads,
+                temp_dir,
+            )?;
+            store.add_stats(stats);
+            let ids_stored =
+                options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
+            write_store_record_columns(
+                &mut payload,
+                columns,
+                store.count(),
+                ids_stored,
+                options.preserve_quality,
+                65_536,
+            )?;
+        }
+        payload.flush()?;
+        let mut payload_file = payload
+            .into_inner()
+            .map_err(|error| Error::Io(error.into_error()))?;
+        let raw_len = payload_file.seek(SeekFrom::End(0))?;
+        payload_file.seek(SeekFrom::Start(0))?;
+        let payload_time = payload_start.elapsed();
+        let checksum_start = std::time::Instant::now();
+        let checksum = checksum_file(std::fs::File::open(&payload_path)?)?;
+        let checksum_time = checksum_start.elapsed();
+        let encoded_path = temp_dir.join("spring-rs3.payload.zst");
+        let encoded_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&encoded_path)?;
+        let zstd_start = std::time::Instant::now();
+        let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
+        encoder.multithread(worker_count(options.threads)?)?;
+        if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
+            encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
+                LONG_DISTANCE_WINDOW_LOG,
+            ))?;
+            encoder.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+                true,
+            ))?;
+        }
+        encoder.set_pledged_src_size(Some(raw_len))?;
+        let mut transfer_buffer = vec![0; 16 * 1024 * 1024];
+        let mut payload_reader = std::fs::File::open(&payload_path)?;
+        loop {
+            let bytes_read = payload_reader.read(&mut transfer_buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            encoder.write_all(&transfer_buffer[..bytes_read])?;
+        }
+        let mut encoded_file = encoder.finish()?;
+        encoded_file.flush()?;
+        let encoded_len = encoded_file.seek(SeekFrom::End(0))?;
+        let zstd_time = zstd_start.elapsed();
+        encoded_file.seek(SeekFrom::Start(0))?;
+        output.write_all(MAGIC)?;
+        put_u32_writer(&mut output, VERSION)?;
+        put_u16_writer(&mut output, 2)?;
+        put_u16_writer(&mut output, flags(options))?;
+        put_u64_writer(&mut output, raw_len)?;
+        put_u64_writer(&mut output, encoded_len)?;
+        put_u32_writer(&mut output, checksum)?;
+        std::io::copy(&mut encoded_file, &mut output)?;
+        let metadata = CompressionMetadata {
+            streams: 2,
+            records: store.count(),
+            preserved_ids: options.preserve_ids,
+            preserved_quality: options.preserve_quality,
+            preserved_order: true,
+        };
+        let profile = CompressionProfile {
+            assignments: assignment_time,
+            consensus_and_payload: payload_time,
+            checksum: checksum_time,
+            zstd: zstd_time,
+            store_stats: store.stats(),
+            assignment_bytes,
+            payload_bytes: raw_len,
+            archive_bytes: 37 + encoded_len,
+            ..CompressionProfile::default()
+        };
+        Ok((metadata, profile))
+    }
+}
+
+#[cfg(test)]
+fn write_reordered_store_profiled_v2<W: Write>(
+    store: &mut PairStore,
+    mut output: W,
+    options: &CompressionOptions,
+    temp_dir: impl AsRef<Path>,
+) -> Result<(CompressionMetadata, CompressionProfile)> {
+    let temp_dir = temp_dir.as_ref();
+    let mut metadata_builder = PreparedRecordsBuilder::create_metadata(temp_dir)?;
+    let mut reads = [Vec::new(), Vec::new()];
+    for id in 0..store.count() {
+        let (first, second) = store.read_pair(id)?;
+        let prepared = prepare_pair(first, second, id, options)?;
+        let sorted = metadata_builder.push_metadata(prepared, options)?;
+        reads[0].push(sorted[0].clone());
+        reads[1].push(sorted[1].clone());
+    }
+    let metadata = metadata_builder.finish_metadata()?;
+    let sections = [0usize, 1].map(|mate| {
+        let (tx, rx) = crossbeam_channel::bounded(reads[mate].len().max(1));
+        for read in std::mem::take(&mut reads[mate]) {
+            tx.send(read)
+                .map_err(|_| Error::InvalidInput("sorter exited".into()))?;
+        }
+        drop(tx);
+        sort_and_write_mate(rx, store.count(), mate, options, temp_dir)
+    });
+    let sections = match sections {
+        [Ok(a), Ok(b)] => [a, b],
+        [Err(e), _] | [_, Err(e)] => return Err(e),
+    };
+    let mut archive = std::io::Cursor::new(Vec::new());
+    let (metadata, mut profile) =
+        write_streamed_profiled(metadata, sections, &mut archive, options, temp_dir)?;
+    output.write_all(archive.get_ref())?;
+    profile.store_stats = StoreStats {
+        index_reads: store.count().saturating_mul(5),
+        blob_reads: store.count().saturating_mul(8),
+        bytes_read: store.stats().bytes_read,
     };
     Ok((metadata, profile))
 }
@@ -330,187 +916,244 @@ pub(crate) fn write_prepared_profiled<W: Write>(
     options: &CompressionOptions,
     temp_dir: impl AsRef<Path>,
 ) -> Result<(CompressionMetadata, CompressionProfile)> {
+    return write_prepared_profiled_v2(prepared, output, options, temp_dir);
+    #[allow(unreachable_code)]
+    {
+        let temp_dir = temp_dir.as_ref();
+        let PreparedRecords {
+            columns,
+            spool_paths,
+            max_sortable_bytes,
+            id_pattern,
+            count,
+        } = prepared;
+        let assignment_bytes = spool_paths.iter().try_fold(0u64, |total, path| {
+            Ok::<_, Error>(total + std::fs::metadata(path)?.len())
+        })?;
+        let payload_path = temp_dir.join("spring-rs3.payload");
+        let payload_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&payload_path)?;
+        let mut payload = std::io::BufWriter::with_capacity(16 * 1024 * 1024, payload_file);
+        put_u64_writer(&mut payload, count)?;
+        put_u16_writer(&mut payload, 2)?;
+        payload.write_all(&[1])?;
+        payload.write_all(&[id_pattern as u8])?;
+
+        let mut assignment_time = std::time::Duration::default();
+        let mut consensus_metrics = ConsensusMetrics::default();
+        let payload_start = std::time::Instant::now();
+        for (mate, ((spool_path, columns), max_sortable_bytes)) in spool_paths
+            .iter()
+            .zip(columns)
+            .zip(max_sortable_bytes)
+            .enumerate()
+        {
+            const SORT_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+            let memory_limited_records = SORT_MEMORY_BYTES / max_sortable_bytes.max(1);
+            let sort_chunk_size = options
+                .reorder
+                .sort_chunk_size
+                .min(memory_limited_records.max(1))
+                .max(1);
+            let sorter = bed_utils::extsort::ExternalSorterBuilder::new()
+                .with_chunk_size(sort_chunk_size)
+                .with_tmp_dir(temp_dir)
+                .with_compression(3)
+                .num_threads(options.reorder.sort_threads.max(1))
+                .build()
+                .map_err(Error::Io)?;
+            let mut reader = SequenceSpoolReader::open(spool_path)?;
+            if reader.record_count() != count {
+                return Err(Error::InvalidFormat(
+                    "sequence spool record count mismatch".into(),
+                ));
+            }
+            let source_error = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let input_error = source_error.clone();
+            let input = std::iter::from_fn(move || match reader.next() {
+                Some(Ok(read)) => Some(read),
+                Some(Err(error)) => {
+                    *input_error.borrow_mut() = Some(error);
+                    None
+                }
+                None => None,
+            });
+            let sort_start = std::time::Instant::now();
+            let sorted = sorter
+                .sort_by(input, SortableRead::compare)
+                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+            assignment_time += sort_start.elapsed();
+            if let Some(error) = source_error.borrow_mut().take() {
+                return Err(error);
+            }
+            let order_path = temp_dir.join(format!("prepared.{mate}.order"));
+            let mut order = std::fs::File::create(&order_path)?;
+            order.set_len(count.saturating_mul(ORDER_ENTRY_SIZE as u64))?;
+            let metrics = write_sorted_clusters(
+                &mut payload,
+                sorted,
+                mate,
+                &options.reorder,
+                options.threads,
+                temp_dir,
+                count,
+                &mut order,
+            )?;
+            order.flush()?;
+            append_compact_order(&mut payload, &order_path, count, temp_dir)?;
+            std::fs::remove_file(order_path)?;
+            consensus_metrics.merge(metrics);
+            let ids_stored =
+                options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
+            write_prepared_record_columns(
+                &mut payload,
+                columns,
+                count,
+                ids_stored,
+                options.preserve_quality,
+            )?;
+            std::fs::remove_file(spool_path)?;
+        }
+        payload.flush()?;
+        let mut payload_file = payload
+            .into_inner()
+            .map_err(|error| Error::Io(error.into_error()))?;
+        let raw_len = payload_file.seek(SeekFrom::End(0))?;
+        payload_file.seek(SeekFrom::Start(0))?;
+        let payload_time = payload_start.elapsed();
+        let checksum_start = std::time::Instant::now();
+        let checksum = checksum_file(std::fs::File::open(&payload_path)?)?;
+        let checksum_time = checksum_start.elapsed();
+        let encoded_path = temp_dir.join("spring-rs3.payload.zst");
+        let encoded_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&encoded_path)?;
+        let zstd_start = std::time::Instant::now();
+        let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
+        encoder.multithread(worker_count(options.threads)?)?;
+        if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
+            encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
+                LONG_DISTANCE_WINDOW_LOG,
+            ))?;
+            encoder.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+                true,
+            ))?;
+        }
+        encoder.set_pledged_src_size(Some(raw_len))?;
+        let mut transfer_buffer = vec![0; 16 * 1024 * 1024];
+        let mut payload_reader = std::fs::File::open(&payload_path)?;
+        loop {
+            let bytes_read = payload_reader.read(&mut transfer_buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            encoder.write_all(&transfer_buffer[..bytes_read])?;
+        }
+        let mut encoded_file = encoder.finish()?;
+        encoded_file.flush()?;
+        let encoded_len = encoded_file.seek(SeekFrom::End(0))?;
+        let zstd_time = zstd_start.elapsed();
+        encoded_file.seek(SeekFrom::Start(0))?;
+        output.write_all(MAGIC)?;
+        put_u32_writer(&mut output, VERSION)?;
+        put_u16_writer(&mut output, 2)?;
+        put_u16_writer(&mut output, flags(options))?;
+        put_u64_writer(&mut output, raw_len)?;
+        put_u64_writer(&mut output, encoded_len)?;
+        put_u32_writer(&mut output, checksum)?;
+        std::io::copy(&mut encoded_file, &mut output)?;
+        let metadata = CompressionMetadata {
+            streams: 2,
+            records: count,
+            preserved_ids: options.preserve_ids,
+            preserved_quality: options.preserve_quality,
+            preserved_order: true,
+        };
+        let profile = CompressionProfile {
+            assignments: assignment_time,
+            consensus_and_payload: payload_time.saturating_sub(assignment_time),
+            checksum: checksum_time,
+            zstd: zstd_time,
+            assignment_bytes,
+            payload_bytes: raw_len,
+            archive_bytes: 37 + encoded_len,
+            consensus_producer: consensus_metrics.producer,
+            consensus_producer_wait: consensus_metrics.producer_wait,
+            consensus_workers: consensus_metrics.workers,
+            consensus_writer: consensus_metrics.writer,
+            consensus_writer_active: consensus_metrics.writer_active,
+            consensus_writer_wait: consensus_metrics.writer_wait,
+            consensus_max_pending_buckets: consensus_metrics.max_pending_buckets,
+            consensus_multi_clusters: consensus_metrics.multi_clusters,
+            consensus_singletons: consensus_metrics.singletons,
+            consensus_buckets: consensus_metrics.buckets,
+            consensus_overlap_comparisons: consensus_metrics.overlap_comparisons,
+            consensus_max_bucket_records: consensus_metrics.max_bucket_records,
+            consensus_max_groups: consensus_metrics.max_groups,
+            ..CompressionProfile::default()
+        };
+        Ok((metadata, profile))
+    }
+}
+
+#[allow(dead_code)]
+fn write_prepared_profiled_v2<W: Write>(
+    prepared: PreparedRecords,
+    mut output: W,
+    options: &CompressionOptions,
+    temp_dir: impl AsRef<Path>,
+) -> Result<(CompressionMetadata, CompressionProfile)> {
     let temp_dir = temp_dir.as_ref();
     let PreparedRecords {
         columns,
         spool_paths,
-        max_sortable_bytes,
         id_pattern,
         count,
+        ..
     } = prepared;
-    let assignment_bytes = spool_paths.iter().try_fold(0u64, |total, path| {
-        Ok::<_, Error>(total + std::fs::metadata(path)?.len())
-    })?;
-    let payload_path = temp_dir.join("spring-rs3.payload");
-    let payload_file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(&payload_path)?;
-    let mut payload = std::io::BufWriter::with_capacity(16 * 1024 * 1024, payload_file);
-    put_u64_writer(&mut payload, count)?;
-    put_u16_writer(&mut payload, 2)?;
-    payload.write_all(&[1])?;
-    payload.write_all(&[id_pattern as u8])?;
-
-    let mut assignment_time = std::time::Duration::default();
-    let mut consensus_metrics = ConsensusMetrics::default();
-    let payload_start = std::time::Instant::now();
-    for (mate, ((spool_path, columns), max_sortable_bytes)) in spool_paths
-        .iter()
-        .zip(columns)
-        .zip(max_sortable_bytes)
-        .enumerate()
-    {
-        const SORT_MEMORY_BYTES: usize = 512 * 1024 * 1024;
-        let memory_limited_records = SORT_MEMORY_BYTES / max_sortable_bytes.max(1);
-        let sort_chunk_size = options
-            .reorder
-            .sort_chunk_size
-            .min(memory_limited_records.max(1))
-            .max(1);
-        let sorter = bed_utils::extsort::ExternalSorterBuilder::new()
-            .with_chunk_size(sort_chunk_size)
-            .with_tmp_dir(temp_dir)
-            .with_compression(3)
-            .num_threads(options.reorder.sort_threads.max(1))
-            .build()
-            .map_err(Error::Io)?;
-        let mut reader = SequenceSpoolReader::open(spool_path)?;
-        if reader.record_count() != count {
-            return Err(Error::InvalidFormat(
-                "sequence spool record count mismatch".into(),
-            ));
-        }
-        let source_error = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let input_error = source_error.clone();
-        let input = std::iter::from_fn(move || match reader.next() {
-            Some(Ok(read)) => Some(read),
-            Some(Err(error)) => {
-                *input_error.borrow_mut() = Some(error);
-                None
-            }
-            None => None,
-        });
-        let sort_start = std::time::Instant::now();
-        let sorted = sorter
-            .sort_by(input, SortableRead::compare)
-            .map_err(|error| Error::InvalidInput(error.to_string()))?;
-        assignment_time += sort_start.elapsed();
-        if let Some(error) = source_error.borrow_mut().take() {
-            return Err(error);
-        }
-        let order_path = temp_dir.join(format!("prepared.{mate}.order"));
-        let mut order = std::fs::File::create(&order_path)?;
-        order.set_len(count.saturating_mul(ORDER_ENTRY_SIZE as u64))?;
-        let metrics = write_sorted_clusters(
-            &mut payload,
-            sorted,
-            mate,
-            &options.reorder,
-            options.threads,
-            temp_dir,
-            count,
-            &mut order,
-        )?;
-        order.flush()?;
-        append_compact_order(&mut payload, &order_path, count, temp_dir)?;
-        std::fs::remove_file(order_path)?;
-        consensus_metrics.merge(metrics);
-        let ids_stored =
-            options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
-        write_prepared_record_columns(
-            &mut payload,
-            columns,
-            count,
-            ids_stored,
-            options.preserve_quality,
-        )?;
-        std::fs::remove_file(spool_path)?;
-    }
-    payload.flush()?;
-    let mut payload_file = payload
-        .into_inner()
-        .map_err(|error| Error::Io(error.into_error()))?;
-    let raw_len = payload_file.seek(SeekFrom::End(0))?;
-    payload_file.seek(SeekFrom::Start(0))?;
-    let payload_time = payload_start.elapsed();
-    let checksum_start = std::time::Instant::now();
-    let checksum = checksum_file(std::fs::File::open(&payload_path)?)?;
-    let checksum_time = checksum_start.elapsed();
-    let encoded_path = temp_dir.join("spring-rs3.payload.zst");
-    let encoded_file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(&encoded_path)?;
-    let zstd_start = std::time::Instant::now();
-    let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
-    encoder.multithread(worker_count(options.threads)?)?;
-    if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
-        encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
-            LONG_DISTANCE_WINDOW_LOG,
-        ))?;
-        encoder.set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
-            true,
-        ))?;
-    }
-    encoder.set_pledged_src_size(Some(raw_len))?;
-    let mut transfer_buffer = vec![0; 16 * 1024 * 1024];
-    let mut payload_reader = std::fs::File::open(&payload_path)?;
-    loop {
-        let bytes_read = payload_reader.read(&mut transfer_buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-        encoder.write_all(&transfer_buffer[..bytes_read])?;
-    }
-    let mut encoded_file = encoder.finish()?;
-    encoded_file.flush()?;
-    let encoded_len = encoded_file.seek(SeekFrom::End(0))?;
-    let zstd_time = zstd_start.elapsed();
-    encoded_file.seek(SeekFrom::Start(0))?;
-    output.write_all(MAGIC)?;
-    put_u32_writer(&mut output, VERSION)?;
-    put_u16_writer(&mut output, 2)?;
-    put_u16_writer(&mut output, flags(options))?;
-    put_u64_writer(&mut output, raw_len)?;
-    put_u64_writer(&mut output, encoded_len)?;
-    put_u32_writer(&mut output, checksum)?;
-    std::io::copy(&mut encoded_file, &mut output)?;
-    let metadata = CompressionMetadata {
-        streams: 2,
-        records: count,
-        preserved_ids: options.preserve_ids,
-        preserved_quality: options.preserve_quality,
-        preserved_order: true,
+    let (ids0, qualities0) = load_prepared_metadata(&columns[0])?;
+    let (ids1, qualities1) = load_prepared_metadata(&columns[1])?;
+    let metadata = PreparedMetadata {
+        columns,
+        id_pattern,
+        count,
+        ids: [ids0, ids1],
+        qualities: [qualities0, qualities1],
     };
-    let profile = CompressionProfile {
-        assignments: assignment_time,
-        consensus_and_payload: payload_time.saturating_sub(assignment_time),
-        checksum: checksum_time,
-        zstd: zstd_time,
-        assignment_bytes,
-        payload_bytes: raw_len,
-        archive_bytes: 37 + encoded_len,
-        consensus_producer: consensus_metrics.producer,
-        consensus_producer_wait: consensus_metrics.producer_wait,
-        consensus_workers: consensus_metrics.workers,
-        consensus_writer: consensus_metrics.writer,
-        consensus_writer_active: consensus_metrics.writer_active,
-        consensus_writer_wait: consensus_metrics.writer_wait,
-        consensus_max_pending_buckets: consensus_metrics.max_pending_buckets,
-        consensus_multi_clusters: consensus_metrics.multi_clusters,
-        consensus_singletons: consensus_metrics.singletons,
-        consensus_buckets: consensus_metrics.buckets,
-        consensus_overlap_comparisons: consensus_metrics.overlap_comparisons,
-        consensus_max_bucket_records: consensus_metrics.max_bucket_records,
-        consensus_max_groups: consensus_metrics.max_groups,
-        ..CompressionProfile::default()
+    let sections = [0usize, 1].map(|mate| -> Result<PreparedMateSection> {
+        let mut reader = SequenceSpoolReader::open(&spool_paths[mate])?;
+        let mut reads = Vec::new();
+        while let Some(read) = reader.next() {
+            reads.push(read?);
+        }
+        let (tx, rx) = crossbeam_channel::bounded(reads.len().max(1));
+        for read in reads {
+            tx.send(read)
+                .map_err(|_| Error::InvalidInput("sorter exited".into()))?;
+        }
+        drop(tx);
+        sort_and_write_mate(rx, count, mate, options, temp_dir)
+    });
+    let sections = match sections {
+        [Ok(first), Ok(second)] => [first, second],
+        [Err(error), _] | [_, Err(error)] => return Err(error),
     };
-    Ok((metadata, profile))
+    let mut archive = std::io::Cursor::new(Vec::new());
+    let result = write_streamed_profiled(metadata, sections, &mut archive, options, temp_dir);
+    if result.is_ok() {
+        output.write_all(archive.get_ref())?;
+    }
+    for path in spool_paths {
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 fn worker_count(workers: usize) -> Result<u32> {
@@ -583,9 +1226,11 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
     _temp_dir: &Path,
 ) -> Result<(CompressionMetadata, CompressionProfile)> {
     let PreparedMetadata {
-        columns,
         id_pattern,
         count,
+        ids,
+        qualities,
+        columns: _,
     } = prepared;
     output.write_all(&[0; 37])?;
     let encoded_start = output.stream_position()?;
@@ -601,12 +1246,11 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
     let mut payload = PayloadChecksumWriter::new(encoder);
     put_u64_writer(&mut payload, count)?;
     put_u16_writer(&mut payload, 2)?;
-    payload.write_all(&[1])?;
     payload.write_all(&[id_pattern as u8])?;
     let payload_started = std::time::Instant::now();
     let mut assignment_time = std::time::Duration::default();
     let mut consensus_metrics = ConsensusMetrics::default();
-    for (mate, (section, columns)) in sections.into_iter().zip(columns).enumerate() {
+    for (mate, section) in sections.into_iter().enumerate() {
         if section.metrics.source_records != count {
             return Err(Error::InvalidFormat(
                 "sorted mate stream record count mismatch".into(),
@@ -614,19 +1258,19 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
         }
         assignment_time += section.assignment_time;
         consensus_metrics.merge(section.metrics);
-        let mut section_file = std::fs::File::open(&section.path)?;
-        std::io::copy(&mut section_file, &mut payload)?;
+        let mut section_file = std::io::BufReader::new(std::fs::File::open(&section.path)?);
+        write_singleton_tail_section(
+            &mut section_file,
+            &mut payload,
+            count,
+            mate,
+            &ids[mate],
+            &qualities[mate],
+            options,
+            id_pattern,
+        )?;
         std::fs::remove_file(section.path)?;
         std::fs::remove_file(section.order_path)?;
-        let ids_stored =
-            options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
-        write_prepared_record_columns(
-            &mut payload,
-            columns,
-            count,
-            ids_stored,
-            options.preserve_quality,
-        )?;
     }
     payload.flush()?;
     let (encoder, raw_len, checksum) = payload.finish();
@@ -678,6 +1322,207 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
             ..CompressionProfile::default()
         },
     ))
+}
+
+struct SingletonTailCounts {
+    multi_groups: u64,
+    multi_records: u64,
+    singleton_buckets: u64,
+    singleton_records: u64,
+    keys: Vec<(u32, bool)>,
+}
+
+fn write_singleton_tail_section<R: Read + Seek, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    count: u64,
+    mate: usize,
+    ids: &[Vec<u8>],
+    qualities: &[Vec<u8>],
+    options: &CompressionOptions,
+    id_pattern: PairedIdPattern,
+) -> Result<()> {
+    let counts = scan_singleton_tail(input, count)?;
+    put_u64_writer(output, counts.multi_groups)?;
+    put_u64_writer(output, counts.multi_records)?;
+    put_u64_writer(output, counts.singleton_buckets)?;
+    put_u64_writer(output, counts.singleton_records)?;
+
+    input.seek(SeekFrom::Start(0))?;
+    let mut records = 0u64;
+    while records < count {
+        let group_records = read_varint(input)?;
+        let kind = read_one(input)?;
+        if kind != 0 {
+            skip_source_singleton(input, group_records)?;
+            records += group_records;
+            continue;
+        }
+        let reference = read_reference_stream(input)?;
+        put_varint(output, group_records)?;
+        output.write_all(&[0])?;
+        put_reference_v8(output, &reference)?;
+        let mut group_ids = Vec::with_capacity(usize_from(group_records, "group")?);
+        let mut previous_id = 0u64;
+        for _ in 0..group_records {
+            let delta = read_varint(input)?;
+            let original_id = zigzag_decode(delta, previous_id)?;
+            previous_id = original_id;
+            group_ids.push(original_id);
+            put_varint(output, delta)?;
+            output.write_all(&[read_one(input)?])?;
+            put_varint(output, read_varint(input)?)?;
+            put_varint(output, read_varint(input)?)?;
+            let mismatch_count = read_varint(input)?;
+            put_varint(output, mismatch_count)?;
+            for _ in 0..mismatch_count {
+                put_varint(output, read_varint(input)?)?;
+                output.write_all(&[read_one(input)?])?;
+            }
+        }
+        write_group_metadata(
+            output, &group_ids, ids, qualities, options, mate, id_pattern,
+        )?;
+        records += group_records;
+    }
+
+    for &(length, packed) in &counts.keys {
+        input.seek(SeekFrom::Start(0))?;
+        let mut pending = None;
+        let mut records = 0u64;
+        while records < count {
+            let group_records = read_varint(input)?;
+            let kind = read_one(input)?;
+            if kind == 0 {
+                skip_source_multi(input, group_records)?;
+            } else {
+                if group_records != 1 {
+                    return Err(Error::InvalidFormat(
+                        "invalid singleton group record count".into(),
+                    ));
+                }
+                let original_id = zigzag_decode(read_varint(input)?, 0)?;
+                let sequence = read_packed_sequence(input)?;
+                if sequence.len() == length && sequence.is_packed() == packed {
+                    let fits = pending
+                        .as_ref()
+                        .is_some_and(|batch: &PendingSingletonBatch| {
+                            batch.ids.len() < MAX_BATCH_RECORDS
+                                && batch.body_len.saturating_add(sequence.encoded_size())
+                                    <= MAX_BATCH_BYTES
+                        });
+                    if !fits {
+                        flush_singleton_tail_batch(
+                            output,
+                            pending.take(),
+                            ids,
+                            qualities,
+                            options,
+                            mate,
+                            id_pattern,
+                        )?;
+                        pending = Some(PendingSingletonBatch {
+                            ids: Vec::with_capacity(MAX_BATCH_RECORDS),
+                            bodies: Vec::with_capacity(MAX_BATCH_RECORDS),
+                            length,
+                            packed,
+                            body_len: 0,
+                        });
+                    }
+                    let batch = pending.as_mut().unwrap();
+                    batch.ids.push(original_id);
+                    batch.body_len += sequence.encoded_size();
+                    batch.bodies.push(sequence.encoded_bytes().to_vec());
+                }
+            }
+            records += group_records;
+        }
+        flush_singleton_tail_batch(output, pending, ids, qualities, options, mate, id_pattern)?;
+    }
+    Ok(())
+}
+
+const MAX_BATCH_RECORDS: usize = 4096;
+const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+fn scan_singleton_tail<R: Read + Seek>(input: &mut R, count: u64) -> Result<SingletonTailCounts> {
+    input.seek(SeekFrom::Start(0))?;
+    let mut records = 0u64;
+    let mut multi_groups = 0;
+    let mut multi_records = 0;
+    let mut singleton_buckets = 0;
+    let mut singleton_records = 0;
+    let mut singleton_batches = BTreeMap::<(u32, bool), (usize, usize)>::new();
+    while records < count {
+        let group_records = read_varint(input)?;
+        let kind = read_one(input)?;
+        if group_records == 0 || records + group_records > count {
+            return Err(Error::InvalidFormat(
+                "invalid RS4 source group count".into(),
+            ));
+        }
+        if kind == 0 {
+            skip_source_multi(input, group_records)?;
+            multi_groups += 1;
+            multi_records += group_records;
+        } else if kind == 1 && group_records == 1 {
+            let _ = read_varint(input)?;
+            let sequence = read_packed_sequence(input)?;
+            let key = (sequence.len(), sequence.is_packed());
+            let batch = singleton_batches.entry(key).or_default();
+            if batch.0 != 0
+                && (batch.0 >= MAX_BATCH_RECORDS
+                    || batch.1.saturating_add(sequence.encoded_size()) > MAX_BATCH_BYTES)
+            {
+                singleton_buckets += 1;
+                *batch = (0, 0);
+            }
+            batch.0 += 1;
+            batch.1 = batch.1.saturating_add(sequence.encoded_size());
+            singleton_records += 1;
+        } else {
+            return Err(Error::InvalidFormat("invalid RS4 source group kind".into()));
+        }
+        records += group_records;
+    }
+    singleton_buckets += singleton_batches
+        .values()
+        .filter(|(count, _)| *count != 0)
+        .count() as u64;
+    Ok(SingletonTailCounts {
+        multi_groups,
+        multi_records,
+        singleton_buckets,
+        singleton_records,
+        keys: singleton_batches.keys().copied().collect(),
+    })
+}
+
+fn skip_source_singleton<R: Read>(input: &mut R, count: u64) -> Result<()> {
+    if count != 1 {
+        return Err(Error::InvalidFormat(
+            "invalid singleton group record count".into(),
+        ));
+    }
+    let _ = read_varint(input)?;
+    let _ = read_packed_sequence(input)?;
+    Ok(())
+}
+
+fn skip_source_multi<R: Read>(input: &mut R, count: u64) -> Result<()> {
+    let _ = read_reference_stream(input)?;
+    for _ in 0..count {
+        let _ = read_varint(input)?;
+        let _ = read_one(input)?;
+        let _ = read_varint(input)?;
+        let _ = read_varint(input)?;
+        let mismatch_count = read_varint(input)?;
+        for _ in 0..mismatch_count {
+            let _ = read_varint(input)?;
+            let _ = read_one(input)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -748,6 +1593,7 @@ fn write_store_clusters<W: Write>(
                                         overlap_comparisons: 0,
                                         source_records: ids.len() as u64,
                                         groups: clusters.len() as u64,
+                                        consensus_groups: clusters,
                                     })
                                 });
                         if done_tx.send(result).is_err() {
@@ -792,6 +1638,7 @@ struct ConsensusBucket {
     overlap_comparisons: u64,
     source_records: u64,
     groups: u64,
+    consensus_groups: Vec<ConsensusCluster>,
 }
 
 #[derive(Default)]
@@ -1015,9 +1862,6 @@ where
     E: std::fmt::Display + Send,
 {
     let limit = reorder.max_bucket_records.max(1);
-    let multi_count_position = payload.stream_position()?;
-    put_u32_writer(payload, 0)?;
-    let mut singleton_sequences = SingletonRecordWriter::create(temp_dir, mate)?;
     let workers = threads.max(1);
     let queue_capacity = workers.div_ceil(2).max(1);
     let in_flight = workers + queue_capacity;
@@ -1074,13 +1918,7 @@ where
             drop(done_tx);
 
             let writer_started = std::time::Instant::now();
-            let result = write_stream_consensus_buckets(
-                done_rx,
-                permit_tx,
-                payload,
-                &mut singleton_sequences,
-                order_output,
-            )?;
+            let result = write_stream_consensus_buckets(done_rx, permit_tx, payload)?;
             let metrics = ConsensusMetrics {
                 producer: std::time::Duration::from_nanos(producer_nanos.load(Ordering::Relaxed)),
                 producer_wait: std::time::Duration::from_nanos(
@@ -1101,11 +1939,7 @@ where
             };
             Ok((result.counts, metrics))
         })?;
-    let multi_end = payload.stream_position()?;
-    payload.seek(SeekFrom::Start(multi_count_position))?;
-    put_u32_writer(payload, cluster_count.0)?;
-    payload.seek(SeekFrom::Start(multi_end))?;
-    singleton_sequences.finish_to(payload, cluster_count.1 as usize)?;
+    let _ = (cluster_count, order_output, mate, temp_dir);
     Ok(metrics)
 }
 
@@ -1135,6 +1969,17 @@ fn process_consensus_bucket(
             overlap_comparisons: 0,
             source_records,
             groups: 1,
+            consensus_groups: vec![ConsensusCluster {
+                reference: read.sequence.clone(),
+                reads: vec![ConsensusRead {
+                    original_id: read.id,
+                    offset: 0,
+                    reverse: false,
+                    length: u32::try_from(read.sequence.len())
+                        .map_err(|_| Error::InvalidInput("read length too large".into()))?,
+                    mismatches: Vec::new(),
+                }],
+            }],
         });
     }
     let (clusters, overlap_comparisons) = cluster_sequences_profiled(kmer_size, reads)?;
@@ -1152,6 +1997,7 @@ fn process_consensus_bucket(
         overlap_comparisons,
         source_records,
         groups,
+        consensus_groups: clusters,
     })
 }
 
@@ -1310,8 +2156,6 @@ fn write_stream_consensus_buckets<W: Write>(
     done_rx: crossbeam_channel::Receiver<Result<ConsensusBucket>>,
     permit_tx: crossbeam_channel::Sender<()>,
     multi_output: &mut W,
-    singleton_sequences: &mut SingletonRecordWriter,
-    order_output: &mut std::fs::File,
 ) -> Result<ConsensusWriteResult> {
     let mut pending = BTreeMap::new();
     let mut next_to_write = 0usize;
@@ -1338,33 +2182,13 @@ fn write_stream_consensus_buckets<W: Write>(
         pending.insert(bucket.index, bucket);
         max_pending_buckets = max_pending_buckets.max(pending.len() as u64);
         while let Some(bucket) = pending.remove(&next_to_write) {
-            for (original_id, entry) in &bucket.order_entries {
-                let offset = original_id
-                    .checked_mul(ORDER_ENTRY_SIZE as u64)
-                    .ok_or_else(|| Error::InvalidInput("order index too large".into()))?;
-                order_output.seek(SeekFrom::Start(offset))?;
-                order_output.write_all(&[entry.singleton as u8])?;
-                let cluster = if entry.singleton {
-                    singleton_count
-                        .checked_add(entry.cluster)
-                        .ok_or_else(|| Error::InvalidInput("singleton index overflow".into()))?
+            for group in &bucket.consensus_groups {
+                write_group_descriptor(multi_output, group)?;
+                if group.reads.len() == 1 {
+                    singleton_count += 1;
                 } else {
-                    multi_cluster_count
-                        .checked_add(entry.cluster)
-                        .ok_or_else(|| Error::InvalidInput("cluster index overflow".into()))?
-                };
-                order_output.write_all(&cluster.to_le_bytes())?;
-                order_output.write_all(&entry.read.to_le_bytes())?;
-            }
-            multi_output.write_all(&bucket.multi_bytes)?;
-            multi_cluster_count = multi_cluster_count
-                .checked_add(bucket.multi_cluster_count)
-                .ok_or_else(|| Error::InvalidInput("too many consensus clusters".into()))?;
-            for (original_id, sequence) in bucket.singletons {
-                singleton_sequences.push_singleton(original_id, sequence)?;
-                singleton_count = singleton_count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::InvalidInput("too many singleton sequences".into()))?;
+                    multi_cluster_count += 1;
+                }
             }
             let _ = permit_tx.send(());
             next_to_write += 1;
@@ -1864,6 +2688,259 @@ fn put_cluster_bodies_v8<W: Write>(writer: &mut W, clusters: &[ConsensusCluster]
     Ok(())
 }
 
+fn write_group_descriptor<W: Write>(writer: &mut W, group: &ConsensusCluster) -> Result<()> {
+    put_varint(writer, group.reads.len() as u64)?;
+    let singleton = group.reads.len() == 1;
+    writer.write_all(&[singleton as u8])?;
+    if singleton {
+        let sequence = crate::reorder::decode_consensus_read(group, &group.reads[0])?;
+        put_varint(writer, zigzag_delta(group.reads[0].original_id, 0))?;
+        write_packed_sequence(writer, &PackedSequence::try_from_bytes(&sequence)?)?;
+        return Ok(());
+    }
+    put_reference_v8(writer, &group.reference)?;
+    let mut previous_id = 0;
+    for read in &group.reads {
+        put_varint(writer, zigzag_delta(read.original_id, previous_id))?;
+        previous_id = read.original_id;
+        writer.write_all(&[read.reverse as u8])?;
+        put_varint(writer, read.offset as u64)?;
+        put_varint(writer, read.length as u64)?;
+        put_varint(writer, read.mismatches.len() as u64)?;
+        let mut previous_position = 0u32;
+        for &(position, base) in &read.mismatches {
+            put_varint(writer, (position - previous_position) as u64)?;
+            writer.write_all(&[base])?;
+            previous_position = position;
+        }
+    }
+    Ok(())
+}
+
+fn copy_group_descriptors<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    count: u64,
+    mate: usize,
+    ids: &[Vec<u8>],
+    qualities: &[Vec<u8>],
+    options: &CompressionOptions,
+    id_pattern: PairedIdPattern,
+) -> Result<()> {
+    const MAX_BATCH_RECORDS: usize = 4096;
+    const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+    let mut pending = None;
+    let mut records = 0u64;
+    while records < count {
+        let group_count = read_varint(input)?;
+        let kind = read_one(input)?;
+        let reference = if kind == 0 {
+            read_reference_stream(input)?
+        } else if kind == 1 {
+            Vec::new()
+        } else {
+            return Err(Error::InvalidFormat("invalid RS4 group kind".into()));
+        };
+        if kind == 1 && group_count != 1 {
+            return Err(Error::InvalidFormat(
+                "invalid singleton group record count".into(),
+            ));
+        }
+        if kind == 0 {
+            flush_singleton_batch(
+                output,
+                pending.take(),
+                ids,
+                qualities,
+                options,
+                mate,
+                id_pattern,
+            )?;
+            put_varint(output, group_count)?;
+            output.write_all(&[kind])?;
+            put_reference_v8(output, &reference)?;
+        }
+        let mut group_ids = Vec::with_capacity(usize_from(group_count, "group")?);
+        let mut previous_id = 0u64;
+        for _ in 0..group_count {
+            let original_id = zigzag_decode(read_varint(input)?, previous_id)?;
+            previous_id = original_id;
+            group_ids.push(original_id);
+            if kind == 1 {
+                let sequence = read_packed_sequence(input)?;
+                let packed = sequence.is_packed();
+                if !packed {
+                    flush_singleton_batch(
+                        output,
+                        pending.take(),
+                        ids,
+                        qualities,
+                        options,
+                        mate,
+                        id_pattern,
+                    )?;
+                    put_varint(output, 1)?;
+                    output.write_all(&[1])?;
+                    put_varint(output, zigzag_delta(original_id, 0))?;
+                    write_packed_sequence(output, &sequence)?;
+                    write_group_metadata(
+                        output,
+                        &[original_id],
+                        ids,
+                        qualities,
+                        options,
+                        mate,
+                        id_pattern,
+                    )?;
+                    records += 1;
+                    continue;
+                }
+                let fits = pending
+                    .as_ref()
+                    .is_some_and(|batch: &PendingSingletonBatch| {
+                        batch.packed == packed
+                            && batch.length == sequence.len()
+                            && batch.ids.len() < MAX_BATCH_RECORDS
+                            && batch.body_len.saturating_add(sequence.encoded_size())
+                                <= MAX_BATCH_BYTES
+                    });
+                if !fits {
+                    flush_singleton_batch(
+                        output,
+                        pending.take(),
+                        ids,
+                        qualities,
+                        options,
+                        mate,
+                        id_pattern,
+                    )?;
+                    pending = Some(PendingSingletonBatch {
+                        ids: Vec::with_capacity(MAX_BATCH_RECORDS),
+                        bodies: Vec::with_capacity(MAX_BATCH_RECORDS),
+                        length: sequence.len(),
+                        packed,
+                        body_len: 0,
+                    });
+                }
+                let batch = pending.as_mut().expect("singleton batch initialized");
+                batch.body_len += sequence.encoded_size();
+                batch.ids.push(original_id);
+                batch.bodies.push(sequence.encoded_bytes().to_vec());
+            } else {
+                put_varint(
+                    output,
+                    zigzag_delta(
+                        original_id,
+                        if group_ids.len() == 1 {
+                            0
+                        } else {
+                            group_ids[group_ids.len() - 2]
+                        },
+                    ),
+                )?;
+                let reverse = read_one(input)?;
+                output.write_all(&[reverse])?;
+                let offset = read_varint(input)?;
+                let length = read_varint(input)?;
+                let mismatch_count = read_varint(input)?;
+                put_varint(output, offset)?;
+                put_varint(output, length)?;
+                put_varint(output, mismatch_count)?;
+                for _ in 0..mismatch_count {
+                    let delta = read_varint(input)?;
+                    let base = read_one(input)?;
+                    put_varint(output, delta)?;
+                    output.write_all(&[base])?;
+                }
+            }
+        }
+        if kind == 0 {
+            write_group_metadata(
+                output, &group_ids, ids, qualities, options, mate, id_pattern,
+            )?;
+            records += group_count;
+        } else {
+            records += 1;
+        }
+    }
+    flush_singleton_batch(output, pending, ids, qualities, options, mate, id_pattern)?;
+    Ok(())
+}
+
+struct PendingSingletonBatch {
+    ids: Vec<u64>,
+    bodies: Vec<Vec<u8>>,
+    length: u32,
+    packed: bool,
+    body_len: usize,
+}
+
+fn flush_singleton_batch<W: Write>(
+    output: &mut W,
+    batch: Option<PendingSingletonBatch>,
+    ids: &[Vec<u8>],
+    qualities: &[Vec<u8>],
+    options: &CompressionOptions,
+    mate: usize,
+    id_pattern: PairedIdPattern,
+) -> Result<()> {
+    let Some(batch) = batch else { return Ok(()) };
+    if batch.ids.len() < 2 {
+        put_varint(output, 1)?;
+        output.write_all(&[1])?;
+        put_varint(output, zigzag_delta(batch.ids[0], 0))?;
+        write_packed_sequence(
+            output,
+            &PackedSequence::from_encoded(batch.length, batch.packed, batch.bodies[0].clone())?,
+        )?;
+        return write_group_metadata(
+            output, &batch.ids, ids, qualities, options, mate, id_pattern,
+        );
+    }
+    put_varint(output, batch.ids.len() as u64)?;
+    output.write_all(&[2])?;
+    put_varint(output, batch.length as u64)?;
+    let mut previous_id = 0;
+    for (&id, body) in batch.ids.iter().zip(&batch.bodies) {
+        put_varint(output, zigzag_delta(id, previous_id))?;
+        previous_id = id;
+        output.write_all(body)?;
+    }
+    write_group_metadata(
+        output, &batch.ids, ids, qualities, options, mate, id_pattern,
+    )
+}
+
+fn flush_singleton_tail_batch<W: Write>(
+    output: &mut W,
+    batch: Option<PendingSingletonBatch>,
+    ids: &[Vec<u8>],
+    qualities: &[Vec<u8>],
+    options: &CompressionOptions,
+    mate: usize,
+    id_pattern: PairedIdPattern,
+) -> Result<()> {
+    let Some(batch) = batch else { return Ok(()) };
+    let mut entries = batch.ids.into_iter().zip(batch.bodies).collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(id, _)| *id);
+    let (ids_sorted, bodies_sorted): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+    flush_singleton_batch(
+        output,
+        Some(PendingSingletonBatch {
+            ids: ids_sorted,
+            bodies: bodies_sorted,
+            length: batch.length,
+            packed: batch.packed,
+            body_len: batch.body_len,
+        }),
+        ids,
+        qualities,
+        options,
+        mate,
+        id_pattern,
+    )
+}
+
 fn put_reference_v8<W: Write>(writer: &mut W, reference: &[u8]) -> Result<()> {
     let clean = reference
         .iter()
@@ -1904,6 +2981,254 @@ fn put_varint<W: Write>(writer: &mut W, mut value: u64) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+fn varint_len(value: u64) -> usize {
+    if value == 0 {
+        1
+    } else {
+        ((u64::BITS - value.leading_zeros()) as usize).div_ceil(7)
+    }
+}
+
+fn zigzag_delta(value: u64, previous: u64) -> u64 {
+    let delta = value as i128 - previous as i128;
+    ((delta << 1) ^ (delta >> 127)) as u64
+}
+
+fn zigzag_decode(value: u64, previous: u64) -> Result<u64> {
+    let delta = ((value >> 1) as i128) ^ -((value & 1) as i128);
+    let decoded = previous as i128 + delta;
+    u64::try_from(decoded)
+        .map_err(|_| Error::InvalidFormat("RS4 original ID delta underflow".into()))
+}
+
+fn write_packed_sequence<W: Write>(writer: &mut W, sequence: &PackedSequence) -> Result<()> {
+    writer.write_all(&[sequence.is_packed() as u8])?;
+    put_varint(writer, sequence.len() as u64)?;
+    put_varint(writer, sequence.encoded_size() as u64)?;
+    writer.write_all(sequence.encoded_bytes())?;
+    Ok(())
+}
+
+fn read_packed_sequence_stream<R: Read>(reader: &mut ChecksummedReader<'_, R>) -> Result<Vec<u8>> {
+    let packed = reader.u8()? != 0;
+    let length = u32::try_from(reader.varint()?)
+        .map_err(|_| Error::InvalidFormat("sequence too large".into()))?;
+    let encoded_length = usize_from(reader.varint()?, "sequence")?;
+    let mut bytes = vec![0; encoded_length];
+    reader.read_exact(&mut bytes)?;
+    Ok(PackedSequence::from_encoded(length, packed, bytes)?.decode())
+}
+
+fn read_packed_sequence<R: Read>(reader: &mut R) -> Result<PackedSequence> {
+    let mut mode = [0];
+    reader.read_exact(&mut mode)?;
+    let length = u32::try_from(read_varint(reader)?)
+        .map_err(|_| Error::InvalidFormat("sequence too large".into()))?;
+    let encoded_length = usize_from(read_varint(reader)?, "sequence")?;
+    let mut bytes = vec![0; encoded_length];
+    reader.read_exact(&mut bytes)?;
+    PackedSequence::from_encoded(length, mode[0] != 0, bytes)
+}
+
+fn write_group_metadata<W: Write>(
+    output: &mut W,
+    group_ids: &[u64],
+    ids: &[Vec<u8>],
+    qualities: &[Vec<u8>],
+    options: &CompressionOptions,
+    mate: usize,
+    id_pattern: PairedIdPattern,
+) -> Result<()> {
+    let store_id =
+        options.preserve_ids && (mate == 0 || id_pattern == PairedIdPattern::Independent);
+    if store_id {
+        write_metadata_values(
+            output,
+            group_ids.iter().map(|&id| {
+                ids.get(id as usize)
+                    .map(Vec::as_slice)
+                    .ok_or_else(|| Error::InvalidFormat("missing ID metadata".into()))
+            }),
+        )?;
+    }
+    if options.preserve_quality {
+        write_quality_metadata(
+            output,
+            group_ids.iter().map(|&id| {
+                qualities
+                    .get(id as usize)
+                    .map(Vec::as_slice)
+                    .ok_or_else(|| Error::InvalidFormat("missing quality metadata".into()))
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_metadata_values<'a, W: Write, I: Iterator<Item = Result<&'a [u8]>>>(
+    output: &mut W,
+    values: I,
+) -> Result<()> {
+    let values: Vec<_> = values.collect::<Result<Vec<_>>>()?;
+    let fixed = values
+        .first()
+        .map(|value| values.iter().all(|other| other.len() == value.len()))
+        .unwrap_or(true);
+    let fixed_size = 1
+        + varint_len(values.first().map_or(0, |value| value.len() as u64))
+        + values.iter().map(|value| value.len()).sum::<usize>();
+    let variable_size = 1
+        + values
+            .iter()
+            .map(|value| varint_len(value.len() as u64))
+            .sum::<usize>()
+        + values.iter().map(|value| value.len()).sum::<usize>();
+
+    let prefix_length = values
+        .first()
+        .map(|first| {
+            values.iter().skip(1).fold(first.len(), |length, value| {
+                length.min(
+                    value
+                        .iter()
+                        .zip(first.iter())
+                        .take(length)
+                        .take_while(|(left, right)| left == right)
+                        .count(),
+                )
+            })
+        })
+        .unwrap_or(0);
+    let prefix_size = 1
+        + varint_len(prefix_length as u64)
+        + prefix_length
+        + values
+            .iter()
+            .map(|value| {
+                let suffix_length = value.len() - prefix_length;
+                varint_len(suffix_length as u64) + suffix_length
+            })
+            .sum::<usize>();
+
+    let fallback_size = if fixed { fixed_size } else { variable_size };
+    if prefix_size < fallback_size {
+        output.write_all(&[2])?;
+        put_varint(output, prefix_length as u64)?;
+        if let Some(first) = values.first() {
+            output.write_all(&first[..prefix_length])?;
+        }
+        for value in &values {
+            put_varint(output, (value.len() - prefix_length) as u64)?;
+        }
+        for value in values {
+            output.write_all(&value[prefix_length..])?;
+        }
+    } else if fixed && fixed_size <= variable_size {
+        output.write_all(&[1])?;
+        put_varint(output, values.first().map_or(0, |value| value.len() as u64))?;
+        for value in values {
+            output.write_all(value)?;
+        }
+    } else {
+        output.write_all(&[0])?;
+        for value in &values {
+            put_varint(output, value.len() as u64)?;
+        }
+        for value in values {
+            output.write_all(value)?;
+        }
+    }
+    Ok(())
+}
+
+const QUALITY_METADATA_PACKED: u8 = 1;
+const QUALITY_METADATA_BLOCK_RECORDS: usize = 4096;
+
+fn write_quality_metadata<'a, W: Write, I: Iterator<Item = Result<&'a [u8]>>>(
+    output: &mut W,
+    values: I,
+) -> Result<()> {
+    let values = values.collect::<Result<Vec<_>>>()?;
+    let encoded =
+        crate::quality_blocks::encode_blocks_bytes(&values, QUALITY_METADATA_BLOCK_RECORDS)?;
+    output.write_all(&[QUALITY_METADATA_PACKED])?;
+    put_varint(output, encoded.len() as u64)?;
+    output.write_all(&encoded)?;
+    Ok(())
+}
+
+fn read_group_metadata<R: Read>(
+    reader: &mut ChecksummedReader<'_, R>,
+    count: u64,
+    packed: bool,
+) -> Result<Vec<Vec<u8>>> {
+    let count = usize_from(count, "group")?;
+    if packed {
+        if reader.u8()? != QUALITY_METADATA_PACKED {
+            return Err(Error::InvalidFormat(
+                "unsupported RS4 quality metadata encoding".into(),
+            ));
+        }
+        let encoded_length = usize_from(reader.varint()?, "quality metadata")?;
+        let mut encoded = vec![0; encoded_length];
+        reader.read_exact(&mut encoded)?;
+        let values = crate::quality_blocks::QualityBlocks::decode(&encoded)?;
+        if values.len() != count {
+            return Err(Error::InvalidFormat(
+                "RS4 quality block record count mismatch".into(),
+            ));
+        }
+        return Ok(values);
+    }
+    let mode = reader.u8()?;
+    let mut lengths = match mode {
+        0 => (0..count)
+            .map(|_| {
+                reader
+                    .varint()
+                    .and_then(|value| usize_from(value, "metadata"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        1 => vec![usize_from(reader.varint()?, "metadata")?; count],
+        2 => {
+            let prefix_length = usize_from(reader.varint()?, "metadata")?;
+            let mut prefix = vec![0; prefix_length];
+            reader.read_exact(&mut prefix)?;
+            let suffix_lengths = (0..count)
+                .map(|_| {
+                    reader
+                        .varint()
+                        .and_then(|value| usize_from(value, "metadata"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut values = Vec::with_capacity(count);
+            for suffix_length in suffix_lengths {
+                let mut value = prefix.clone();
+                let start = value.len();
+                let end = start
+                    .checked_add(suffix_length)
+                    .ok_or_else(|| Error::InvalidFormat("RS4 metadata value too large".into()))?;
+                value.resize(end, 0);
+                reader.read_exact(&mut value[start..])?;
+                values.push(value);
+            }
+            return Ok(values);
+        }
+        _ => {
+            return Err(Error::InvalidFormat(
+                "unsupported RS4 metadata encoding".into(),
+            ))
+        }
+    };
+    let mut values = Vec::with_capacity(count);
+    for length in lengths.drain(..) {
+        let mut value = vec![0; length];
+        reader.read_exact(&mut value)?;
+        values.push(value);
+    }
+    Ok(values)
 }
 
 fn append_compact_order<W: Write>(
@@ -2073,6 +3398,29 @@ where
     Ok(())
 }
 
+fn load_prepared_metadata(column: &PreparedColumn) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    let mut ids = Vec::new();
+    if column.ids.count != 0 {
+        for_each_id(&column.ids.path, column.ids.count, |id| {
+            ids.push(id);
+            Ok(())
+        })?;
+    }
+    let qualities = if column.qualities.block_count == 0 {
+        Vec::new()
+    } else {
+        let mut bytes = Vec::new();
+        copy_external_bytes(&column.qualities.path, &mut bytes)?;
+        let mut encoded = Vec::with_capacity(8 + bytes.len());
+        encoded.extend_from_slice(&(PreparedQualityWriter::BLOCK_RECORDS as u32).to_le_bytes());
+        encoded.extend_from_slice(&column.qualities.block_count.to_le_bytes());
+        encoded.extend_from_slice(&bytes);
+        let values = crate::quality_blocks::QualityBlocks::decode(&encoded)?;
+        values
+    };
+    Ok((ids, qualities))
+}
+
 struct PreparedQualityWriter {
     output: Lz4ByteWriter,
     values: Vec<Vec<u8>>,
@@ -2233,6 +3581,8 @@ pub(crate) struct PreparedMetadata {
     columns: [PreparedColumn; 2],
     id_pattern: PairedIdPattern,
     count: u64,
+    ids: [Vec<Vec<u8>>; 2],
+    qualities: [Vec<Vec<u8>>; 2],
 }
 
 impl PreparedRecordsBuilder {
@@ -2382,10 +3732,15 @@ impl PreparedRecordsBuilder {
 
     pub(crate) fn finish_metadata(self) -> Result<PreparedMetadata> {
         let [first, second] = self.columns;
+        let columns = [first.finish()?, second.finish()?];
+        let (first_ids, first_qualities) = load_prepared_metadata(&columns[0])?;
+        let (second_ids, second_qualities) = load_prepared_metadata(&columns[1])?;
         Ok(PreparedMetadata {
-            columns: [first.finish()?, second.finish()?],
+            columns,
             id_pattern: self.id_pattern.unwrap_or(PairedIdPattern::Independent),
             count: self.count,
+            ids: [first_ids, second_ids],
+            qualities: [first_qualities, second_qualities],
         })
     }
 }
@@ -2782,11 +4137,6 @@ fn put_bytes_writer<W: Write>(writer: &mut W, bytes: &[u8], enabled: bool) -> Re
 fn put_u16_writer<W: Write>(writer: &mut W, value: u16) -> Result<()> {
     writer.write_all(&value.to_le_bytes()).map_err(Into::into)
 }
-fn checksum(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(2166136261, |hash, byte| {
-        (hash ^ *byte as u32).wrapping_mul(16777619)
-    })
-}
 fn usize_from(value: u64, field: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::InvalidFormat(format!("{field} too large")))
 }
@@ -2804,6 +4154,179 @@ fn read_u64<R: Read>(reader: &mut R) -> Result<u64> {
     let mut bytes = [0; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+struct ChecksummedReader<'a, R> {
+    inner: &'a mut R,
+    remaining: u64,
+    checksum: u32,
+}
+
+impl<'a, R: Read> ChecksummedReader<'a, R> {
+    fn new(inner: &'a mut R, remaining: u64) -> Self {
+        Self {
+            inner,
+            remaining,
+            checksum: 2166136261,
+        }
+    }
+    fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(Error::InvalidFormat("RS4 payload length mismatch".into()));
+        }
+        self.inner.read_exact(bytes)?;
+        self.remaining -= bytes.len() as u64;
+        for &byte in bytes.iter() {
+            self.checksum = (self.checksum ^ byte as u32).wrapping_mul(16777619);
+        }
+        Ok(())
+    }
+    fn u8(&mut self) -> Result<u8> {
+        let mut b = [0];
+        self.read_exact(&mut b)?;
+        Ok(b[0])
+    }
+    fn u16(&mut self) -> Result<u16> {
+        let mut b = [0; 2];
+        self.read_exact(&mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+    fn u32(&mut self) -> Result<u32> {
+        let mut b = [0; 4];
+        self.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        let mut b = [0; 8];
+        self.read_exact(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+    fn varint(&mut self) -> Result<u64> {
+        let mut value = 0u64;
+        for shift in (0..=63).step_by(7) {
+            let byte = self.u8()?;
+            if shift == 63 && byte > 1 {
+                return Err(Error::InvalidFormat("RS4 varint overflow".into()));
+            }
+            value |= ((byte & 0x7f) as u64) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(Error::InvalidFormat("unterminated RS4 varint".into()))
+    }
+    fn bytes_u64(&mut self) -> Result<Vec<u8>> {
+        let len = usize_from(self.u64()?, "field")?;
+        let mut value = vec![0; len];
+        self.read_exact(&mut value)?;
+        Ok(value)
+    }
+    fn finish(mut self, expected: u32) -> Result<()> {
+        let mut buffer = [0u8; 64 * 1024];
+        while self.remaining != 0 {
+            let length = (self.remaining as usize).min(buffer.len());
+            self.read_exact(&mut buffer[..length])?;
+        }
+        if self.checksum != expected {
+            return Err(Error::InvalidFormat("RS4 checksum failure".into()));
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for ChecksummedReader<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let length = bytes.len().min(self.remaining as usize);
+        let read = self.inner.read(&mut bytes[..length])?;
+        self.remaining -= read as u64;
+        for &byte in &bytes[..read] {
+            self.checksum = (self.checksum ^ byte as u32).wrapping_mul(16777619);
+        }
+        Ok(read)
+    }
+}
+
+fn read_one<R: Read>(reader: &mut R) -> Result<u8> {
+    let mut b = [0];
+    reader.read_exact(&mut b)?;
+    Ok(b[0])
+}
+fn read_bytes_u64<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+    let len = usize_from(read_u64(reader)?, "field")?;
+    let mut value = vec![0; len];
+    reader.read_exact(&mut value)?;
+    Ok(value)
+}
+fn read_varint<R: Read>(reader: &mut R) -> Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = read_one(reader)?;
+        if shift == 63 && byte > 1 {
+            return Err(Error::InvalidFormat("RS4 varint overflow".into()));
+        }
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(Error::InvalidFormat("unterminated RS4 varint".into()))
+}
+fn read_reference_stream<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+    match read_one(reader)? {
+        0 => {
+            let len = usize_from(read_u32(reader)? as u64, "reference")?;
+            let mut value = vec![0; len];
+            reader.read_exact(&mut value)?;
+            Ok(value)
+        }
+        1 => {
+            let width = usize_from(read_u32(reader)? as u64, "reference")?;
+            let data_len = usize_from(read_u64(reader)?, "reference")?;
+            let mut packed = vec![0; data_len];
+            reader.read_exact(&mut packed)?;
+            if data_len != width.div_ceil(4) {
+                return Err(Error::InvalidFormat("invalid packed RS4 reference".into()));
+            }
+            Ok((0..width)
+                .map(|i| {
+                    [b'A', b'C', b'G', b'T'][((packed[i / 4] >> (6 - 2 * (i % 4))) & 3) as usize]
+                })
+                .collect())
+        }
+        _ => Err(Error::InvalidFormat("invalid RS4 reference mode".into())),
+    }
+}
+fn read_consensus_read_stream<R: Read>(
+    reader: &mut ChecksummedReader<'_, R>,
+    original_id: u64,
+) -> Result<ConsensusRead> {
+    let reverse = reader.u8()? != 0;
+    let offset = u32::try_from(read_varint(reader)?)
+        .map_err(|_| Error::InvalidFormat("read offset too large".into()))?;
+    let length = u32::try_from(read_varint(reader)?)
+        .map_err(|_| Error::InvalidFormat("read length too large".into()))?;
+    let mismatch_count = usize_from(read_varint(reader)?, "mismatch count")?;
+    let mut mismatches = Vec::with_capacity(mismatch_count);
+    let mut position: u32 = 0;
+    for _ in 0..mismatch_count {
+        position = position
+            .checked_add(
+                u32::try_from(read_varint(reader)?)
+                    .map_err(|_| Error::InvalidFormat("mismatch position too large".into()))?,
+            )
+            .ok_or_else(|| Error::InvalidFormat("mismatch position overflow".into()))?;
+        mismatches.push((position, reader.u8()?));
+    }
+    Ok(ConsensusRead {
+        original_id,
+        offset,
+        reverse,
+        length,
+        mismatches,
+    })
 }
 
 struct Cursor<'a> {
@@ -3253,6 +4776,63 @@ mod tests {
     }
 
     #[test]
+    fn singleton_descriptor_batches_clean_sequences_and_falls_back() {
+        let sequences = [
+            PackedSequence::from_bytes(b"ACGT"),
+            PackedSequence::from_bytes(b"TGCA"),
+            PackedSequence::from_bytes(b"ACG"),
+            PackedSequence::from_bytes(b"ACGN"),
+        ];
+        let mut input = Vec::new();
+        for (id, sequence) in sequences.iter().enumerate() {
+            put_varint(&mut input, 1).unwrap();
+            input.write_all(&[1]).unwrap();
+            put_varint(&mut input, zigzag_delta(id as u64, 0)).unwrap();
+            write_packed_sequence(&mut input, sequence).unwrap();
+        }
+        let options = CompressionOptions {
+            preserve_ids: false,
+            preserve_quality: false,
+            ..CompressionOptions::default()
+        };
+        let mut output = Vec::new();
+        copy_group_descriptors(
+            &mut std::io::Cursor::new(input),
+            &mut output,
+            sequences.len() as u64,
+            0,
+            &[],
+            &[],
+            &options,
+            PairedIdPattern::Independent,
+        )
+        .unwrap();
+
+        let mut output = std::io::Cursor::new(output);
+        assert_eq!(read_varint(&mut output).unwrap(), 2);
+        assert_eq!(read_one(&mut output).unwrap(), 2);
+        assert_eq!(read_varint(&mut output).unwrap(), 4);
+        assert_eq!(
+            zigzag_decode(read_varint(&mut output).unwrap(), 0).unwrap(),
+            0
+        );
+        assert_eq!(read_one(&mut output).unwrap(), 0x1b);
+        assert_eq!(
+            zigzag_decode(read_varint(&mut output).unwrap(), 0).unwrap(),
+            1
+        );
+        assert_eq!(read_one(&mut output).unwrap(), 0xe4);
+        assert_eq!(read_varint(&mut output).unwrap(), 1);
+        assert_eq!(read_one(&mut output).unwrap(), 1);
+        assert_eq!(read_varint(&mut output).unwrap(), 4);
+        assert_eq!(read_packed_sequence(&mut output).unwrap(), sequences[2]);
+        assert_eq!(read_varint(&mut output).unwrap(), 1);
+        assert_eq!(read_one(&mut output).unwrap(), 1);
+        assert_eq!(read_varint(&mut output).unwrap(), 6);
+        assert_eq!(read_packed_sequence(&mut output).unwrap(), sequences[3]);
+    }
+
+    #[test]
     fn similar_store_reads_share_consensus_and_split_at_limit() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = PairStore::create(directory.path().join("store")).unwrap();
@@ -3415,6 +4995,52 @@ mod tests {
         }
     }
 
+    fn metadata_round_trip(values: &[&[u8]], expected_mode: u8) -> Vec<Vec<u8>> {
+        let mut encoded = Vec::new();
+        write_metadata_values(&mut encoded, values.iter().copied().map(Ok)).unwrap();
+        assert_eq!(encoded[0], expected_mode);
+        let length = encoded.len() as u64;
+        let mut input = std::io::Cursor::new(encoded);
+        let mut reader = ChecksummedReader::new(&mut input, length);
+        read_group_metadata(&mut reader, values.len() as u64, false).unwrap()
+    }
+
+    #[test]
+    fn group_metadata_compresses_common_prefixes() {
+        let values = [b"sample-000/1".as_slice(), b"sample-001/1", b"sample-002/1"];
+        assert_eq!(
+            metadata_round_trip(&values, 2),
+            values
+                .iter()
+                .map(|value| value.to_vec())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn group_metadata_falls_back_when_prefix_is_not_useful() {
+        let values = [b"a".as_slice(), b"bbbb", b"ccc"];
+        assert_eq!(
+            metadata_round_trip(&values, 0),
+            values
+                .iter()
+                .map(|value| value.to_vec())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn group_metadata_preserves_arbitrary_bytes() {
+        let values = [b"\x80\x00prefix-a".as_slice(), b"\x80\x00prefix-b"];
+        assert_eq!(
+            metadata_round_trip(&values, 2),
+            values
+                .iter()
+                .map(|value| value.to_vec())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn paired_id_patterns_are_losslessly_derivable() {
         assert_eq!(
@@ -3475,5 +5101,37 @@ mod tests {
         assert_eq!(count, 0);
         assert_eq!(singletons.len(), clusters.len());
         assert_eq!(order.len(), clusters.len());
+    }
+
+    #[test]
+    fn run_compaction_uses_bounded_fan_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let runs_dir = directory.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let mut paths = Vec::new();
+        for original_id in (0..(RUN_MERGE_FAN_IN as u64 + 1)).rev() {
+            let path = runs_dir.join(format!("input-{original_id}.bin"));
+            let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+            file.write_all(&1u64.to_le_bytes()).unwrap();
+            write_run_record(
+                &mut file,
+                original_id,
+                &ReadRecord::new("id", b"ACGT".to_vec(), None),
+            )
+            .unwrap();
+            file.flush().unwrap();
+            paths.push(path);
+        }
+        let mut set = RunSet {
+            paths,
+            records: RUN_MERGE_FAN_IN as u64 + 1,
+        };
+        compact_run_set(&mut set, directory.path()).unwrap();
+        assert!(set.paths.len() <= RUN_MERGE_FAN_IN);
+        let mut merger = RunMerger::open(&set.paths).unwrap();
+        for expected_id in 0..(RUN_MERGE_FAN_IN as u64 + 1) {
+            assert_eq!(merger.next().unwrap().unwrap().0, expected_id);
+        }
+        assert!(merger.next().unwrap().is_none());
     }
 }

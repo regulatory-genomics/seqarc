@@ -1,10 +1,9 @@
 //! A Rust-native, library-only sequencing read compressor.
 //!
 //! The archive format is intentionally independent from the original C++
-//! SPRING format. RS3 archives are self-describing and support range decoding
+//! SPRING format. RS4 archives are self-describing and support range decoding
 //! without a command-line interface.
 
-mod codec;
 mod consensus_archive;
 mod external_bytes;
 mod fastx;
@@ -188,7 +187,30 @@ impl Default for CompressionOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct DecompressionOptions {
-    pub range: Option<RangeInclusive<u64>>,
+    pub original_range: Option<RangeInclusive<u64>>,
+    pub output_order: OutputOrder,
+    pub temp_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputOrder {
+    #[default]
+    Original,
+    Compression,
+}
+
+pub trait PairedRecordSink {
+    fn write_pair(&mut self, original_id: u64, first: ReadRecord, second: ReadRecord)
+        -> Result<()>;
+
+    fn finish(&mut self) -> Result<()>;
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecompressionMetadata {
+    pub streams: usize,
+    pub pairs: u64,
+    pub output_order: OutputOrder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,7 +256,7 @@ pub struct ArchiveRecords {
 
 /// Compress paired gzipped FASTQ files into a native archive.
 ///
-/// Uses the store-backed RS3 consensus path.
+/// Uses the store-backed RS4 consensus path.
 pub fn compress_paired_fastq_files(
     input_1: impl AsRef<Path>,
     input_2: impl AsRef<Path>,
@@ -248,7 +270,7 @@ pub fn compress_paired_fastq_files(
     compress_reordered_paired_fastq_files(input_1, input_2, output, options, temp_dir)
 }
 
-/// Reads paired FASTQ streams and writes an RS3 global-reorder archive.
+/// Reads paired FASTQ streams and writes an RS4 global-reorder archive.
 ///
 /// Minimizer entries spill through `bed-utils`, records are stored on disk,
 /// and consensus buckets are processed by a bounded worker pool.
@@ -533,12 +555,19 @@ fn directory_size(path: &Path) -> Result<u64> {
 
 /// Decompress an archive, optionally selecting an inclusive zero-based record range.
 pub fn decompress<R: Read>(input: R, options: &DecompressionOptions) -> Result<ArchiveRecords> {
-    let mut input = std::io::BufReader::new(input);
-    let mut magic = [0; 9];
-    input.read_exact(&mut magic)?;
-    let mut data = magic.to_vec();
-    input.read_to_end(&mut data)?;
-    consensus_archive::read_reordered(std::io::Cursor::new(data), options)
+    consensus_archive::read_reordered(input, options)
+}
+
+/// Decode paired records into a sink without requiring callers to collect the
+/// output into `ArchiveRecords`.
+///
+/// Records are delivered in original order.
+pub fn decompress_paired_into<R: Read, S: PairedRecordSink>(
+    input: R,
+    options: &DecompressionOptions,
+    sink: &mut S,
+) -> Result<DecompressionMetadata> {
+    consensus_archive::read_paired_into(input, options, sink)
 }
 
 /// Copy decoded records to FASTQ or FASTA writers.
@@ -639,11 +668,75 @@ mod tests {
         assert_eq!(profile.store_stats.blob_reads, 16);
         let decoded = decompress(
             Cursor::new(archive),
-            &DecompressionOptions { range: Some(1..=1) },
+            &DecompressionOptions {
+                original_range: Some(1..=1),
+                ..DecompressionOptions::default()
+            },
         )
         .unwrap();
         assert_eq!(decoded.streams[0], vec![first[1].clone()]);
         assert_eq!(decoded.streams[1], vec![second[1].clone()]);
+    }
+
+    #[test]
+    fn rs4_round_trips_singletons_ids_qualities_and_original_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PairStore::create(directory.path().join("store")).unwrap();
+        let first = [
+            ReadRecord::new("z/1", b"ACGT".to_vec(), Some(b"IIII".to_vec())),
+            ReadRecord::new("a/1", b"NNNN".to_vec(), Some(b"####".to_vec())),
+            ReadRecord::new("m/1", b"TGCA".to_vec(), Some(b"JJJJ".to_vec())),
+        ];
+        let second = [
+            ReadRecord::new("z/2", b"GATC".to_vec(), Some(b"HHHH".to_vec())),
+            ReadRecord::new("a/2", b"CCCC".to_vec(), Some(b"$$$$".to_vec())),
+            ReadRecord::new("m/2", b"ATAT".to_vec(), Some(b"GGGG".to_vec())),
+        ];
+        for (left, right) in first.iter().zip(&second) {
+            store.append(left, right).unwrap();
+        }
+        let mut archive = Vec::new();
+        consensus_archive::write_reordered_store_profiled(
+            &mut store,
+            &mut archive,
+            &CompressionOptions::default(),
+            directory.path(),
+        )
+        .unwrap();
+        let decoded = decompress(Cursor::new(archive), &DecompressionOptions::default()).unwrap();
+        assert_eq!(decoded.streams, vec![first.to_vec(), second.to_vec()]);
+    }
+
+    #[test]
+    fn rs4_round_trips_prefixed_arbitrary_byte_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PairStore::create(directory.path().join("store")).unwrap();
+        let first = [
+            ReadRecord::new(b"\x80sample-000/1".to_vec(), b"ACGT".to_vec(), None),
+            ReadRecord::new(b"\x80sample-001/1".to_vec(), b"NNNN".to_vec(), None),
+            ReadRecord::new(b"\x80sample-002/1".to_vec(), b"TGCA".to_vec(), None),
+        ];
+        let second = [
+            ReadRecord::new(b"\x80sample-000/2".to_vec(), b"TGCA".to_vec(), None),
+            ReadRecord::new(b"\x80sample-001/2".to_vec(), b"CCCC".to_vec(), None),
+            ReadRecord::new(b"\x80sample-002/2".to_vec(), b"GATC".to_vec(), None),
+        ];
+        for (left, right) in first.iter().zip(&second) {
+            store.append(left, right).unwrap();
+        }
+        let mut archive = Vec::new();
+        consensus_archive::write_reordered_store_profiled(
+            &mut store,
+            &mut archive,
+            &CompressionOptions {
+                preserve_quality: false,
+                ..CompressionOptions::default()
+            },
+            directory.path(),
+        )
+        .unwrap();
+        let decoded = decompress(Cursor::new(archive), &DecompressionOptions::default()).unwrap();
+        assert_eq!(decoded.streams, vec![first.to_vec(), second.to_vec()]);
     }
 
     #[test]
@@ -675,6 +768,53 @@ mod tests {
         let decoded = decompress(Cursor::new(archive), &DecompressionOptions::default()).unwrap();
         assert_eq!(decoded.streams[0], (0..32).map(record).collect::<Vec<_>>());
         assert_eq!(decoded.streams[1], (32..64).map(record).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn paired_sink_receives_original_order_records() {
+        struct Sink {
+            ids: Vec<u64>,
+        }
+
+        impl PairedRecordSink for Sink {
+            fn write_pair(
+                &mut self,
+                original_id: u64,
+                _first: ReadRecord,
+                _second: ReadRecord,
+            ) -> Result<()> {
+                self.ids.push(original_id);
+                Ok(())
+            }
+
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PairStore::create(directory.path().join("store")).unwrap();
+        for index in 0..4 {
+            store.append(&record(index), &record(index + 4)).unwrap();
+        }
+        let mut archive = Vec::new();
+        consensus_archive::write_reordered_store_profiled(
+            &mut store,
+            &mut archive,
+            &CompressionOptions::default(),
+            directory.path(),
+        )
+        .unwrap();
+
+        let mut sink = Sink { ids: Vec::new() };
+        let metadata = decompress_paired_into(
+            Cursor::new(archive),
+            &DecompressionOptions::default(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(metadata.pairs, 4);
+        assert_eq!(sink.ids, vec![0, 1, 2, 3]);
     }
 
     #[test]

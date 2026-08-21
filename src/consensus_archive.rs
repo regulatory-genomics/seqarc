@@ -1238,7 +1238,7 @@ fn write_reordered_store_profiled_v2<W: Write>(
 #[allow(dead_code)]
 pub(crate) fn write_prepared_profiled<W: Write>(
     prepared: PreparedRecords,
-    mut output: W,
+    output: W,
     options: &CompressionOptions,
     temp_dir: impl AsRef<Path>,
 ) -> Result<(CompressionMetadata, CompressionProfile)> {

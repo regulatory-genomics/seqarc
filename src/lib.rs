@@ -4,10 +4,13 @@
 //! SPRING format. RS4 archives are self-describing and support range decoding
 //! without a command-line interface.
 
+mod alignment_archive;
+#[allow(dead_code)]
 mod consensus_archive;
 mod external_bytes;
 mod fastx;
 mod packed_sequence;
+#[allow(dead_code)]
 mod quality_blocks;
 mod record_store;
 pub mod reorder;
@@ -147,6 +150,33 @@ pub struct CompressionOptions {
     pub zstd_threads: usize,
     pub zstd_level: i32,
     pub reorder: ReorderOptions,
+}
+
+#[derive(Clone, Debug)]
+pub struct AlignmentCompressionOptions {
+    pub chunk_pairs: usize,
+    pub include_chunk_index: bool,
+    pub threads: usize,
+    pub zstd_threads: usize,
+    pub preserve_ids: bool,
+    pub preserve_quality: bool,
+    pub quality_mode: QualityMode,
+    pub zstd_level: i32,
+}
+
+impl Default for AlignmentCompressionOptions {
+    fn default() -> Self {
+        Self {
+            chunk_pairs: 250_000,
+            include_chunk_index: true,
+            threads: 16,
+            zstd_threads: 16,
+            preserve_ids: true,
+            preserve_quality: true,
+            quality_mode: QualityMode::Lossless,
+            zstd_level: 19,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -478,6 +508,39 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     Ok((metadata, profile))
 }
 
+/// Compress paired gzipped FASTQ files against an embedded genome reference.
+///
+/// Mapped reads store their reference offset, strand, CIGAR, and sequence noise.
+/// Reads without a minibwa alignment are stored using the packed/raw fallback.
+pub fn compress_aligned_paired_fastq_files(
+    genome_fasta: impl AsRef<Path>,
+    input_1: impl AsRef<Path>,
+    input_2: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &AlignmentCompressionOptions,
+) -> Result<CompressionMetadata> {
+    alignment_archive::compress_paired_fastq_files(genome_fasta, input_1, input_2, output, options)
+}
+
+/// Compress paired gzipped FASTQ files using an existing minibwa index.
+pub fn compress_aligned_paired_fastq_files_with_index(
+    genome_fasta: impl AsRef<Path>,
+    index_prefix: impl AsRef<Path>,
+    input_1: impl AsRef<Path>,
+    input_2: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &AlignmentCompressionOptions,
+) -> Result<CompressionMetadata> {
+    alignment_archive::compress_paired_fastq_files_with_index(
+        genome_fasta,
+        index_prefix,
+        input_1,
+        input_2,
+        output,
+        options,
+    )
+}
+
 struct CompressionGuard {
     workspace: Option<std::path::PathBuf>,
     partial_output: Option<std::path::PathBuf>,
@@ -560,6 +623,22 @@ pub fn decompress<R: Read>(input: R, options: &DecompressionOptions) -> Result<A
     consensus_archive::read_reordered(input, options)
 }
 
+/// Decompress an alignment archive into paired records.
+pub fn decompress_aligned_paired<R: Read>(
+    input: R,
+    options: &DecompressionOptions,
+) -> Result<ArchiveRecords> {
+    alignment_archive::decompress_paired(input, options)
+}
+
+pub fn decompress_aligned_paired_into<R: Read, S: PairedRecordSink>(
+    input: R,
+    options: &DecompressionOptions,
+    sink: &mut S,
+) -> Result<DecompressionMetadata> {
+    alignment_archive::decompress_paired_into(input, options, sink)
+}
+
 /// Decode paired records into a sink without requiring callers to collect the
 /// output into `ArchiveRecords`.
 ///
@@ -579,6 +658,91 @@ pub fn write_fastx<W: Write>(records: &[ReadRecord], output: W, format: Format) 
         writer.write_record(record)?;
     }
     writer.finish()
+}
+
+/// Build a minibwa index from a genome FASTA by concatenating all chromosomes
+/// into one synthetic contig.
+pub fn build_genome_index(
+    genome_fasta: impl AsRef<Path>,
+    index_prefix: impl AsRef<Path>,
+) -> Result<minibwa::Index> {
+    let genome_fasta = genome_fasta.as_ref();
+    let input = File::open(genome_fasta)?;
+    let reader: Box<dyn Read> = if genome_fasta
+        .extension()
+        .is_some_and(|extension| extension == "gz")
+    {
+        Box::new(gzip_reader(input))
+    } else {
+        Box::new(input)
+    };
+    let mut genome = Vec::new();
+    for record in FastxReader::new(BufReader::new(reader), Format::Fasta) {
+        genome.extend(record?.sequence);
+    }
+    if genome.is_empty() {
+        return Err(Error::InvalidInput(
+            "genome FASTA does not contain any sequence".into(),
+        ));
+    }
+
+    let mut fasta = tempfile::NamedTempFile::new()?;
+    fasta.write_all(b">genome\n")?;
+    fasta.write_all(&genome)?;
+    fasta.write_all(b"\n")?;
+    fasta.as_file_mut().sync_all()?;
+
+    minibwa::Index::build(fasta.path(), index_prefix, 4, false)
+        .map_err(|error| Error::InvalidInput(error.to_string()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenomeAlignment {
+    pub start: i64,
+    pub query_start: i32,
+    pub query_end: i32,
+    pub cigar: Vec<minibwa::CigarOp>,
+    pub is_reverse: bool,
+}
+
+/// Align a batch of raw DNA sequences against a minibwa index.
+///
+/// The returned entries preserve input order. `None` indicates that a sequence
+/// could not be mapped. When minibwa reports multiple hits, only its first hit
+/// is returned.
+pub fn align_dna_batch(
+    index: &minibwa::Index,
+    sequences: &[impl AsRef<[u8]>],
+) -> Result<Vec<Option<GenomeAlignment>>> {
+    let names: Vec<String> = (0..sequences.len())
+        .map(|index| format!("read-{index}"))
+        .collect();
+    let queries: Vec<_> = names
+        .iter()
+        .zip(sequences)
+        .map(|(name, sequence)| minibwa::Query {
+            name,
+            sequence: sequence.as_ref(),
+            methylation_type: 0,
+        })
+        .collect();
+    let mut options = minibwa::Options::default();
+    options.set_paired_end(false);
+    let hits = minibwa::map_batch(index, &options, &queries, None)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+
+    Ok(hits
+        .into_iter()
+        .map(|hits| {
+            hits.into_iter().next().map(|hit| GenomeAlignment {
+                start: hit.target_start,
+                query_start: hit.query_start,
+                query_end: hit.query_end,
+                cigar: hit.cigar,
+                is_reverse: hit.is_reverse,
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -642,6 +806,141 @@ mod tests {
             .unwrap();
         assert_eq!(records[0].sequence, b"ACGT");
         assert_eq!(records[1].quality, None);
+    }
+
+    #[test]
+    fn genome_index_concatenates_chromosomes() {
+        let directory = tempfile::tempdir().unwrap();
+        let genome = directory.path().join("genome.fa");
+        std::fs::write(&genome, b">chr1\nACGT\n>chr2\nTGCA\n").unwrap();
+        let prefix = directory.path().join("genome-index");
+
+        let _index = build_genome_index(&genome, &prefix).unwrap();
+
+        assert!(prefix.with_extension("l2b").exists());
+        assert!(prefix.with_extension("mbw").exists());
+    }
+
+    #[test]
+    fn dna_batch_alignment_returns_first_hit_and_strand() {
+        let directory = tempfile::tempdir().unwrap();
+        let genome = directory.path().join("genome.fa");
+        let prefix = directory.path().join("genome-index");
+        let reference =
+            b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+        std::fs::write(&genome, [b">chr1\n".as_slice(), reference, b"\n"].concat()).unwrap();
+        let index = build_genome_index(&genome, &prefix).unwrap();
+
+        let forward = reference[20..60].to_vec();
+        let reverse = forward
+            .iter()
+            .rev()
+            .map(|base| match base {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                _ => *base,
+            })
+            .collect::<Vec<_>>();
+        let alignments = align_dna_batch(
+            &index,
+            &[
+                forward,
+                reverse,
+                b"NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN".to_vec(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(alignments.len(), 3);
+        assert_eq!(alignments[0].as_ref().unwrap().start, 20);
+        assert!(!alignments[0].as_ref().unwrap().is_reverse);
+        assert!(!alignments[0].as_ref().unwrap().cigar.is_empty());
+        assert!(alignments[1].as_ref().unwrap().is_reverse);
+        assert!(alignments[2].is_none());
+    }
+
+    #[test]
+    fn aligned_paired_archive_round_trips_mapped_and_unmapped_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let genome = directory.path().join("genome.fa");
+        let input_1 = directory.path().join("reads.1.fastq.gz");
+        let input_2 = directory.path().join("reads.2.fastq.gz");
+        let output = directory.path().join("reads.aln");
+        let reference =
+            b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+        std::fs::write(&genome, [b">chr1\n".as_slice(), reference, b"\n"].concat()).unwrap();
+        let mut forward = reference[20..60].to_vec();
+        forward[5] = match forward[5] {
+            b'A' => b'C',
+            _ => b'A',
+        };
+        let reverse = reference[20..60]
+            .iter()
+            .rev()
+            .map(|base| match base {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                _ => *base,
+            })
+            .collect::<Vec<_>>();
+        let unknown = b"NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN";
+        let first_fastq = format!(
+            "@pair0/1\n{}\n+\n{}\n@pair1/1\n{}\n+\n{}\n",
+            String::from_utf8_lossy(&forward),
+            "I".repeat(forward.len()),
+            String::from_utf8_lossy(unknown),
+            "#".repeat(unknown.len()),
+        );
+        let second_fastq = format!(
+            "@pair0/2\n{}\n+\n{}\n@pair1/2\n{}\n+\n{}\n",
+            String::from_utf8_lossy(&reverse),
+            "J".repeat(reverse.len()),
+            String::from_utf8_lossy(unknown),
+            "$".repeat(unknown.len()),
+        );
+        for (path, contents) in [(&input_1, first_fastq), (&input_2, second_fastq)] {
+            let encoder = gzip_writer(File::create(path).unwrap(), 1);
+            let mut writer = encoder;
+            writer.write_all(contents.as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let alignment_options = AlignmentCompressionOptions {
+            chunk_pairs: 1,
+            ..AlignmentCompressionOptions::default()
+        };
+        compress_aligned_paired_fastq_files(
+            &genome,
+            &input_1,
+            &input_2,
+            &output,
+            &alignment_options,
+        )
+        .unwrap();
+        let mut archive = Vec::new();
+        File::open(&output)
+            .unwrap()
+            .read_to_end(&mut archive)
+            .unwrap();
+        let decoded =
+            decompress_aligned_paired(Cursor::new(archive), &DecompressionOptions::default())
+                .unwrap();
+
+        assert_eq!(decoded.streams[0].len(), 2);
+        assert_eq!(decoded.streams[1].len(), 2);
+        assert_eq!(decoded.streams[0][0].sequence, forward);
+        assert_eq!(decoded.streams[1][0].sequence, reverse);
+        assert_eq!(decoded.streams[0][1].sequence, unknown);
+        assert_eq!(decoded.streams[1][1].sequence, unknown);
+        assert_eq!(
+            decoded.streams[0][0].quality.as_deref(),
+            Some(vec![b'I'; forward.len()].as_slice())
+        );
+        assert_eq!(decoded.streams[0][0].id, b"pair0/1");
     }
 
     #[test]

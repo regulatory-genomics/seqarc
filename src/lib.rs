@@ -148,7 +148,7 @@ pub struct CompressionOptions {
 
 #[derive(Clone, Debug)]
 pub struct AlignmentCompressionOptions {
-    pub chunk_pairs: usize,
+    pub chunk_records: usize,
     pub threads: usize,
     pub preserve_ids: bool,
     pub preserve_quality: bool,
@@ -159,7 +159,7 @@ pub struct AlignmentCompressionOptions {
 impl Default for AlignmentCompressionOptions {
     fn default() -> Self {
         Self {
-            chunk_pairs: 250_000,
+            chunk_records: 250_000,
             threads: 16,
             preserve_ids: true,
             preserve_quality: true,
@@ -227,6 +227,41 @@ pub trait PairedRecordSink {
     fn finish(&mut self) -> Result<()>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlignmentLayout {
+    SingleEnd,
+    PairedEnd,
+}
+
+impl AlignmentLayout {
+    pub fn streams(self) -> usize {
+        match self {
+            Self::SingleEnd => 1,
+            Self::PairedEnd => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlignedRecordGroup {
+    Single(ReadRecord),
+    Paired(ReadRecord, ReadRecord),
+}
+
+pub trait AlignedRecordSink {
+    fn write_group(&mut self, original_id: u64, group: AlignedRecordGroup) -> Result<()>;
+
+    fn finish(&mut self) -> Result<()>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlignedDecompressionMetadata {
+    pub layout: AlignmentLayout,
+    pub streams: usize,
+    pub records: u64,
+    pub output_order: OutputOrder,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DecompressionMetadata {
     pub streams: usize,
@@ -277,7 +312,7 @@ pub struct AlignedCompressionProfile {
     pub map_and_spool: Duration,
     pub reference: Duration,
     pub chunks: Duration,
-    pub pairs: u64,
+    pub records: u64,
     pub chunk_count: u64,
     pub spool_bytes: u64,
     pub max_pending_chunks: u64,
@@ -581,6 +616,44 @@ pub fn compress_aligned_paired_fastq_files_with_index_profiled(
     )
 }
 
+pub fn compress_aligned_single_fastq_file(
+    genome_fasta: impl AsRef<Path>,
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &AlignmentCompressionOptions,
+) -> Result<CompressionMetadata> {
+    compress_aligned_single_fastq_file_profiled(genome_fasta, input, output, options)
+        .map(|(metadata, _)| metadata)
+}
+
+pub fn compress_aligned_single_fastq_file_profiled(
+    genome_fasta: impl AsRef<Path>,
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &AlignmentCompressionOptions,
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
+    alignment_archive::compress_single_fastq_file(genome_fasta, input, output, options)
+}
+
+pub fn compress_aligned_single_fastq_file_with_index(
+    index_file: impl AsRef<Path>,
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &AlignmentCompressionOptions,
+) -> Result<CompressionMetadata> {
+    compress_aligned_single_fastq_file_with_index_profiled(index_file, input, output, options)
+        .map(|(metadata, _)| metadata)
+}
+
+pub fn compress_aligned_single_fastq_file_with_index_profiled(
+    index_file: impl AsRef<Path>,
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &AlignmentCompressionOptions,
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
+    alignment_archive::compress_single_fastq_file_with_index(index_file, input, output, options)
+}
+
 struct CompressionGuard {
     workspace: Option<std::path::PathBuf>,
     partial_output: Option<std::path::PathBuf>,
@@ -669,6 +742,21 @@ pub fn decompress_aligned_paired<R: Read>(
     options: &DecompressionOptions,
 ) -> Result<ArchiveRecords> {
     alignment_archive::decompress_paired(input, options)
+}
+
+pub fn decompress_aligned_single<R: Read>(
+    input: R,
+    options: &DecompressionOptions,
+) -> Result<ArchiveRecords> {
+    alignment_archive::decompress_single(input, options)
+}
+
+pub fn decompress_aligned_into<R: Read, S: AlignedRecordSink>(
+    input: R,
+    options: &DecompressionOptions,
+    sink: &mut S,
+) -> Result<AlignedDecompressionMetadata> {
+    alignment_archive::decompress_into(input, options, sink)
 }
 
 pub fn decompress_aligned_paired_into<R: Read, S: PairedRecordSink>(
@@ -981,7 +1069,7 @@ mod tests {
         }
 
         let alignment_options = AlignmentCompressionOptions {
-            chunk_pairs: 1,
+            chunk_records: 1,
             ..AlignmentCompressionOptions::default()
         };
         let (metadata, profile) = compress_aligned_paired_fastq_files_profiled(
@@ -993,7 +1081,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metadata.records, 2);
-        assert_eq!(profile.pairs, 2);
+        assert_eq!(profile.records, 2);
         assert_eq!(profile.chunk_count, 2);
         assert_eq!(profile.mapped_reads + profile.raw_reads, 4);
         assert!(profile.spool_bytes > 0);

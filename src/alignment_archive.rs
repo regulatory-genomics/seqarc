@@ -3,12 +3,13 @@ use crate::minibwa::{Aligner, CigarKind, CigarOp, Index, Opts, Strand, ThreadBuf
 use crate::packed_sequence::PackedSequence;
 use crate::quality_blocks::{decode_stream_bytes, encode_stream_bytes};
 use crate::{
-    apply_quality, gzip_reader, AlignedCompressionProfile, ArchiveRecords, CompressionMetadata,
+    apply_quality, gzip_reader, AlignedCompressionProfile, AlignedDecompressionMetadata,
+    AlignedRecordGroup, AlignedRecordSink, AlignmentLayout, ArchiveRecords, CompressionMetadata,
     DecompressionOptions, Error, FastxReader, Format, GenomeAlignment, PairedRecordSink,
     ReadRecord, Result,
 };
 use bed_utils::extsort::{ExternalChunk, ExternalChunkBuilder};
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -16,18 +17,44 @@ use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
-const VERSION: u32 = 10;
+const VERSION: u32 = 11;
 const BATCH_SIZE: usize = 256;
 const PARSE_BATCH_PAIRS: usize = 4096;
 
 #[derive(Clone, Debug)]
 struct AlignedPair {
     first: ReadRecord,
-    second: ReadRecord,
+    second: Option<ReadRecord>,
     first_hit: Option<GenomeAlignment>,
     second_hit: Option<GenomeAlignment>,
     first_selection: AlignmentSelection,
     second_selection: AlignmentSelection,
+}
+
+impl AlignedPair {
+    fn layout(&self) -> AlignmentLayout {
+        if self.second.is_some() {
+            AlignmentLayout::PairedEnd
+        } else {
+            AlignmentLayout::SingleEnd
+        }
+    }
+
+    fn record(&self, stream: usize) -> &ReadRecord {
+        match stream {
+            0 => &self.first,
+            1 => self.second.as_ref().expect("paired stream is missing"),
+            _ => unreachable!(),
+        }
+    }
+
+    fn hit(&self, stream: usize) -> Option<&GenomeAlignment> {
+        match stream {
+            0 => self.first_hit.as_ref(),
+            1 => self.second_hit.as_ref(),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -45,7 +72,7 @@ struct SelectedAlignment {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 struct SpoolPair {
     first: SpoolRead,
-    second: SpoolRead,
+    second: Option<SpoolRead>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -151,20 +178,27 @@ impl IdMode {
 struct IdModeDetector {
     mode: Option<IdMode>,
     preserve: bool,
+    layout: AlignmentLayout,
 }
 
 impl IdModeDetector {
-    fn new(preserve: bool) -> Self {
+    fn new(preserve: bool, layout: AlignmentLayout) -> Self {
         Self {
             mode: None,
             preserve,
+            layout,
         }
     }
 
-    fn observe(&mut self, first: &[u8], second: &[u8]) {
+    fn observe(&mut self, first: &[u8], second: Option<&[u8]>) {
         if !self.preserve {
             return;
         }
+        if self.layout == AlignmentLayout::SingleEnd {
+            self.mode = Some(IdMode::Independent);
+            return;
+        }
+        let second = second.expect("paired identifier is missing");
         let observed = if first == second {
             IdMode::IdenticalMates
         } else if first.ends_with(b"/1")
@@ -186,7 +220,10 @@ impl IdModeDetector {
 
     fn finish(self) -> IdMode {
         if self.preserve {
-            self.mode.unwrap_or(IdMode::IdenticalMates)
+            self.mode.unwrap_or(match self.layout {
+                AlignmentLayout::SingleEnd => IdMode::Independent,
+                AlignmentLayout::PairedEnd => IdMode::IdenticalMates,
+            })
         } else {
             IdMode::None
         }
@@ -215,7 +252,14 @@ pub(crate) fn compress_paired_fastq_files(
         display_duration(index_elapsed),
         index.reference_len()
     );
-    let (metadata, mut profile) = compress_with_index(&index, input_1, input_2, output, options)?;
+    let (metadata, mut profile) = compress_with_index(
+        &index,
+        input_1,
+        Some(input_2),
+        output,
+        options,
+        AlignmentLayout::PairedEnd,
+    )?;
     profile.index = index_elapsed;
     profile.total = total_started.elapsed();
     eprintln!(
@@ -247,7 +291,14 @@ pub(crate) fn compress_paired_fastq_files_with_index(
         display_duration(index_elapsed),
         index.reference_len()
     );
-    let (metadata, mut profile) = compress_with_index(&index, input_1, input_2, output, options)?;
+    let (metadata, mut profile) = compress_with_index(
+        &index,
+        input_1,
+        Some(input_2),
+        output,
+        options,
+        AlignmentLayout::PairedEnd,
+    )?;
     profile.index = index_elapsed;
     profile.total = total_started.elapsed();
     eprintln!(
@@ -257,25 +308,102 @@ pub(crate) fn compress_paired_fastq_files_with_index(
     Ok((metadata, profile))
 }
 
-fn compress_with_index(
-    index: &Index,
-    input_1: impl AsRef<Path>,
-    input_2: impl AsRef<Path>,
+pub(crate) fn compress_single_fastq_file(
+    genome_fasta: impl AsRef<Path>,
+    input: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: &crate::AlignmentCompressionOptions,
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
+    let total_started = std::time::Instant::now();
+    let workspace = tempfile::tempdir()?;
+    eprintln!(
+        "[seqarc] stage=index_build start reference={}",
+        genome_fasta.as_ref().display()
+    );
+    let index_started = std::time::Instant::now();
+    let index =
+        crate::build_genome_index(genome_fasta, workspace.path().join("index.seqarc-index"))?;
+    let index_elapsed = index_started.elapsed();
+    eprintln!(
+        "[seqarc] stage=index_build done elapsed={} reference_bases={}",
+        display_duration(index_elapsed),
+        index.reference_len()
+    );
+    let (metadata, mut profile) = compress_with_index(
+        &index,
+        input,
+        Option::<&Path>::None,
+        output,
+        options,
+        AlignmentLayout::SingleEnd,
+    )?;
+    profile.index = index_elapsed;
+    profile.total = total_started.elapsed();
+    eprintln!(
+        "[seqarc] stage=total done elapsed={}",
+        display_duration(profile.total)
+    );
+    Ok((metadata, profile))
+}
+
+pub(crate) fn compress_single_fastq_file_with_index(
+    index_file: impl AsRef<Path>,
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &crate::AlignmentCompressionOptions,
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
+    let total_started = std::time::Instant::now();
+    let index_file = index_file.as_ref();
+    eprintln!(
+        "[seqarc] stage=index_load start path={}",
+        index_file.display()
+    );
+    let index_started = std::time::Instant::now();
+    let index =
+        Index::load(index_file, false).map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let index_elapsed = index_started.elapsed();
+    eprintln!(
+        "[seqarc] stage=index_load done elapsed={} reference_bases={}",
+        display_duration(index_elapsed),
+        index.reference_len()
+    );
+    let (metadata, mut profile) = compress_with_index(
+        &index,
+        input,
+        Option::<&Path>::None,
+        output,
+        options,
+        AlignmentLayout::SingleEnd,
+    )?;
+    profile.index = index_elapsed;
+    profile.total = total_started.elapsed();
+    eprintln!(
+        "[seqarc] stage=total done elapsed={}",
+        display_duration(profile.total)
+    );
+    Ok((metadata, profile))
+}
+
+fn compress_with_index<I2: AsRef<Path>>(
+    index: &Index,
+    input_1: impl AsRef<Path>,
+    input_2: Option<I2>,
+    output: impl AsRef<Path>,
+    options: &crate::AlignmentCompressionOptions,
+    layout: AlignmentLayout,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let pipeline_started = std::time::Instant::now();
     let mapping_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads.max(1))
         .build()
         .map_err(|error| Error::InvalidInput(format!("failed to create mapping pool: {error}")))?;
-    let progress = ProgressBar::new_spinner();
-    progress.enable_steady_tick(std::time::Duration::from_millis(250));
-    progress.set_message("aligned 0 reads");
+    let progress = mapping_progress();
     stage_log(&progress, format!(
-        "[seqarc] stage=initialize threads={} chunk_pairs={} zstd_level={} preserve_ids={} preserve_quality={}",
+        "[seqarc] stage=initialize layout={:?} streams={} threads={} chunk_records={} zstd_level={} preserve_ids={} preserve_quality={}",
+        layout,
+        layout.streams(),
         options.threads.max(1),
-        options.chunk_pairs.max(1),
+        options.chunk_records.max(1),
         options.zstd_level,
         options.preserve_ids,
         options.preserve_quality
@@ -285,10 +413,10 @@ fn compress_with_index(
     let mut spool_builder = ExternalChunkBuilder::new(File::create(&spool_path)?, 1)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let mut mask = ReferenceMask::new(index.reference_len());
-    let mut id_detector = IdModeDetector::new(options.preserve_ids);
+    let mut id_detector = IdModeDetector::new(options.preserve_ids, layout);
     let mut profile = AlignedCompressionProfile::default();
     let input_1 = input_1.as_ref().to_path_buf();
-    let input_2 = input_2.as_ref().to_path_buf();
+    let input_2 = input_2.map(|path| path.as_ref().to_path_buf());
     let mapper_options = options.clone();
     let (parse_tx, parse_rx) = crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(4);
     let (mapped_tx, mapped_rx) = crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(4);
@@ -301,42 +429,66 @@ fn compress_with_index(
                 BufReader::new(gzip_reader(File::open(input_1)?)),
                 Format::Fastq,
             );
-            let mut second = FastxReader::new(
-                BufReader::new(gzip_reader(File::open(input_2)?)),
-                Format::Fastq,
-            );
             let mut pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
-            loop {
-                match (first.next(), second.next()) {
-                    (None, None) => break,
-                    (Some(Ok(mut first)), Some(Ok(mut second))) => {
-                        first.validate(true)?;
-                        second.validate(true)?;
-                        if mapper_options.preserve_quality {
-                            apply_quality(&mut first, &mapper_options.quality_mode);
-                            apply_quality(&mut second, &mapper_options.quality_mode);
+            if let Some(input_2) = input_2 {
+                let mut second = FastxReader::new(
+                    BufReader::new(gzip_reader(File::open(input_2)?)),
+                    Format::Fastq,
+                );
+                loop {
+                    match (first.next(), second.next()) {
+                        (None, None) => break,
+                        (Some(Ok(mut first)), Some(Ok(mut second))) => {
+                            first.validate(true)?;
+                            second.validate(true)?;
+                            if mapper_options.preserve_quality {
+                                apply_quality(&mut first, &mapper_options.quality_mode);
+                                apply_quality(&mut second, &mapper_options.quality_mode);
+                            }
+                            pairs.push(AlignedPair {
+                                first,
+                                second: Some(second),
+                                first_hit: None,
+                                second_hit: None,
+                                first_selection: AlignmentSelection::default(),
+                                second_selection: AlignmentSelection::default(),
+                            });
                         }
-                        pairs.push(AlignedPair {
-                            first,
-                            second,
-                            first_hit: None,
-                            second_hit: None,
-                            first_selection: AlignmentSelection::default(),
-                            second_selection: AlignmentSelection::default(),
-                        });
-                        if pairs.len() == PARSE_BATCH_PAIRS {
-                            producer_tx
-                                .send(Ok(std::mem::take(&mut pairs)))
-                                .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
-                            pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
+                        (None, Some(_)) | (Some(_), None) => {
+                            return Err(Error::InvalidInput(
+                                "paired streams have different record counts".into(),
+                            ));
                         }
+                        (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
                     }
-                    (None, Some(_)) | (Some(_), None) => {
-                        return Err(Error::InvalidInput(
-                            "paired streams have different record counts".into(),
-                        ));
+                    if pairs.len() == PARSE_BATCH_PAIRS {
+                        producer_tx
+                            .send(Ok(std::mem::take(&mut pairs)))
+                            .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
+                        pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
                     }
-                    (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
+                }
+            } else {
+                for first in first {
+                    let mut first = first?;
+                    first.validate(true)?;
+                    if mapper_options.preserve_quality {
+                        apply_quality(&mut first, &mapper_options.quality_mode);
+                    }
+                    pairs.push(AlignedPair {
+                        first,
+                        second: None,
+                        first_hit: None,
+                        second_hit: None,
+                        first_selection: AlignmentSelection::default(),
+                        second_selection: AlignmentSelection::default(),
+                    });
+                    if pairs.len() == PARSE_BATCH_PAIRS {
+                        producer_tx
+                            .send(Ok(std::mem::take(&mut pairs)))
+                            .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
+                        pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
+                    }
                 }
             }
             if !pairs.is_empty() {
@@ -385,17 +537,19 @@ fn compress_with_index(
     drop(spool_chunk);
     profile.map_and_spool = map_started.elapsed();
     profile.spool_bytes = std::fs::metadata(&spool_path)?.len();
-    let mapped_pairs = (profile.mapped_reads + profile.raw_reads) / 2;
+    let mapped_records = (profile.mapped_reads + profile.raw_reads) / layout.streams() as u64;
     stage_log(&progress, format!(
-        "[seqarc] stage=map_and_spool done elapsed={} pairs={} mapped_reads={} raw_reads={} candidate_hits={} spool_bytes={}",
+        "[seqarc] stage=map_and_spool done elapsed={} layout={:?} records={} mapped_reads={} raw_reads={} candidate_hits={} spool_bytes={}",
         display_duration(profile.map_and_spool),
-        mapped_pairs,
+        layout,
+        mapped_records,
         profile.mapped_reads,
         profile.raw_reads,
         profile.candidate_hits,
         profile.spool_bytes
     ));
-    progress.set_message("pruning reference".to_owned());
+    progress.finish_and_clear();
+    let progress = stage_progress("pruning reference");
     stage_log(&progress, "[seqarc] stage=reference start");
     let reference_started = std::time::Instant::now();
     let (compact_reference, kept_runs) = compact_reference(index, &mask)?;
@@ -425,6 +579,9 @@ fn compress_with_index(
     if options.preserve_quality {
         flags |= 2;
     }
+    if layout == AlignmentLayout::SingleEnd {
+        flags |= 4;
+    }
     flags |= (id_mode as u16) << 3;
     write_u16(&mut archive, flags)?;
     write_u64(&mut archive, reference_block.block.len() as u64)?;
@@ -440,9 +597,9 @@ fn compress_with_index(
     stage_log(
         &progress,
         format!(
-            "[seqarc] stage=chunks start workers={} chunk_pairs={}",
+            "[seqarc] stage=chunks start workers={} chunk_records={}",
             worker_count,
-            options.chunk_pairs.max(1)
+            options.chunk_records.max(1)
         ),
     );
     let chunks_started = std::time::Instant::now();
@@ -459,17 +616,17 @@ fn compress_with_index(
             move || -> Result<()> {
                 let spool = ExternalChunk::<SpoolPair>::open(File::open(spool_path)?)
                     .map_err(|error| Error::InvalidFormat(error.to_string()))?;
-                let mut pairs = Vec::with_capacity(options.chunk_pairs.max(1));
+                let mut pairs = Vec::with_capacity(options.chunk_records.max(1));
                 let mut chunk_index = 0usize;
                 for item in spool {
                     let item = item.map_err(|error| Error::InvalidFormat(error.to_string()))?;
                     pairs.push(item.into_aligned_pair(&kept_runs)?);
-                    if pairs.len() == options.chunk_pairs.max(1) {
+                    if pairs.len() == options.chunk_records.max(1) {
                         job_tx
                             .send(Ok((chunk_index, std::mem::take(&mut pairs))))
                             .map_err(|_| Error::InvalidInput("chunk workers exited".into()))?;
                         chunk_index += 1;
-                        pairs = Vec::with_capacity(options.chunk_pairs.max(1));
+                        pairs = Vec::with_capacity(options.chunk_records.max(1));
                     }
                 }
                 if !pairs.is_empty() {
@@ -488,7 +645,7 @@ fn compress_with_index(
             workers.push(scope.spawn(move || -> Result<()> {
                 while let Ok(job) = job_rx.recv() {
                     let result = job.and_then(|(index, pairs)| {
-                        encode_chunk(reference_for_workers, &pairs, options, id_mode)
+                        encode_chunk(reference_for_workers, &pairs, options, id_mode, layout)
                             .map(|chunk| (index, chunk))
                     });
                     if result_tx.send(result).is_err() {
@@ -536,7 +693,7 @@ fn compress_with_index(
     profile.chunks = chunks_started.elapsed();
     profile.chunk_count = written_chunks;
     stage_log(&progress, format!(
-        "[seqarc] stage=chunks done elapsed={} chunks={} pairs={} raw_bytes={} compressed_bytes={} max_pending={}",
+        "[seqarc] stage=chunks done elapsed={} chunks={} records={} raw_bytes={} compressed_bytes={} max_pending={}",
         display_duration(profile.chunks),
         profile.chunk_count,
         replay_pair_count,
@@ -551,22 +708,23 @@ fn compress_with_index(
     archive.seek(SeekFrom::Start(end))?;
     archive.flush()?;
     profile.archive_bytes = end;
-    profile.pairs = replay_pair_count;
+    profile.records = replay_pair_count;
     stage_log(
         &progress,
         format!(
-            "[seqarc] stage=archive done elapsed={} pairs={} chunks={} archive_bytes={}",
+            "[seqarc] stage=archive done elapsed={} layout={:?} records={} chunks={} archive_bytes={}",
             display_duration(pipeline_started.elapsed()),
-            profile.pairs,
+            layout,
+            profile.records,
             profile.chunk_count,
             profile.archive_bytes
         ),
     );
-    progress.finish_with_message(format!("aligned {} reads", progress.position()));
+    progress.finish_and_clear();
 
     Ok((
         CompressionMetadata {
-            streams: 2,
+            streams: layout.streams(),
             records: replay_pair_count,
             preserved_ids: options.preserve_ids,
             preserved_quality: options.preserve_quality,
@@ -581,12 +739,36 @@ pub(crate) fn decompress_paired<R: Read>(
     options: &DecompressionOptions,
 ) -> Result<ArchiveRecords> {
     let mut streams = vec![Vec::new(), Vec::new()];
-    decode_paired(input, options, |_, first, second| {
-        streams[0].push(first);
-        streams[1].push(second);
-        Ok(())
+    decode_aligned(input, options, |_, group| match group {
+        AlignedRecordGroup::Paired(first, second) => {
+            streams[0].push(first);
+            streams[1].push(second);
+            Ok(())
+        }
+        AlignedRecordGroup::Single(_) => Err(Error::InvalidFormat(
+            "single-end archive passed to paired decoder".into(),
+        )),
     })?;
     Ok(ArchiveRecords { streams })
+}
+
+pub(crate) fn decompress_single<R: Read>(
+    input: R,
+    options: &DecompressionOptions,
+) -> Result<ArchiveRecords> {
+    let mut stream = Vec::new();
+    decode_aligned(input, options, |_, group| match group {
+        AlignedRecordGroup::Single(record) => {
+            stream.push(record);
+            Ok(())
+        }
+        AlignedRecordGroup::Paired(_, _) => Err(Error::InvalidFormat(
+            "paired archive passed to single-end decoder".into(),
+        )),
+    })?;
+    Ok(ArchiveRecords {
+        streams: vec![stream],
+    })
 }
 
 pub(crate) fn decompress_paired_into<R: Read, S: PairedRecordSink>(
@@ -595,10 +777,15 @@ pub(crate) fn decompress_paired_into<R: Read, S: PairedRecordSink>(
     sink: &mut S,
 ) -> Result<crate::DecompressionMetadata> {
     let mut pairs = 0;
-    decode_paired(input, options, |original_id, first, second| {
-        sink.write_pair(original_id, first, second)?;
-        pairs += 1;
-        Ok(())
+    decode_aligned(input, options, |original_id, group| match group {
+        AlignedRecordGroup::Paired(first, second) => {
+            sink.write_pair(original_id, first, second)?;
+            pairs += 1;
+            Ok(())
+        }
+        AlignedRecordGroup::Single(_) => Err(Error::InvalidFormat(
+            "single-end archive passed to paired decoder".into(),
+        )),
     })?;
     sink.finish()?;
     Ok(crate::DecompressionMetadata {
@@ -608,12 +795,32 @@ pub(crate) fn decompress_paired_into<R: Read, S: PairedRecordSink>(
     })
 }
 
-fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
+pub(crate) fn decompress_into<R: Read, S: AlignedRecordSink>(
+    input: R,
+    options: &DecompressionOptions,
+    sink: &mut S,
+) -> Result<AlignedDecompressionMetadata> {
+    let mut records = 0;
+    let layout = decode_aligned(input, options, |original_id, group| {
+        sink.write_group(original_id, group)?;
+        records += 1;
+        Ok(())
+    })?;
+    sink.finish()?;
+    Ok(AlignedDecompressionMetadata {
+        layout,
+        streams: layout.streams(),
+        records,
+        output_order: crate::OutputOrder::Original,
+    })
+}
+
+fn decode_aligned<R: Read, F: FnMut(u64, AlignedRecordGroup) -> Result<()>>(
     mut input: R,
     options: &DecompressionOptions,
     mut emit: F,
-) -> Result<()> {
-    let (flags, id_mode, chunk_count, reference) = read_header(&mut input)?;
+) -> Result<AlignmentLayout> {
+    let (flags, id_mode, layout, chunk_count, reference) = read_header(&mut input)?;
     let preserve_quality = flags & 2 != 0;
     let mut first_pair = 0u64;
     for _ in 0..chunk_count {
@@ -633,11 +840,15 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
         }
         let ids_end = ids_len;
         let qualities_end = ids_end + qualities_len;
-        let ids = decode_ids(&raw[..ids_end], pair_count, id_mode)?;
-        let qualities =
-            decode_qualities(&raw[ids_end..qualities_end], pair_count, preserve_quality)?;
+        let ids = decode_ids(&raw[..ids_end], pair_count, id_mode, layout)?;
+        let qualities = decode_qualities(
+            &raw[ids_end..qualities_end],
+            pair_count,
+            preserve_quality,
+            layout,
+        )?;
         let records = &raw[qualities_end..];
-        let decoded = decode_records(records, pair_count, first_pair, &reference)?;
+        let decoded = decode_records(records, pair_count, first_pair, &reference, layout)?;
         for index in 0..pair_count {
             let original_id = decoded[index].0;
             if options
@@ -649,15 +860,22 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
             }
             let first = ReadRecord::new(
                 ids[0][index].clone(),
-                decoded[index].1.clone(),
+                decoded[index].1[0].clone(),
                 qualities[0][index].clone(),
             );
-            let second = ReadRecord::new(
-                ids[1][index].clone(),
-                decoded[index].2.clone(),
-                qualities[1][index].clone(),
-            );
-            emit(original_id, first, second)?;
+            let group = if layout == AlignmentLayout::SingleEnd {
+                AlignedRecordGroup::Single(first)
+            } else {
+                AlignedRecordGroup::Paired(
+                    first,
+                    ReadRecord::new(
+                        ids[1][index].clone(),
+                        decoded[index].1[1].clone(),
+                        qualities[1][index].clone(),
+                    ),
+                )
+            };
+            emit(original_id, group)?;
         }
         first_pair = first_pair
             .checked_add(pair_count as u64)
@@ -669,7 +887,7 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
             "trailing aligned archive bytes".into(),
         ));
     }
-    Ok(())
+    Ok(layout)
 }
 
 fn decode_chunk_sections(
@@ -718,22 +936,28 @@ fn map_pairs(
     progress: &ProgressBar,
 ) -> Result<()> {
     let first_hits = map_mate(index, pairs, 0, mapping_pool, progress)?;
-    let second_hits = map_mate(index, pairs, 1, mapping_pool, progress)?;
-    for ((pair, first), second) in pairs.iter_mut().zip(first_hits).zip(second_hits) {
+    for (pair, first) in pairs.iter_mut().zip(first_hits) {
         pair.first_hit = first.hit;
         pair.first_selection = first.selection;
-        pair.second_hit = second.hit;
-        pair.second_selection = second.selection;
+    }
+    if pairs.first().is_some_and(|pair| pair.second.is_some()) {
+        let second_hits = map_mate(index, pairs, 1, mapping_pool, progress)?;
+        for (pair, second) in pairs.iter_mut().zip(second_hits) {
+            pair.second_hit = second.hit;
+            pair.second_selection = second.selection;
+        }
     }
     Ok(())
 }
 
 fn update_mapping_profile(profile: &mut AlignedCompressionProfile, pairs: &[AlignedPair]) {
     for pair in pairs {
-        for (hit, selection) in [
-            (&pair.first_hit, pair.first_selection),
-            (&pair.second_hit, pair.second_selection),
-        ] {
+        for stream in 0..pair.layout().streams() {
+            let (hit, selection) = if stream == 0 {
+                (&pair.first_hit, pair.first_selection)
+            } else {
+                (&pair.second_hit, pair.second_selection)
+            };
             profile.candidate_hits += u64::from(selection.candidate_hits);
             profile.selected_non_first_hits += u64::from(selection.selected_non_first);
             profile.rejected_alignments += u64::from(selection.rejected_alignment);
@@ -753,15 +977,17 @@ fn spool_mapped_pairs(
     spool_builder: &mut ExternalChunkBuilder<SpoolPair>,
 ) -> Result<()> {
     for pair in pairs {
-        id_detector.observe(&pair.first.id, &pair.second.id);
+        id_detector.observe(
+            &pair.first.id,
+            pair.second.as_ref().map(|record| record.id.as_slice()),
+        );
         if let Some(hit) = &pair.first_hit {
             mask.mark_hit(hit)?;
         }
         if let Some(hit) = &pair.second_hit {
             mask.mark_hit(hit)?;
         }
-        let spool_pair =
-            SpoolPair::from_records(pair, pair.first_hit.clone(), pair.second_hit.clone())?;
+        let spool_pair = SpoolPair::from_records(pair)?;
         spool_builder
             .add(spool_pair)
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
@@ -783,12 +1009,9 @@ fn map_mate(
         pairs
             .par_chunks(BATCH_SIZE)
             .map_init(ThreadBuf::new, |buffer, batch| {
-                let records = batch
-                    .iter()
-                    .map(|pair| if mate == 0 { &pair.first } else { &pair.second });
+                let records = batch.iter().map(|pair| pair.record(mate));
                 let result = align_batch(&aligner, buffer, index, records);
                 progress.inc(batch.len() as u64);
-                progress.set_message(format!("aligned {} reads", progress.position()));
                 result
             })
             .collect::<Result<Vec<_>>>()
@@ -884,21 +1107,21 @@ fn compact_position(runs: &[KeptRun], original: usize) -> Result<usize> {
 }
 
 impl SpoolPair {
-    fn from_records(
-        pair: &AlignedPair,
-        first_hit: Option<GenomeAlignment>,
-        second_hit: Option<GenomeAlignment>,
-    ) -> Result<Self> {
+    fn from_records(pair: &AlignedPair) -> Result<Self> {
         Ok(Self {
-            first: SpoolRead::from_record(&pair.first, first_hit)?,
-            second: SpoolRead::from_record(&pair.second, second_hit)?,
+            first: SpoolRead::from_record(&pair.first, pair.first_hit.clone())?,
+            second: pair
+                .second
+                .as_ref()
+                .map(|record| SpoolRead::from_record(record, pair.second_hit.clone()))
+                .transpose()?,
         })
     }
 
     fn into_aligned_pair(self, runs: &[KeptRun]) -> Result<AlignedPair> {
         Ok(AlignedPair {
             first: self.first.record()?,
-            second: self.second.record()?,
+            second: self.second.as_ref().map(SpoolRead::record).transpose()?,
             first_hit: self
                 .first
                 .alignment
@@ -906,7 +1129,7 @@ impl SpoolPair {
                 .transpose()?,
             second_hit: self
                 .second
-                .alignment
+                .and_then(|read| read.alignment)
                 .map(|hit| hit.into_genome(runs))
                 .transpose()?,
             first_selection: AlignmentSelection::default(),
@@ -981,12 +1204,13 @@ fn encode_chunk(
     pairs: &[AlignedPair],
     options: &crate::AlignmentCompressionOptions,
     id_mode: IdMode,
+    layout: AlignmentLayout,
 ) -> Result<EncodedChunk> {
     let mut ids = Vec::new();
-    write_id_stream(&mut ids, pairs, id_mode)?;
+    write_id_stream(&mut ids, pairs, id_mode, layout)?;
     let mut qualities = Vec::new();
-    write_quality_stream(&mut qualities, pairs, options)?;
-    let records = write_record_stream(reference, pairs)?;
+    write_quality_stream(&mut qualities, pairs, options, layout)?;
+    let records = write_record_stream(reference, pairs, layout)?;
     let ids_compressed = zstd::stream::encode_all(Cursor::new(&ids), options.zstd_level)?;
     let qualities_compressed =
         zstd::stream::encode_all(Cursor::new(&qualities), options.zstd_level)?;
@@ -1001,7 +1225,8 @@ fn encode_chunk(
     compressed.extend(&qualities_compressed);
     compressed.extend(&records_compressed);
     Ok(EncodedChunk {
-        pairs: pairs.len() as u32,
+        pairs: u32::try_from(pairs.len())
+            .map_err(|_| Error::InvalidInput("chunk contains too many records".into()))?,
         raw_len: (ids.len() + qualities.len() + records.len()) as u64,
         ids_len: ids.len() as u64,
         qualities_len: qualities.len() as u64,
@@ -1024,16 +1249,17 @@ fn write_encoded_chunk(archive: &mut File, chunk: EncodedChunk) -> Result<()> {
     Ok(())
 }
 
-fn write_id_stream(output: &mut Vec<u8>, pairs: &[AlignedPair], mode: IdMode) -> Result<()> {
-    for mate in 0..2 {
+fn write_id_stream(
+    output: &mut Vec<u8>,
+    pairs: &[AlignedPair],
+    mode: IdMode,
+    layout: AlignmentLayout,
+) -> Result<()> {
+    for mate in 0..layout.streams() {
         let mut block = Vec::new();
         if mode != IdMode::None && !(mode != IdMode::Independent && mate == 1) {
             let ids = pairs.iter().map(|pair| {
-                let id = if mate == 0 {
-                    &pair.first.id
-                } else {
-                    &pair.second.id
-                };
+                let id = &pair.record(mate).id;
                 if mode == IdMode::SlashMate {
                     &id[..id.len().saturating_sub(2)]
                 } else {
@@ -1072,17 +1298,12 @@ fn write_quality_stream(
     output: &mut Vec<u8>,
     pairs: &[AlignedPair],
     options: &crate::AlignmentCompressionOptions,
+    layout: AlignmentLayout,
 ) -> Result<()> {
-    for mate in 0..2 {
+    for mate in 0..layout.streams() {
         let values = pairs
             .iter()
-            .map(|pair| {
-                if mate == 0 {
-                    pair.first.quality.as_deref().unwrap_or(&[])
-                } else {
-                    pair.second.quality.as_deref().unwrap_or(&[])
-                }
-            })
+            .map(|pair| pair.record(mate).quality.as_deref().unwrap_or(&[]))
             .collect::<Vec<_>>();
         let block = if options.preserve_quality {
             encode_stream_bytes(&values)?
@@ -1098,22 +1319,19 @@ fn write_quality_stream(
 fn write_record_stream<R: ReferenceBases + ?Sized>(
     reference: &R,
     pairs: &[AlignedPair],
+    layout: AlignmentLayout,
 ) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut starts = [0i64; 2];
-    for mate in 0..2 {
+    for mate in 0..layout.streams() {
         let bitmap_len = pairs.len().div_ceil(8);
         let mut mapped_bitmap = vec![0; bitmap_len];
         let mut reverse_bitmap = vec![0; bitmap_len];
         let mut positions = Vec::new();
         let mut bodies = Vec::new();
         for (index, pair) in pairs.iter().enumerate() {
-            let record = if mate == 0 { &pair.first } else { &pair.second };
-            let hit = if mate == 0 {
-                pair.first_hit.as_ref()
-            } else {
-                pair.second_hit.as_ref()
-            };
+            let record = pair.record(mate);
+            let hit = pair.hit(mate);
             if let Some(hit) = hit {
                 mapped_bitmap[index / 8] |= 1 << (index % 8);
                 let encoded_reverse = if mate == 1 {
@@ -1281,13 +1499,16 @@ fn decode_records(
     count: usize,
     first_pair: u64,
     reference: &[u8],
-) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>> {
+    layout: AlignmentLayout,
+) -> Result<Vec<(u64, Vec<Vec<u8>>)>> {
     let mut cursor = Cursor::new(input.to_vec());
     let mut starts = [0i64; 2];
     let mut first_starts = vec![None; count];
     let mut first_reverses = vec![None; count];
-    let mut all = [Vec::with_capacity(count), Vec::with_capacity(count)];
-    for mate in 0..2 {
+    let mut all = (0..layout.streams())
+        .map(|_| Vec::with_capacity(count))
+        .collect::<Vec<_>>();
+    for mate in 0..layout.streams() {
         let bitmap_len = count.div_ceil(8);
         let mut mapped_bitmap = vec![0; bitmap_len];
         let mut reverse_bitmap = vec![0; bitmap_len];
@@ -1339,20 +1560,24 @@ fn decode_records(
         .map(|index| {
             (
                 first_pair + index as u64,
-                all[0][index].clone(),
-                all[1][index].clone(),
+                all.iter().map(|stream| stream[index].clone()).collect(),
             )
         })
         .collect())
 }
 
-fn decode_ids(input: &[u8], count: usize, mode: IdMode) -> Result<[Vec<Vec<u8>>; 2]> {
+fn decode_ids(
+    input: &[u8],
+    count: usize,
+    mode: IdMode,
+    layout: AlignmentLayout,
+) -> Result<Vec<Vec<Vec<u8>>>> {
     let mut cursor = Cursor::new(input.to_vec());
-    let mut blocks = [Vec::new(), Vec::new()];
-    for mate in 0..2 {
+    let mut blocks = vec![Vec::new(); layout.streams()];
+    for block in &mut blocks {
         let length = usize_from(read_u64(&mut cursor)?, "ID block")?;
-        blocks[mate] = vec![0; length];
-        cursor.read_exact(&mut blocks[mate])?;
+        *block = vec![0; length];
+        cursor.read_exact(block)?;
     }
     if cursor.position() != cursor.get_ref().len() as u64 {
         return Err(Error::InvalidFormat("trailing ID block bytes".into()));
@@ -1365,6 +1590,14 @@ fn decode_ids(input: &[u8], count: usize, mode: IdMode) -> Result<[Vec<Vec<u8>>;
     } else {
         decode_prefix_ids(&blocks[0], count)?
     };
+    if layout == AlignmentLayout::SingleEnd {
+        if !matches!(mode, IdMode::None | IdMode::Independent) {
+            return Err(Error::InvalidFormat(
+                "mate-specific ID mode in single-end archive".into(),
+            ));
+        }
+        return Ok(vec![first]);
+    }
     let second = match mode {
         IdMode::None => vec![Vec::new(); count],
         IdMode::Independent => decode_prefix_ids(&blocks[1], count)?,
@@ -1400,7 +1633,7 @@ fn decode_ids(input: &[u8], count: usize, mode: IdMode) -> Result<[Vec<Vec<u8>>;
     } else {
         first
     };
-    Ok([first, second])
+    Ok(vec![first, second])
 }
 
 fn decode_prefix_ids(input: &[u8], count: usize) -> Result<Vec<Vec<u8>>> {
@@ -1436,20 +1669,25 @@ fn decode_qualities(
     input: &[u8],
     count: usize,
     preserve: bool,
-) -> Result<[Vec<Option<Vec<u8>>>; 2]> {
+    layout: AlignmentLayout,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
     let mut cursor = Cursor::new(input.to_vec());
-    let mut result = [Vec::with_capacity(count), Vec::with_capacity(count)];
-    for mate in 0..2 {
+    let mut result = Vec::with_capacity(layout.streams());
+    for _ in 0..layout.streams() {
         let length = usize_from(read_u64(&mut cursor)?, "quality block")?;
         let mut block = vec![0; length];
         cursor.read_exact(&mut block)?;
         if preserve {
-            result[mate] = decode_stream_bytes(&block, count)?
-                .into_iter()
-                .map(Some)
-                .collect();
+            result.push(
+                decode_stream_bytes(&block, count)?
+                    .into_iter()
+                    .map(Some)
+                    .collect(),
+            );
         } else if length != 0 {
             return Err(Error::InvalidFormat("unexpected quality bytes".into()));
+        } else {
+            result.push(vec![None; count]);
         }
     }
     if cursor.position() != cursor.get_ref().len() as u64 {
@@ -1678,7 +1916,7 @@ fn reconstruct_with_noise(
     Ok(sequence)
 }
 
-fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, u64, Vec<u8>)> {
+fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, AlignmentLayout, u64, Vec<u8>)> {
     let mut magic = [0; 9];
     input.read_exact(&mut magic)?;
     if magic != *MAGIC {
@@ -1691,17 +1929,40 @@ fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, u64, Vec<u8>)> {
         ));
     }
     let flags = read_u16(input)?;
-    if flags & !0x1b != 0 {
+    if flags & !0x1f != 0 {
         return Err(Error::InvalidFormat(
             "unknown alignment archive flags".into(),
         ));
     }
     let id_mode = IdMode::from_flags(flags)?;
+    let layout = if flags & 4 != 0 {
+        AlignmentLayout::SingleEnd
+    } else {
+        AlignmentLayout::PairedEnd
+    };
+    if (flags & 1 != 0) != (id_mode != IdMode::None) {
+        return Err(Error::InvalidFormat(
+            "identifier flag and mode disagree".into(),
+        ));
+    }
+    if layout == AlignmentLayout::SingleEnd
+        && !matches!(id_mode, IdMode::None | IdMode::Independent)
+    {
+        return Err(Error::InvalidFormat(
+            "mate-specific ID mode in single-end archive".into(),
+        ));
+    }
     let reference_len = usize_from(read_u64(input)?, "reference block")?;
     let chunks = read_u64(input)?;
     let mut reference_block = vec![0; reference_len];
     input.read_exact(&mut reference_block)?;
-    Ok((flags, id_mode, chunks, decode_reference(&reference_block)?))
+    Ok((
+        flags,
+        id_mode,
+        layout,
+        chunks,
+        decode_reference(&reference_block)?,
+    ))
 }
 
 fn encode_reference(
@@ -2091,6 +2352,29 @@ fn display_duration(duration: std::time::Duration) -> String {
     }
 }
 
+fn mapping_progress() -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} mapping reads [{elapsed_precise}] {human_pos} reads @ {per_sec}",
+        )
+        .expect("valid mapping progress template"),
+    );
+    progress.enable_steady_tick(std::time::Duration::from_millis(250));
+    progress
+}
+
+fn stage_progress(message: &'static str) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .expect("valid stage progress template"),
+    );
+    progress.set_message(message);
+    progress.enable_steady_tick(std::time::Duration::from_millis(250));
+    progress
+}
+
 fn stage_log(progress: &ProgressBar, message: impl AsRef<str>) {
     if progress.is_hidden() {
         eprintln!("{}", message.as_ref());
@@ -2138,15 +2422,15 @@ mod tests {
         ] {
             let pair = AlignedPair {
                 first: ReadRecord::new(first_id, b"A".to_vec(), None),
-                second: ReadRecord::new(second_id, b"A".to_vec(), None),
+                second: Some(ReadRecord::new(second_id, b"A".to_vec(), None)),
                 first_hit: None,
                 second_hit: None,
                 first_selection: AlignmentSelection::default(),
                 second_selection: AlignmentSelection::default(),
             };
             let mut encoded = Vec::new();
-            write_id_stream(&mut encoded, &[pair], mode).unwrap();
-            let decoded = decode_ids(&encoded, 1, mode).unwrap();
+            write_id_stream(&mut encoded, &[pair], mode, AlignmentLayout::PairedEnd).unwrap();
+            let decoded = decode_ids(&encoded, 1, mode, AlignmentLayout::PairedEnd).unwrap();
             assert_eq!(decoded[0][0], expected_first);
             assert_eq!(decoded[1][0], expected_second);
         }
@@ -2205,8 +2489,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pre_v10_archives() {
-        for version in [7, 8, 9] {
+    fn rejects_pre_v11_archives() {
+        for version in [7, 8, 9, 10] {
             let mut header = Vec::new();
             header.extend(MAGIC);
             write_u32(&mut header, version).unwrap();
@@ -2216,18 +2500,6 @@ mod tests {
                     if message == "unsupported alignment archive version"
             ));
         }
-    }
-
-    #[test]
-    fn rejects_removed_chunk_index_flag() {
-        let mut header = Vec::new();
-        header.extend(MAGIC);
-        write_u32(&mut header, VERSION).unwrap();
-        write_u16(&mut header, 1 << 2).unwrap();
-        assert!(matches!(
-            read_header(&mut Cursor::new(header)),
-            Err(Error::InvalidFormat(message)) if message == "unknown alignment archive flags"
-        ));
     }
 
     #[test]
@@ -2306,7 +2578,7 @@ mod tests {
     }
 
     #[test]
-    fn v10_record_stream_round_trips_mate_relative_coordinates() {
+    fn v11_record_stream_round_trips_mate_relative_coordinates() {
         let reference =
             b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
         let first_sequence = reference[10..30].to_vec();
@@ -2325,7 +2597,7 @@ mod tests {
         let pairs = vec![
             AlignedPair {
                 first: ReadRecord::new("pair0/1", first_sequence.clone(), None),
-                second: ReadRecord::new("pair0/2", second_sequence.clone(), None),
+                second: Some(ReadRecord::new("pair0/2", second_sequence.clone(), None)),
                 first_hit: Some(alignment(10, false)),
                 second_hit: Some(alignment(40, true)),
                 first_selection: AlignmentSelection::default(),
@@ -2333,7 +2605,7 @@ mod tests {
             },
             AlignedPair {
                 first: ReadRecord::new("pair1/1", b"ACGTNCGT".to_vec(), None),
-                second: ReadRecord::new("pair1/2", b"NNNNNNNN".to_vec(), None),
+                second: Some(ReadRecord::new("pair1/2", b"NNNNNNNN".to_vec(), None)),
                 first_hit: None,
                 second_hit: None,
                 first_selection: AlignmentSelection::default(),
@@ -2341,11 +2613,19 @@ mod tests {
             },
         ];
         let reference_slice = reference.as_slice();
-        let encoded = write_record_stream(reference_slice, &pairs).unwrap();
-        let decoded = decode_records(&encoded, pairs.len(), 0, reference).unwrap();
-        assert_eq!(decoded[0].1, first_sequence);
-        assert_eq!(decoded[0].2, second_sequence);
-        assert_eq!(decoded[1].1, b"ACGTNCGT");
-        assert_eq!(decoded[1].2, b"NNNNNNNN");
+        let encoded =
+            write_record_stream(reference_slice, &pairs, AlignmentLayout::PairedEnd).unwrap();
+        let decoded = decode_records(
+            &encoded,
+            pairs.len(),
+            0,
+            reference,
+            AlignmentLayout::PairedEnd,
+        )
+        .unwrap();
+        assert_eq!(decoded[0].1[0], first_sequence);
+        assert_eq!(decoded[0].1[1], second_sequence);
+        assert_eq!(decoded[1].1[0], b"ACGTNCGT");
+        assert_eq!(decoded[1].1[1], b"NNNNNNNN");
     }
 }

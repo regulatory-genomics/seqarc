@@ -1,8 +1,9 @@
 use crate::packed_sequence::PackedSequence;
 use crate::quality_blocks::{decode_stream_bytes, encode_stream_bytes};
 use crate::{
-    apply_quality, gzip_reader, ArchiveRecords, CompressionMetadata, DecompressionOptions, Error,
-    FastxReader, Format, GenomeAlignment, PairedRecordSink, ReadRecord, Result,
+    apply_quality, gzip_reader, AlignedCompressionProfile, ArchiveRecords, CompressionMetadata,
+    DecompressionOptions, Error, FastxReader, Format, GenomeAlignment, PairedRecordSink,
+    ReadRecord, Result,
 };
 use bed_utils::extsort::{ExternalChunk, ExternalChunkBuilder};
 use indicatif::ProgressBar;
@@ -14,7 +15,9 @@ use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 9] = b"SPRNG-AL2";
-const VERSION: u32 = 7;
+const VERSION: u32 = 9;
+const SPARSE_VERSION: u32 = 8;
+const LEGACY_VERSION: u32 = 7;
 const CHUNK_HEADER_SIZE: u64 = 44;
 const BATCH_SIZE: usize = 256;
 const PARSE_BATCH_PAIRS: usize = 4096;
@@ -25,6 +28,20 @@ struct AlignedPair {
     second: ReadRecord,
     first_hit: Option<GenomeAlignment>,
     second_hit: Option<GenomeAlignment>,
+    first_selection: AlignmentSelection,
+    second_selection: AlignmentSelection,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AlignmentSelection {
+    candidate_hits: u32,
+    selected_non_first: bool,
+    rejected_alignment: bool,
+}
+
+struct SelectedAlignment {
+    hit: Option<GenomeAlignment>,
+    selection: AlignmentSelection,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -82,7 +99,15 @@ struct EncodedChunk {
     ids_len: u64,
     qualities_len: u64,
     records_len: u64,
+    ids_compressed_len: u64,
+    qualities_compressed_len: u64,
+    records_compressed_len: u64,
     compressed: Vec<u8>,
+}
+
+struct EncodedReference {
+    block: Vec<u8>,
+    raw_len: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +182,7 @@ pub(crate) fn compress_paired_fastq_files(
     input_2: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: &crate::AlignmentCompressionOptions,
-) -> Result<CompressionMetadata> {
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let reference = read_reference(genome_fasta)?;
     let index = build_index(&reference)?;
     compress_with_index(&index, &reference, input_1, input_2, output, options)
@@ -170,7 +195,7 @@ pub(crate) fn compress_paired_fastq_files_with_index(
     input_2: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: &crate::AlignmentCompressionOptions,
-) -> Result<CompressionMetadata> {
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let reference = read_reference(genome_fasta)?;
     let index =
         Index::load(index_prefix, false).map_err(|error| Error::InvalidInput(error.to_string()))?;
@@ -184,7 +209,7 @@ fn compress_with_index(
     input_2: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: &crate::AlignmentCompressionOptions,
-) -> Result<CompressionMetadata> {
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let mapping_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads.max(1))
         .build()
@@ -198,6 +223,7 @@ fn compress_with_index(
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let mut mask = ReferenceMask::new(reference.len());
     let mut id_detector = IdModeDetector::new(options.preserve_ids);
+    let mut profile = AlignedCompressionProfile::default();
     let input_1 = input_1.as_ref().to_path_buf();
     let input_2 = input_2.as_ref().to_path_buf();
     let mapper_options = options.clone();
@@ -230,6 +256,8 @@ fn compress_with_index(
                             second,
                             first_hit: None,
                             second_hit: None,
+                            first_selection: AlignmentSelection::default(),
+                            second_selection: AlignmentSelection::default(),
                         });
                         if pairs.len() == PARSE_BATCH_PAIRS {
                             producer_tx
@@ -260,7 +288,13 @@ fn compress_with_index(
         let mapper = scope.spawn(move || -> Result<()> {
             while let Ok(batch) = parse_rx.recv() {
                 let mapped = batch.and_then(|mut pairs| {
-                    map_pairs(&index, &mut pairs, &mapping_pool, &mapper_progress)?;
+                    map_pairs(
+                        index,
+                        reference,
+                        &mut pairs,
+                        &mapping_pool,
+                        &mapper_progress,
+                    )?;
                     Ok(pairs)
                 });
                 if mapper_tx.send(mapped).is_err() {
@@ -273,6 +307,7 @@ fn compress_with_index(
 
         while let Ok(batch) = mapped_rx.recv() {
             let pairs = batch?;
+            update_mapping_profile(&mut profile, &pairs);
             spool_mapped_pairs(&pairs, &mut id_detector, &mut mask, &mut spool_builder)?;
         }
         producer
@@ -293,6 +328,9 @@ fn compress_with_index(
     let (compact_reference, kept_runs) = compact_reference(reference, &mask);
     let id_mode = id_detector.finish();
     let reference_block = encode_reference(&compact_reference, options)?;
+    profile.reference_bases = compact_reference.len() as u64;
+    profile.reference_raw_bytes = reference_block.raw_len;
+    profile.reference_compressed_bytes = reference_block.block.len() as u64;
     let mut archive = File::create(output)?;
     let header_size = 9 + 4 + 2 + 8 * 4;
     archive.write_all(MAGIC)?;
@@ -309,7 +347,7 @@ fn compress_with_index(
     }
     flags |= (id_mode as u16) << 3;
     write_u16(&mut archive, flags)?;
-    write_u64(&mut archive, reference_block.len() as u64)?;
+    write_u64(&mut archive, reference_block.block.len() as u64)?;
     let chunk_count_pos = archive.stream_position()?;
     write_u64(&mut archive, 0)?;
     let index_offset_pos = archive.stream_position()?;
@@ -317,7 +355,7 @@ fn compress_with_index(
     let index_length_pos = archive.stream_position()?;
     write_u64(&mut archive, 0)?;
     debug_assert_eq!(archive.stream_position()?, header_size as u64);
-    archive.write_all(&reference_block)?;
+    archive.write_all(&reference_block.block)?;
 
     let mut chunks = Vec::new();
     let mut replay_pair_count = 0u64;
@@ -385,6 +423,13 @@ fn compress_with_index(
             let (index, first_pair, chunk) = result?;
             pending.insert(index, (first_pair, chunk));
             while let Some((first_pair, chunk)) = pending.remove(&next_chunk) {
+                profile.ids_raw_bytes += chunk.ids_len;
+                profile.qualities_raw_bytes += chunk.qualities_len;
+                profile.records_raw_bytes += chunk.records_len;
+                profile.ids_compressed_bytes += chunk.ids_compressed_len;
+                profile.qualities_compressed_bytes += chunk.qualities_compressed_len;
+                profile.records_compressed_bytes += chunk.records_compressed_len;
+                profile.chunks_compressed_bytes += chunk.compressed.len() as u64;
                 chunks.push(write_encoded_chunk(&mut archive, first_pair, chunk)?);
                 replay_pair_count += chunks.last().unwrap().pairs as u64;
                 next_chunk += 1;
@@ -427,15 +472,20 @@ fn compress_with_index(
     write_u64(&mut archive, index_length)?;
     archive.seek(SeekFrom::Start(end))?;
     archive.flush()?;
+    profile.archive_bytes = end;
+    profile.pairs = replay_pair_count;
     progress.finish_with_message(format!("aligned {} reads", progress.position()));
 
-    Ok(CompressionMetadata {
-        streams: 2,
-        records: replay_pair_count,
-        preserved_ids: options.preserve_ids,
-        preserved_quality: options.preserve_quality,
-        preserved_order: true,
-    })
+    Ok((
+        CompressionMetadata {
+            streams: 2,
+            records: replay_pair_count,
+            preserved_ids: options.preserve_ids,
+            preserved_quality: options.preserve_quality,
+            preserved_order: true,
+        },
+        profile,
+    ))
 }
 
 pub(crate) fn decompress_paired<R: Read>(
@@ -475,7 +525,7 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
     options: &DecompressionOptions,
     mut emit: F,
 ) -> Result<()> {
-    let (flags, id_mode, chunk_count, index_offset, reference, mut position) =
+    let (version, flags, id_mode, chunk_count, index_offset, reference, mut position) =
         read_header(&mut input)?;
     let preserve_quality = flags & 2 != 0;
     let has_index = flags & 4 != 0;
@@ -497,7 +547,11 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
         position = position
             .checked_add(CHUNK_HEADER_SIZE + compressed_len as u64)
             .ok_or_else(|| Error::InvalidFormat("archive position overflow".into()))?;
-        let raw = zstd::stream::decode_all(Cursor::new(compressed))?;
+        let raw = if version >= VERSION {
+            decode_chunk_sections(&compressed, ids_len, qualities_len, records_len)?
+        } else {
+            zstd::stream::decode_all(Cursor::new(compressed))?
+        };
         if raw.len() != raw_len || ids_len + qualities_len + records_len != raw.len() {
             return Err(Error::InvalidFormat(
                 "chunk block sizes do not match".into(),
@@ -509,7 +563,7 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
         let qualities =
             decode_qualities(&raw[ids_end..qualities_end], pair_count, preserve_quality)?;
         let records = &raw[qualities_end..];
-        let decoded = decode_records(records, pair_count, first_pair, &reference)?;
+        let decoded = decode_records(records, pair_count, first_pair, &reference, version)?;
         for index in 0..pair_count {
             let original_id = decoded[index].0;
             if options
@@ -541,19 +595,79 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
     Ok(())
 }
 
+fn decode_chunk_sections(
+    compressed: &[u8],
+    ids_len: usize,
+    qualities_len: usize,
+    records_len: usize,
+) -> Result<Vec<u8>> {
+    let mut input = Cursor::new(compressed.to_vec());
+    let ids_compressed_len = usize_from(read_u64(&mut input)?, "compressed ID section")?;
+    let qualities_compressed_len = usize_from(read_u64(&mut input)?, "compressed quality section")?;
+    let records_compressed_len = usize_from(read_u64(&mut input)?, "compressed record section")?;
+    let expected = 24usize
+        .checked_add(ids_compressed_len)
+        .and_then(|value| value.checked_add(qualities_compressed_len))
+        .and_then(|value| value.checked_add(records_compressed_len))
+        .ok_or_else(|| Error::InvalidFormat("compressed section size overflow".into()))?;
+    if expected != compressed.len() {
+        return Err(Error::InvalidFormat(
+            "compressed section sizes do not match".into(),
+        ));
+    }
+    let mut decode_section = |compressed_len: usize, raw_len: usize| -> Result<Vec<u8>> {
+        let mut section = vec![0; compressed_len];
+        input.read_exact(&mut section)?;
+        let raw = zstd::stream::decode_all(Cursor::new(section))?;
+        if raw.len() != raw_len {
+            return Err(Error::InvalidFormat("chunk section length mismatch".into()));
+        }
+        Ok(raw)
+    };
+    let ids = decode_section(ids_compressed_len, ids_len)?;
+    let qualities = decode_section(qualities_compressed_len, qualities_len)?;
+    let records = decode_section(records_compressed_len, records_len)?;
+    let mut raw = Vec::with_capacity(ids_len + qualities_len + records_len);
+    raw.extend(ids);
+    raw.extend(qualities);
+    raw.extend(records);
+    Ok(raw)
+}
+
 fn map_pairs(
     index: &Index,
+    reference: &[u8],
     pairs: &mut [AlignedPair],
     mapping_pool: &rayon::ThreadPool,
     progress: &ProgressBar,
 ) -> Result<()> {
-    let first_hits = map_mate(index, pairs, 0, mapping_pool, progress)?;
-    let second_hits = map_mate(index, pairs, 1, mapping_pool, progress)?;
-    for ((pair, first_hit), second_hit) in pairs.iter_mut().zip(first_hits).zip(second_hits) {
-        pair.first_hit = first_hit;
-        pair.second_hit = second_hit;
+    let first_hits = map_mate(index, reference, pairs, 0, mapping_pool, progress)?;
+    let second_hits = map_mate(index, reference, pairs, 1, mapping_pool, progress)?;
+    for ((pair, first), second) in pairs.iter_mut().zip(first_hits).zip(second_hits) {
+        pair.first_hit = first.hit;
+        pair.first_selection = first.selection;
+        pair.second_hit = second.hit;
+        pair.second_selection = second.selection;
     }
     Ok(())
+}
+
+fn update_mapping_profile(profile: &mut AlignedCompressionProfile, pairs: &[AlignedPair]) {
+    for pair in pairs {
+        for (hit, selection) in [
+            (&pair.first_hit, pair.first_selection),
+            (&pair.second_hit, pair.second_selection),
+        ] {
+            profile.candidate_hits += u64::from(selection.candidate_hits);
+            profile.selected_non_first_hits += u64::from(selection.selected_non_first);
+            profile.rejected_alignments += u64::from(selection.rejected_alignment);
+            if hit.is_some() {
+                profile.mapped_reads += 1;
+            } else {
+                profile.raw_reads += 1;
+            }
+        }
+    }
 }
 
 fn spool_mapped_pairs(
@@ -581,24 +695,21 @@ fn spool_mapped_pairs(
 
 fn map_mate(
     index: &Index,
+    reference: &[u8],
     pairs: &[AlignedPair],
     mate: usize,
     mapping_pool: &rayon::ThreadPool,
     progress: &ProgressBar,
-) -> Result<Vec<Option<GenomeAlignment>>> {
+) -> Result<Vec<SelectedAlignment>> {
     mapping_pool.install(|| {
         use rayon::prelude::*;
         pairs
             .par_chunks(BATCH_SIZE)
             .map(|batch| {
-                let sequences = batch.iter().map(|pair| {
-                    if mate == 0 {
-                        &pair.first.sequence
-                    } else {
-                        &pair.second.sequence
-                    }
-                });
-                let result = align_batch(index, sequences);
+                let records = batch
+                    .iter()
+                    .map(|pair| if mate == 0 { &pair.first } else { &pair.second });
+                let result = align_batch(index, reference, records);
                 progress.inc(batch.len() as u64);
                 progress.set_message(format!("aligned {} reads", progress.position()));
                 result
@@ -723,6 +834,8 @@ impl SpoolPair {
                 .alignment
                 .map(|hit| hit.into_genome(runs))
                 .transpose()?,
+            first_selection: AlignmentSelection::default(),
+            second_selection: AlignmentSelection::default(),
         })
     }
 }
@@ -799,17 +912,28 @@ fn encode_chunk(
     let mut qualities = Vec::new();
     write_quality_stream(&mut qualities, pairs, options)?;
     let records = write_record_stream(reference, pairs)?;
-    let mut raw = Vec::with_capacity(ids.len() + qualities.len() + records.len());
-    raw.extend(&ids);
-    raw.extend(&qualities);
-    raw.extend(&records);
-    let compressed = zstd::stream::encode_all(Cursor::new(&raw), options.zstd_level)?;
+    let ids_compressed = zstd::stream::encode_all(Cursor::new(&ids), options.zstd_level)?;
+    let qualities_compressed =
+        zstd::stream::encode_all(Cursor::new(&qualities), options.zstd_level)?;
+    let records_compressed = zstd::stream::encode_all(Cursor::new(&records), options.zstd_level)?;
+    let mut compressed = Vec::with_capacity(
+        24 + ids_compressed.len() + qualities_compressed.len() + records_compressed.len(),
+    );
+    write_u64(&mut compressed, ids_compressed.len() as u64)?;
+    write_u64(&mut compressed, qualities_compressed.len() as u64)?;
+    write_u64(&mut compressed, records_compressed.len() as u64)?;
+    compressed.extend(&ids_compressed);
+    compressed.extend(&qualities_compressed);
+    compressed.extend(&records_compressed);
     Ok(EncodedChunk {
         pairs: pairs.len() as u32,
-        raw_len: raw.len() as u64,
+        raw_len: (ids.len() + qualities.len() + records.len()) as u64,
         ids_len: ids.len() as u64,
         qualities_len: qualities.len() as u64,
         records_len: records.len() as u64,
+        ids_compressed_len: ids_compressed.len() as u64,
+        qualities_compressed_len: qualities_compressed.len() as u64,
+        records_compressed_len: records_compressed.len() as u64,
         compressed,
     })
 }
@@ -913,7 +1037,10 @@ fn write_record_stream(reference: &[u8], pairs: &[AlignedPair]) -> Result<Vec<u8
         let bitmap_len = pairs.len().div_ceil(8);
         let mut mapped_bitmap = vec![0; bitmap_len];
         let mut reverse_bitmap = vec![0; bitmap_len];
+        let mut positions = Vec::new();
+        let mut bodies = Vec::new();
         for (index, pair) in pairs.iter().enumerate() {
+            let record = if mate == 0 { &pair.first } else { &pair.second };
             let hit = if mate == 0 {
                 pair.first_hit.as_ref()
             } else {
@@ -921,60 +1048,120 @@ fn write_record_stream(reference: &[u8], pairs: &[AlignedPair]) -> Result<Vec<u8
             };
             if let Some(hit) = hit {
                 mapped_bitmap[index / 8] |= 1 << (index % 8);
-                if hit.is_reverse {
+                let encoded_reverse = if mate == 1 {
+                    pair.first_hit
+                        .as_ref()
+                        .map_or(hit.is_reverse, |first| hit.is_reverse ^ first.is_reverse)
+                } else {
+                    hit.is_reverse
+                };
+                if encoded_reverse {
                     reverse_bitmap[index / 8] |= 1 << (index % 8);
                 }
+                let base = if mate == 1 {
+                    pair.first_hit
+                        .as_ref()
+                        .map_or(starts[mate], |first| first.start)
+                } else {
+                    starts[mate]
+                };
+                let delta = hit
+                    .start
+                    .checked_sub(base)
+                    .ok_or_else(|| Error::InvalidInput("alignment offset overflow".into()))?;
+                write_varint(&mut positions, zigzag_encode(delta))?;
+                starts[mate] = hit.start;
+                encode_record_body(&mut bodies, record, hit, reference)?;
+            } else {
+                write_packed(&mut bodies, &record.sequence)?;
             }
         }
         output.extend(mapped_bitmap);
         output.extend(reverse_bitmap);
-        for pair in pairs {
-            let record = if mate == 0 { &pair.first } else { &pair.second };
-            let hit = if mate == 0 {
-                pair.first_hit.as_ref()
-            } else {
-                pair.second_hit.as_ref()
-            };
-            encode_record(&mut output, record, hit, reference, &mut starts[mate])?;
-        }
+        write_u64(&mut output, positions.len() as u64)?;
+        output.extend(positions);
+        output.extend(bodies);
     }
     Ok(output)
 }
 
-fn align_batch<'a, I>(index: &Index, sequences: I) -> Result<Vec<Option<GenomeAlignment>>>
+fn align_batch<'a, I>(index: &Index, reference: &[u8], records: I) -> Result<Vec<SelectedAlignment>>
 where
-    I: IntoIterator<Item = &'a Vec<u8>>,
+    I: IntoIterator<Item = &'a ReadRecord>,
 {
-    let sequences = sequences.into_iter().collect::<Vec<_>>();
-    let names = (0..sequences.len())
+    let records = records.into_iter().collect::<Vec<_>>();
+    let names = (0..records.len())
         .map(|index| format!("read-{index}"))
         .collect::<Vec<_>>();
     let queries = names
         .iter()
-        .zip(&sequences)
-        .map(|(name, sequence)| Query {
+        .zip(&records)
+        .map(|(name, record)| Query {
             name,
-            sequence,
+            sequence: &record.sequence,
             methylation_type: 0,
         })
         .collect::<Vec<_>>();
     let mut options = Options::default();
     options.set_paired_end(false);
     minibwa::map_batch(index, &options, &queries, None)
-        .map(|hits| {
-            hits.into_iter()
-                .map(|hits| {
-                    hits.into_iter().next().map(|hit| GenomeAlignment {
-                        start: hit.target_start,
-                        query_start: hit.query_start,
-                        query_end: hit.query_end,
-                        cigar: hit.cigar,
-                        is_reverse: hit.is_reverse,
-                    })
-                })
+        .map_err(|error| Error::InvalidInput(error.to_string()))
+        .and_then(|hits| {
+            records
+                .into_iter()
+                .zip(hits)
+                .map(|(record, hits)| select_alignment(record, hits, reference))
                 .collect()
         })
-        .map_err(|error| Error::InvalidInput(error.to_string()))
+}
+
+fn select_alignment(
+    record: &ReadRecord,
+    hits: Vec<minibwa::Hit>,
+    reference: &[u8],
+) -> Result<SelectedAlignment> {
+    let raw_cost = encode_packed(&record.sequence)?.len();
+    let candidate_hits = u32::try_from(hits.len()).unwrap_or(u32::MAX);
+    let mut best: Option<(usize, i32, usize, GenomeAlignment)> = None;
+    for (index, hit) in hits.into_iter().enumerate() {
+        let alignment = GenomeAlignment {
+            start: hit.target_start,
+            query_start: hit.query_start,
+            query_end: hit.query_end,
+            cigar: hit.cigar,
+            is_reverse: hit.is_reverse,
+        };
+        let mut encoded = Vec::new();
+        if encode_record(&mut encoded, record, Some(&alignment), reference, &mut 0).is_err() {
+            continue;
+        }
+        let candidate = (encoded.len(), hit.score, index, alignment);
+        if best.as_ref().is_none_or(|current| {
+            candidate.0 < current.0
+                || (candidate.0 == current.0 && candidate.1 > current.1)
+                || (candidate.0 == current.0 && candidate.1 == current.1 && candidate.2 < current.2)
+        }) {
+            best = Some(candidate);
+        }
+    }
+    let use_alignment = best
+        .as_ref()
+        .is_some_and(|candidate| candidate.0 < raw_cost);
+    let selected_non_first =
+        use_alignment && best.as_ref().is_some_and(|candidate| candidate.2 != 0);
+    let rejected_alignment = candidate_hits != 0 && !use_alignment;
+    Ok(SelectedAlignment {
+        hit: if use_alignment {
+            best.map(|candidate| candidate.3)
+        } else {
+            None
+        },
+        selection: AlignmentSelection {
+            candidate_hits,
+            selected_non_first,
+            rejected_alignment,
+        },
+    })
 }
 
 fn encode_record(
@@ -990,26 +1177,35 @@ fn encode_record(
             .checked_sub(*previous_start)
             .ok_or_else(|| Error::InvalidInput("alignment offset overflow".into()))?;
         *previous_start = hit.start;
-        let cigar = effective_cigar(hit, record.sequence.len())?;
         write_varint(output, zigzag_encode(delta))?;
-        write_varint(output, cigar.len() as u64)?;
-        for chunk in cigar.chunks(2) {
-            let first = cigar_code(chunk[0].op)? << 4;
-            let second = if chunk.len() == 2 {
-                cigar_code(chunk[1].op)?
-            } else {
-                0
-            };
-            write_u8(output, first | second)?;
-        }
-        for op in &cigar {
-            write_varint(output, op.len as u64)?;
-        }
-        encode_noise(output, &record.sequence, hit, &cigar, reference)?;
+        encode_record_body(output, record, hit, reference)?;
     } else {
         write_packed(output, &record.sequence)?;
     }
     Ok(())
+}
+
+fn encode_record_body(
+    output: &mut Vec<u8>,
+    record: &ReadRecord,
+    hit: &GenomeAlignment,
+    reference: &[u8],
+) -> Result<()> {
+    let cigar = effective_cigar(hit, record.sequence.len())?;
+    write_varint(output, cigar.len() as u64)?;
+    for chunk in cigar.chunks(2) {
+        let first = cigar_code(chunk[0].op)? << 4;
+        let second = if chunk.len() == 2 {
+            cigar_code(chunk[1].op)?
+        } else {
+            0
+        };
+        write_u8(output, first | second)?;
+    }
+    for op in &cigar {
+        write_varint(output, op.len as u64)?;
+    }
+    encode_noise(output, &record.sequence, hit, &cigar, reference)
 }
 
 fn decode_records(
@@ -1017,6 +1213,20 @@ fn decode_records(
     count: usize,
     first_pair: u64,
     reference: &[u8],
+    version: u32,
+) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>> {
+    if version >= VERSION {
+        return decode_records_v9(input, count, first_pair, reference, version);
+    }
+    decode_records_legacy(input, count, first_pair, reference, version)
+}
+
+fn decode_records_legacy(
+    input: &[u8],
+    count: usize,
+    first_pair: u64,
+    reference: &[u8],
+    version: u32,
 ) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>> {
     let mut cursor = Cursor::new(input.to_vec());
     let mut out = Vec::with_capacity(count);
@@ -1037,9 +1247,9 @@ fn decode_records(
                 starts[mate] = starts[mate]
                     .checked_add(delta)
                     .ok_or_else(|| Error::InvalidFormat("alignment offset overflow".into()))?;
-                decode_mapped_body(&mut cursor, reference, starts[mate], reverse)?
+                decode_mapped_body(&mut cursor, reference, starts[mate], reverse, version)?
             } else {
-                read_packed(&mut cursor)?.decode()
+                read_packed(&mut cursor, version)?.decode()
             };
             stream.push(sequence);
         }
@@ -1056,6 +1266,77 @@ fn decode_records(
         ));
     }
     Ok(out)
+}
+
+fn decode_records_v9(
+    input: &[u8],
+    count: usize,
+    first_pair: u64,
+    reference: &[u8],
+    version: u32,
+) -> Result<Vec<(u64, Vec<u8>, Vec<u8>)>> {
+    let mut cursor = Cursor::new(input.to_vec());
+    let mut starts = [0i64; 2];
+    let mut first_starts = vec![None; count];
+    let mut first_reverses = vec![None; count];
+    let mut all = [Vec::with_capacity(count), Vec::with_capacity(count)];
+    for mate in 0..2 {
+        let bitmap_len = count.div_ceil(8);
+        let mut mapped_bitmap = vec![0; bitmap_len];
+        let mut reverse_bitmap = vec![0; bitmap_len];
+        cursor.read_exact(&mut mapped_bitmap)?;
+        cursor.read_exact(&mut reverse_bitmap)?;
+        let positions_len = usize_from(read_u64(&mut cursor)?, "alignment positions")?;
+        let mut positions = vec![0; positions_len];
+        cursor.read_exact(&mut positions)?;
+        let mut positions = Cursor::new(positions);
+        for ordinal in 0..count {
+            let mapped = mapped_bitmap[ordinal / 8] & (1 << (ordinal % 8)) != 0;
+            let encoded_reverse = reverse_bitmap[ordinal / 8] & (1 << (ordinal % 8)) != 0;
+            let sequence = if mapped {
+                let delta = zigzag_decode(read_varint(&mut positions)?)?;
+                let base = if mate == 1 {
+                    first_starts[ordinal].unwrap_or(starts[mate])
+                } else {
+                    starts[mate]
+                };
+                let start = base
+                    .checked_add(delta)
+                    .ok_or_else(|| Error::InvalidFormat("alignment offset overflow".into()))?;
+                starts[mate] = start;
+                let reverse = if mate == 1 {
+                    first_reverses[ordinal].map_or(encoded_reverse, |first| encoded_reverse ^ first)
+                } else {
+                    encoded_reverse
+                };
+                if mate == 0 {
+                    first_starts[ordinal] = Some(start);
+                    first_reverses[ordinal] = Some(reverse);
+                }
+                decode_mapped_body(&mut cursor, reference, start, reverse, version)?
+            } else {
+                read_packed(&mut cursor, version)?.decode()
+            };
+            all[mate].push(sequence);
+        }
+        if positions.position() != positions.get_ref().len() as u64 {
+            return Err(Error::InvalidFormat(
+                "trailing alignment position bytes".into(),
+            ));
+        }
+    }
+    if cursor.position() != cursor.get_ref().len() as u64 {
+        return Err(Error::InvalidFormat("trailing record bytes".into()));
+    }
+    Ok((0..count)
+        .map(|index| {
+            (
+                first_pair + index as u64,
+                all[0][index].clone(),
+                all[1][index].clone(),
+            )
+        })
+        .collect())
 }
 
 fn decode_ids(input: &[u8], count: usize, mode: IdMode) -> Result<[Vec<Vec<u8>>; 2]> {
@@ -1175,6 +1456,7 @@ fn decode_mapped_body(
     reference: &[u8],
     start: i64,
     is_reverse: bool,
+    version: u32,
 ) -> Result<Vec<u8>> {
     let count = usize_from(read_varint(input)?, "CIGAR count")?;
     let mut op_codes = Vec::with_capacity(count);
@@ -1198,6 +1480,7 @@ fn decode_mapped_body(
         reference,
         nonnegative_usize(start, "alignment start")?,
         &cigar,
+        version,
     )?;
     if is_reverse {
         reverse_complement(&mut sequence);
@@ -1326,6 +1609,7 @@ fn reconstruct_with_noise(
     reference: &[u8],
     start: usize,
     cigar: &[CigarOp],
+    version: u32,
 ) -> Result<Vec<u8>> {
     let mut sequence = Vec::new();
     let mut ref_pos = start;
@@ -1373,7 +1657,7 @@ fn reconstruct_with_noise(
                 }
             }
             CigarOpKind::SoftClip => {
-                let bases = read_softclip(input, len)?;
+                let bases = read_softclip(input, len, version)?;
                 sequence.extend_from_slice(&bases);
             }
             CigarOpKind::Del | CigarOpKind::Skip => {
@@ -1395,14 +1679,14 @@ fn reconstruct_with_noise(
     Ok(sequence)
 }
 
-fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, u64, u64, Vec<u8>, u64)> {
+fn read_header<R: Read>(input: &mut R) -> Result<(u32, u16, IdMode, u64, u64, Vec<u8>, u64)> {
     let mut magic = [0; 9];
     input.read_exact(&mut magic)?;
     if magic != *MAGIC {
         return Err(Error::InvalidFormat("bad alignment archive magic".into()));
     }
     let version = read_u32(input)?;
-    if version != VERSION {
+    if version != VERSION && version != SPARSE_VERSION && version != LEGACY_VERSION {
         return Err(Error::InvalidFormat(
             "unsupported alignment archive version".into(),
         ));
@@ -1422,6 +1706,7 @@ fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, u64, u64, Vec<u8>
     input.read_exact(&mut reference_block)?;
     let position = 9 + 4 + 2 + 8 * 4 + reference_len as u64;
     Ok((
+        version,
         flags,
         id_mode,
         chunks,
@@ -1463,7 +1748,7 @@ fn build_index(reference: &[u8]) -> Result<Index> {
 fn encode_reference(
     reference: &[u8],
     options: &crate::AlignmentCompressionOptions,
-) -> Result<Vec<u8>> {
+) -> Result<EncodedReference> {
     let mut packed = vec![0; reference.len().div_ceil(4)];
     let mut runs: Vec<(usize, Vec<u8>)> = Vec::new();
     for (index, &base) in reference.iter().enumerate() {
@@ -1511,7 +1796,10 @@ fn encode_reference(
     let mut block = Vec::new();
     write_u64(&mut block, raw.len() as u64)?;
     block.extend(compressed);
-    Ok(block)
+    Ok(EncodedReference {
+        block,
+        raw_len: raw.len() as u64,
+    })
 }
 
 fn decode_reference(block: &[u8]) -> Result<Vec<u8>> {
@@ -1568,22 +1856,43 @@ fn encode_packed(sequence: &[u8]) -> Result<Vec<u8>> {
     let packed = PackedSequence::try_from_bytes(sequence)?;
     let mut output = Vec::new();
     write_u32(&mut output, packed.len())?;
-    write_u8(&mut output, u8::from(packed.is_packed()))?;
-    write_u64(&mut output, packed.encoded_size() as u64)?;
-    output.extend(packed.encoded_bytes());
+    if packed.is_packed() {
+        write_u8(&mut output, 1)?;
+        write_u64(&mut output, packed.encoded_size() as u64)?;
+        output.extend(packed.encoded_bytes());
+    } else {
+        let sparse = encode_sparse_body(sequence)?;
+        let (mode, body) = if sparse.len() < sequence.len() {
+            (2, sparse.as_slice())
+        } else {
+            (0, sequence)
+        };
+        write_u8(&mut output, mode)?;
+        write_u64(&mut output, body.len() as u64)?;
+        output.extend(body);
+    }
     Ok(output)
 }
 fn write_packed(output: &mut Vec<u8>, sequence: &[u8]) -> Result<()> {
     output.extend(encode_packed(sequence)?);
     Ok(())
 }
-fn read_packed(input: &mut Cursor<Vec<u8>>) -> Result<PackedSequence> {
+fn read_packed(input: &mut Cursor<Vec<u8>>, version: u32) -> Result<PackedSequence> {
     let length = read_u32(input)?;
-    let packed = read_u8(input)? != 0;
+    let mode = read_u8(input)?;
     let body_len = usize_from(read_u64(input)?, "packed sequence body")?;
     let mut body = vec![0; body_len];
     input.read_exact(&mut body)?;
-    PackedSequence::from_encoded(length, packed, body)
+    match mode {
+        0 => PackedSequence::from_encoded(length, false, body),
+        1 => PackedSequence::from_encoded(length, true, body),
+        2 if version >= SPARSE_VERSION => {
+            PackedSequence::try_from_bytes(&decode_sparse_body(length as usize, &body)?)
+        }
+        _ => Err(Error::InvalidFormat(
+            "unknown packed sequence encoding".into(),
+        )),
+    }
 }
 
 fn write_softclip(output: &mut Vec<u8>, sequence: &[u8]) -> Result<()> {
@@ -1592,13 +1901,19 @@ fn write_softclip(output: &mut Vec<u8>, sequence: &[u8]) -> Result<()> {
         write_u8(output, 0)?;
         output.extend(packed.encoded_bytes());
     } else {
-        write_u8(output, 1)?;
-        output.extend(sequence);
+        let sparse = encode_sparse_body(sequence)?;
+        if sparse.len() < sequence.len() {
+            write_u8(output, 2)?;
+            output.extend(sparse);
+        } else {
+            write_u8(output, 1)?;
+            output.extend(sequence);
+        }
     }
     Ok(())
 }
 
-fn read_softclip(input: &mut Cursor<Vec<u8>>, length: usize) -> Result<Vec<u8>> {
+fn read_softclip(input: &mut Cursor<Vec<u8>>, length: usize, version: u32) -> Result<Vec<u8>> {
     match read_u8(input)? {
         0 => {
             let body_len = length.div_ceil(4);
@@ -1611,8 +1926,80 @@ fn read_softclip(input: &mut Cursor<Vec<u8>>, length: usize) -> Result<Vec<u8>> 
             input.read_exact(&mut sequence)?;
             Ok(sequence)
         }
+        2 if version >= SPARSE_VERSION => {
+            let packed_len = length.div_ceil(4);
+            let mut body = vec![0; packed_len];
+            input.read_exact(&mut body)?;
+            let count = usize_from(read_varint(input)?, "sparse sequence exceptions")?;
+            write_varint(&mut body, count as u64)?;
+            for _ in 0..count {
+                write_varint(&mut body, read_varint(input)?)?;
+                body.push(read_u8(input)?);
+            }
+            decode_sparse_body(length, &body)
+        }
         _ => Err(Error::InvalidFormat("unknown soft-clip encoding".into())),
     }
+}
+
+fn encode_sparse_body(sequence: &[u8]) -> Result<Vec<u8>> {
+    let mut packed = vec![0; sequence.len().div_ceil(4)];
+    let mut exceptions = Vec::new();
+    for (index, &base) in sequence.iter().enumerate() {
+        let bits = match base {
+            b'A' => 0,
+            b'C' => 1,
+            b'G' => 2,
+            b'T' => 3,
+            _ => {
+                exceptions.push((index, base));
+                0
+            }
+        };
+        packed[index / 4] |= bits << (6 - (index % 4) * 2);
+    }
+    write_varint(&mut packed, exceptions.len() as u64)?;
+    let mut previous = 0usize;
+    for (position, base) in exceptions {
+        write_varint(&mut packed, (position - previous) as u64)?;
+        packed.push(base);
+        previous = position;
+    }
+    Ok(packed)
+}
+
+fn decode_sparse_body(length: usize, body: &[u8]) -> Result<Vec<u8>> {
+    let packed_len = length.div_ceil(4);
+    if body.len() < packed_len {
+        return Err(Error::InvalidFormat("truncated sparse sequence".into()));
+    }
+    let mut sequence = (0..length)
+        .map(|index| b"ACGT"[((body[index / 4] >> (6 - (index % 4) * 2)) & 3) as usize])
+        .collect::<Vec<_>>();
+    let mut cursor = Cursor::new(body[packed_len..].to_vec());
+    let count = usize_from(read_varint(&mut cursor)?, "sparse sequence exceptions")?;
+    let mut previous = 0usize;
+    for index in 0..count {
+        let position = previous
+            .checked_add(usize_from(
+                read_varint(&mut cursor)?,
+                "sparse sequence exception offset",
+            )?)
+            .ok_or_else(|| Error::InvalidFormat("sparse sequence offset overflow".into()))?;
+        if position >= length || (index != 0 && position <= previous) {
+            return Err(Error::InvalidFormat(
+                "sparse sequence exception out of bounds".into(),
+            ));
+        }
+        sequence[position] = read_u8(&mut cursor)?;
+        previous = position;
+    }
+    if cursor.position() != cursor.get_ref().len() as u64 {
+        return Err(Error::InvalidFormat(
+            "trailing sparse sequence bytes".into(),
+        ));
+    }
+    Ok(sequence)
 }
 fn reverse_complement(sequence: &mut [u8]) {
     sequence.reverse();
@@ -1750,7 +2137,7 @@ mod tests {
         let reference = b"ACGTNNNNacgtRYACGT";
         let encoded =
             encode_reference(reference, &crate::AlignmentCompressionOptions::default()).unwrap();
-        assert_eq!(decode_reference(&encoded).unwrap(), reference);
+        assert_eq!(decode_reference(&encoded.block).unwrap(), reference);
     }
 
     #[test]
@@ -1783,6 +2170,8 @@ mod tests {
                 second: ReadRecord::new(second_id, b"A".to_vec(), None),
                 first_hit: None,
                 second_hit: None,
+                first_selection: AlignmentSelection::default(),
+                second_selection: AlignmentSelection::default(),
             };
             let mut encoded = Vec::new();
             write_id_stream(&mut encoded, &[pair], mode).unwrap();
@@ -1797,8 +2186,157 @@ mod tests {
         for sequence in [b"ACGTAC".as_slice(), b"ACNTac".as_slice()] {
             let mut encoded = Vec::new();
             write_softclip(&mut encoded, sequence).unwrap();
-            let decoded = read_softclip(&mut Cursor::new(encoded), sequence.len()).unwrap();
+            let decoded =
+                read_softclip(&mut Cursor::new(encoded), sequence.len(), VERSION).unwrap();
             assert_eq!(decoded, sequence);
         }
+    }
+
+    #[test]
+    fn packed_sequence_uses_sparse_exceptions_when_smaller() {
+        let sparse = b"ACGTACGTACGTACGTACGTNCGTACGTACGTACGTACGT";
+        let encoded = encode_packed(sparse).unwrap();
+        assert_eq!(encoded[4], 2);
+        assert_eq!(
+            read_packed(&mut Cursor::new(encoded), VERSION)
+                .unwrap()
+                .decode(),
+            sparse
+        );
+
+        let raw = b"NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN";
+        let encoded = encode_packed(raw).unwrap();
+        assert_eq!(encoded[4], 0);
+        assert_eq!(
+            read_packed(&mut Cursor::new(encoded), VERSION)
+                .unwrap()
+                .decode(),
+            raw
+        );
+    }
+
+    #[test]
+    fn legacy_packed_modes_remain_readable() {
+        let mut packed = Vec::new();
+        write_u32(&mut packed, 4).unwrap();
+        write_u8(&mut packed, 1).unwrap();
+        write_u64(&mut packed, 1).unwrap();
+        packed.push(0x1b);
+        assert_eq!(
+            read_packed(&mut Cursor::new(packed), LEGACY_VERSION)
+                .unwrap()
+                .decode(),
+            b"ACGT"
+        );
+
+        let mut raw = Vec::new();
+        write_u32(&mut raw, 4).unwrap();
+        write_u8(&mut raw, 0).unwrap();
+        write_u64(&mut raw, 4).unwrap();
+        raw.extend(b"ACNT");
+        assert_eq!(
+            read_packed(&mut Cursor::new(raw), LEGACY_VERSION)
+                .unwrap()
+                .decode(),
+            b"ACNT"
+        );
+    }
+
+    #[test]
+    fn alignment_selection_uses_smallest_candidate_payload() {
+        let reference = [vec![b'A'; 40], vec![b'C'; 40]].concat();
+        let record = ReadRecord::new("read", vec![b'C'; 40], None);
+        let hit = |start| minibwa::Hit {
+            tid: 0,
+            target_start: start,
+            target_end: start + 40,
+            query_start: 0,
+            query_end: 40,
+            mapq: 60,
+            score: if start == 40 { 40 } else { 1 },
+            matching_bases: if start == 40 { 40 } else { 0 },
+            block_len: 40,
+            is_reverse: false,
+            is_primary: start == 0,
+            is_proper_pair: false,
+            cigar: vec![CigarOp {
+                len: 40,
+                op: CigarOpKind::Match,
+            }],
+        };
+        let selected = select_alignment(&record, vec![hit(0), hit(40)], &reference).unwrap();
+        assert_eq!(selected.hit.unwrap().start, 40);
+        assert!(selected.selection.selected_non_first);
+        assert!(!selected.selection.rejected_alignment);
+    }
+
+    #[test]
+    fn alignment_selection_rejects_payload_larger_than_raw_sequence() {
+        let reference = vec![b'A'; 40];
+        let record = ReadRecord::new("read", vec![b'N'; 40], None);
+        let hit = minibwa::Hit {
+            tid: 0,
+            target_start: 0,
+            target_end: 40,
+            query_start: 0,
+            query_end: 40,
+            mapq: 1,
+            score: 1,
+            matching_bases: 0,
+            block_len: 40,
+            is_reverse: false,
+            is_primary: true,
+            is_proper_pair: false,
+            cigar: vec![CigarOp {
+                len: 40,
+                op: CigarOpKind::Match,
+            }],
+        };
+        let selected = select_alignment(&record, vec![hit], &reference).unwrap();
+        assert!(selected.hit.is_none());
+        assert!(selected.selection.rejected_alignment);
+    }
+
+    #[test]
+    fn v9_record_stream_round_trips_mate_relative_coordinates() {
+        let reference =
+            b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+        let first_sequence = reference[10..30].to_vec();
+        let mut second_sequence = reference[40..60].to_vec();
+        reverse_complement(&mut second_sequence);
+        let alignment = |start, reverse| GenomeAlignment {
+            start,
+            query_start: 0,
+            query_end: 20,
+            cigar: vec![CigarOp {
+                len: 20,
+                op: CigarOpKind::Match,
+            }],
+            is_reverse: reverse,
+        };
+        let pairs = vec![
+            AlignedPair {
+                first: ReadRecord::new("pair0/1", first_sequence.clone(), None),
+                second: ReadRecord::new("pair0/2", second_sequence.clone(), None),
+                first_hit: Some(alignment(10, false)),
+                second_hit: Some(alignment(40, true)),
+                first_selection: AlignmentSelection::default(),
+                second_selection: AlignmentSelection::default(),
+            },
+            AlignedPair {
+                first: ReadRecord::new("pair1/1", b"ACGTNCGT".to_vec(), None),
+                second: ReadRecord::new("pair1/2", b"NNNNNNNN".to_vec(), None),
+                first_hit: None,
+                second_hit: None,
+                first_selection: AlignmentSelection::default(),
+                second_selection: AlignmentSelection::default(),
+            },
+        ];
+        let encoded = write_record_stream(reference, &pairs).unwrap();
+        let decoded = decode_records(&encoded, pairs.len(), 0, reference, VERSION).unwrap();
+        assert_eq!(decoded[0].1, first_sequence);
+        assert_eq!(decoded[0].2, second_sequence);
+        assert_eq!(decoded[1].1, b"ACGTNCGT");
+        assert_eq!(decoded[1].2, b"NNNNNNNN");
     }
 }

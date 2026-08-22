@@ -272,6 +272,27 @@ pub struct CompressionProfile {
     pub consensus_max_groups: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlignedCompressionProfile {
+    pub pairs: u64,
+    pub candidate_hits: u64,
+    pub mapped_reads: u64,
+    pub raw_reads: u64,
+    pub selected_non_first_hits: u64,
+    pub rejected_alignments: u64,
+    pub reference_bases: u64,
+    pub reference_raw_bytes: u64,
+    pub reference_compressed_bytes: u64,
+    pub ids_raw_bytes: u64,
+    pub qualities_raw_bytes: u64,
+    pub records_raw_bytes: u64,
+    pub ids_compressed_bytes: u64,
+    pub qualities_compressed_bytes: u64,
+    pub records_compressed_bytes: u64,
+    pub chunks_compressed_bytes: u64,
+    pub archive_bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveRecords {
     pub streams: Vec<Vec<ReadRecord>>,
@@ -511,6 +532,18 @@ pub fn compress_aligned_paired_fastq_files(
     output: impl AsRef<Path>,
     options: &AlignmentCompressionOptions,
 ) -> Result<CompressionMetadata> {
+    compress_aligned_paired_fastq_files_profiled(genome_fasta, input_1, input_2, output, options)
+        .map(|(metadata, _)| metadata)
+}
+
+/// Compress paired gzipped FASTQ files and report aligned archive size details.
+pub fn compress_aligned_paired_fastq_files_profiled(
+    genome_fasta: impl AsRef<Path>,
+    input_1: impl AsRef<Path>,
+    input_2: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &AlignmentCompressionOptions,
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     alignment_archive::compress_paired_fastq_files(genome_fasta, input_1, input_2, output, options)
 }
 
@@ -523,6 +556,26 @@ pub fn compress_aligned_paired_fastq_files_with_index(
     output: impl AsRef<Path>,
     options: &AlignmentCompressionOptions,
 ) -> Result<CompressionMetadata> {
+    compress_aligned_paired_fastq_files_with_index_profiled(
+        genome_fasta,
+        index_prefix,
+        input_1,
+        input_2,
+        output,
+        options,
+    )
+    .map(|(metadata, _)| metadata)
+}
+
+/// Compress using an existing minibwa index and report archive size details.
+pub fn compress_aligned_paired_fastq_files_with_index_profiled(
+    genome_fasta: impl AsRef<Path>,
+    index_prefix: impl AsRef<Path>,
+    input_1: impl AsRef<Path>,
+    input_2: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    options: &AlignmentCompressionOptions,
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     alignment_archive::compress_paired_fastq_files_with_index(
         genome_fasta,
         index_prefix,
@@ -904,7 +957,7 @@ mod tests {
             chunk_pairs: 1,
             ..AlignmentCompressionOptions::default()
         };
-        compress_aligned_paired_fastq_files(
+        let (metadata, profile) = compress_aligned_paired_fastq_files_profiled(
             &genome,
             &input_1,
             &input_2,
@@ -912,6 +965,12 @@ mod tests {
             &alignment_options,
         )
         .unwrap();
+        assert_eq!(metadata.records, 2);
+        assert_eq!(profile.pairs, 2);
+        assert_eq!(profile.mapped_reads + profile.raw_reads, 4);
+        assert!(profile.reference_bases > 0);
+        assert!(profile.reference_compressed_bytes > 0);
+        assert!(profile.archive_bytes > profile.chunks_compressed_bytes);
         let mut archive = Vec::new();
         File::open(&output)
             .unwrap()

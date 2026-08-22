@@ -1,4 +1,6 @@
-use spring_rs::{compress_aligned_paired_fastq_files_with_index, AlignmentCompressionOptions};
+use spring_rs::{
+    compress_aligned_paired_fastq_files_with_index_profiled, AlignmentCompressionOptions,
+};
 use std::env;
 use std::path::PathBuf;
 
@@ -29,7 +31,7 @@ fn main() -> spring_rs::Result<()> {
             "expected reference, index prefix, two FASTQ files, and output".into(),
         ));
     }
-    compress_aligned_paired_fastq_files_with_index(
+    let (_, profile) = compress_aligned_paired_fastq_files_with_index_profiled(
         reference,
         index_prefix,
         input_1,
@@ -37,5 +39,28 @@ fn main() -> spring_rs::Result<()> {
         output,
         &AlignmentCompressionOptions::default(),
     )?;
+    eprintln!("archive bytes: {}", profile.archive_bytes);
+    eprintln!(
+        "reference: {} bases, {} bytes compressed",
+        profile.reference_bases, profile.reference_compressed_bytes
+    );
+    eprintln!(
+        "chunk streams raw: ids {}, qualities {}, records {} bytes",
+        profile.ids_raw_bytes, profile.qualities_raw_bytes, profile.records_raw_bytes
+    );
+    eprintln!(
+        "chunk streams compressed: ids {}, qualities {}, records {} bytes",
+        profile.ids_compressed_bytes,
+        profile.qualities_compressed_bytes,
+        profile.records_compressed_bytes
+    );
+    eprintln!(
+        "mapping: {} mapped, {} raw, {} candidate hits, {} non-first selections, {} rejected",
+        profile.mapped_reads,
+        profile.raw_reads,
+        profile.candidate_hits,
+        profile.selected_non_first_hits,
+        profile.rejected_alignments
+    );
     Ok(())
 }

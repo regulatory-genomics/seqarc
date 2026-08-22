@@ -1150,7 +1150,6 @@ pub fn write_reordered_store_profiled<W: Write>(
             .open(&encoded_path)?;
         let zstd_start = std::time::Instant::now();
         let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
-        encoder.multithread(worker_count(options.zstd_threads)?)?;
         if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
             encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
                 LONG_DISTANCE_WINDOW_LOG,
@@ -1376,7 +1375,6 @@ pub(crate) fn write_prepared_profiled<W: Write>(
             .open(&encoded_path)?;
         let zstd_start = std::time::Instant::now();
         let mut encoder = zstd::stream::Encoder::new(encoded_file, options.zstd_level)?;
-        encoder.multithread(worker_count(options.zstd_threads)?)?;
         if raw_len >= 1 << LONG_DISTANCE_WINDOW_LOG {
             encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
                 LONG_DISTANCE_WINDOW_LOG,
@@ -1495,10 +1493,6 @@ fn write_prepared_profiled_v2<W: Write>(
     result
 }
 
-fn worker_count(workers: usize) -> Result<u32> {
-    u32::try_from(workers).map_err(|_| Error::InvalidInput("thread count exceeds u32".into()))
-}
-
 pub(crate) struct PreparedMateSection {
     path: std::path::PathBuf,
     order_path: std::path::PathBuf,
@@ -1576,7 +1570,6 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
     let encoded_start = output.stream_position()?;
     let zstd_started = std::time::Instant::now();
     let mut encoder = zstd::stream::Encoder::new(&mut output, options.zstd_level)?;
-    encoder.multithread(worker_count(options.zstd_threads)?)?;
     encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
         LONG_DISTANCE_WINDOW_LOG,
     ))?;

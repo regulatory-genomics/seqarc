@@ -10,10 +10,6 @@ fn main() -> spring_rs::Result<()> {
     let work_dir = std::env::var("SPRING_RS_WORK_DIR")
         .unwrap_or_else(|_| "/tmp/opencode/spring-rs-consensus-work".into());
     let mut options = CompressionOptions::default();
-    options.zstd_threads = std::env::var("SPRING_RS_ZSTD_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(options.zstd_threads);
     options.reorder.max_bucket_records = std::env::var("SPRING_RS_MAX_BUCKET")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -37,10 +33,9 @@ fn main() -> spring_rs::Result<()> {
         input_1, input_2, output, &options, work_dir,
     )?;
     println!(
-        "{metadata:?} in {:.1}s (zstd level {}, zstd threads {}, sort threads {}, max bucket {})",
+        "{metadata:?} in {:.1}s (zstd level {}, sort threads {}, max bucket {})",
         start.elapsed().as_secs_f64(),
         options.zstd_level,
-        options.zstd_threads,
         options.reorder.sort_threads,
         options.reorder.max_bucket_records,
     );

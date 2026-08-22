@@ -142,7 +142,6 @@ pub struct CompressionOptions {
     pub preserve_order: bool,
     pub quality_mode: QualityMode,
     pub threads: usize,
-    pub zstd_threads: usize,
     pub zstd_level: i32,
     pub reorder: ReorderOptions,
 }
@@ -152,7 +151,6 @@ pub struct AlignmentCompressionOptions {
     pub chunk_pairs: usize,
     pub include_chunk_index: bool,
     pub threads: usize,
-    pub zstd_threads: usize,
     pub preserve_ids: bool,
     pub preserve_quality: bool,
     pub quality_mode: QualityMode,
@@ -165,7 +163,6 @@ impl Default for AlignmentCompressionOptions {
             chunk_pairs: 250_000,
             include_chunk_index: true,
             threads: 16,
-            zstd_threads: 16,
             preserve_ids: true,
             preserve_quality: true,
             quality_mode: QualityMode::Lossless,
@@ -205,7 +202,6 @@ impl Default for CompressionOptions {
             preserve_order: true,
             quality_mode: QualityMode::Lossless,
             threads: 16,
-            zstd_threads: 16,
             zstd_level: 19,
             reorder: ReorderOptions::default(),
         }
@@ -756,10 +752,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_sixteen_workers_and_zstd_threads() {
+    fn defaults_use_sixteen_workers_and_zstd_level() {
         let options = CompressionOptions::default();
         assert_eq!(options.threads, 16);
-        assert_eq!(options.zstd_threads, 16);
         assert_eq!(options.zstd_level, 19);
     }
 
@@ -1052,7 +1047,6 @@ mod tests {
             &mut archive,
             &CompressionOptions {
                 threads: 1,
-                zstd_threads: 4,
                 zstd_level: 19,
                 reorder: ReorderOptions {
                     kmer_size: 3,

@@ -8,12 +8,13 @@ use bed_utils::extsort::{ExternalChunk, ExternalChunkBuilder};
 use indicatif::ProgressBar;
 use minibwa::{CigarOp, CigarOpKind, Index, Options, Query};
 use rkyv::{Archive, Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 9] = b"SPRNG-AL2";
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 const CHUNK_HEADER_SIZE: u64 = 44;
 const BATCH_SIZE: usize = 256;
 const PARSE_BATCH_PAIRS: usize = 4096;
@@ -73,6 +74,15 @@ struct ChunkIndexEntry {
     first_pair: u64,
     pairs: u32,
     compressed_size: u64,
+}
+
+struct EncodedChunk {
+    pairs: u32,
+    raw_len: u64,
+    ids_len: u64,
+    qualities_len: u64,
+    records_len: u64,
+    compressed: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,37 +320,89 @@ fn compress_with_index(
     archive.write_all(&reference_block)?;
 
     let mut chunks = Vec::new();
-    let mut replay_pairs = Vec::with_capacity(options.chunk_pairs.max(1));
     let mut replay_pair_count = 0u64;
-    let spool = ExternalChunk::<SpoolPair>::open(File::open(&spool_path)?)
-        .map_err(|error| Error::InvalidFormat(error.to_string()))?;
-    for item in spool {
-        let item = item.map_err(|error| Error::InvalidFormat(error.to_string()))?;
-        replay_pairs.push(item.into_aligned_pair(&kept_runs)?);
-        if replay_pairs.len() == options.chunk_pairs.max(1) {
-            chunks.push(write_chunk(
-                &mut archive,
-                &compact_reference,
-                replay_pair_count,
-                &replay_pairs,
-                options,
-                id_mode,
-            )?);
-            replay_pair_count += replay_pairs.len() as u64;
-            replay_pairs.clear();
+    progress.set_message("compressing chunks".to_owned());
+    let worker_count = options.threads.max(1);
+    let (job_tx, job_rx) =
+        crossbeam_channel::bounded::<Result<(usize, u64, Vec<AlignedPair>)>>(worker_count);
+    let (result_tx, result_rx) =
+        crossbeam_channel::bounded::<Result<(usize, u64, EncodedChunk)>>(worker_count);
+    let reference_for_workers = compact_reference.as_slice();
+    std::thread::scope(|scope| -> Result<()> {
+        let dispatcher = scope.spawn({
+            let job_tx = job_tx.clone();
+            let spool_path = spool_path.clone();
+            let kept_runs = kept_runs.clone();
+            move || -> Result<()> {
+                let spool = ExternalChunk::<SpoolPair>::open(File::open(spool_path)?)
+                    .map_err(|error| Error::InvalidFormat(error.to_string()))?;
+                let mut pairs = Vec::with_capacity(options.chunk_pairs.max(1));
+                let mut first_pair = 0u64;
+                let mut chunk_index = 0usize;
+                for item in spool {
+                    let item = item.map_err(|error| Error::InvalidFormat(error.to_string()))?;
+                    pairs.push(item.into_aligned_pair(&kept_runs)?);
+                    if pairs.len() == options.chunk_pairs.max(1) {
+                        job_tx
+                            .send(Ok((chunk_index, first_pair, std::mem::take(&mut pairs))))
+                            .map_err(|_| Error::InvalidInput("chunk workers exited".into()))?;
+                        first_pair += options.chunk_pairs.max(1) as u64;
+                        chunk_index += 1;
+                        pairs = Vec::with_capacity(options.chunk_pairs.max(1));
+                    }
+                }
+                if !pairs.is_empty() {
+                    job_tx
+                        .send(Ok((chunk_index, first_pair, pairs)))
+                        .map_err(|_| Error::InvalidInput("chunk workers exited".into()))?;
+                }
+                Ok(())
+            }
+        });
+        drop(job_tx);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            workers.push(scope.spawn(move || -> Result<()> {
+                while let Ok(job) = job_rx.recv() {
+                    let result = job.and_then(|(index, first_pair, pairs)| {
+                        encode_chunk(reference_for_workers, &pairs, options, id_mode)
+                            .map(|chunk| (index, first_pair, chunk))
+                    });
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            }));
         }
-    }
-    if !replay_pairs.is_empty() {
-        chunks.push(write_chunk(
-            &mut archive,
-            &compact_reference,
-            replay_pair_count,
-            &replay_pairs,
-            options,
-            id_mode,
-        )?);
-        replay_pair_count += replay_pairs.len() as u64;
-    }
+        drop(job_rx);
+        drop(result_tx);
+        let mut pending = BTreeMap::new();
+        let mut next_chunk = 0usize;
+        while let Ok(result) = result_rx.recv() {
+            let (index, first_pair, chunk) = result?;
+            pending.insert(index, (first_pair, chunk));
+            while let Some((first_pair, chunk)) = pending.remove(&next_chunk) {
+                chunks.push(write_encoded_chunk(&mut archive, first_pair, chunk)?);
+                replay_pair_count += chunks.last().unwrap().pairs as u64;
+                next_chunk += 1;
+            }
+        }
+        dispatcher
+            .join()
+            .map_err(|_| Error::InvalidInput("chunk dispatcher panicked".into()))??;
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| Error::InvalidInput("chunk worker panicked".into()))??;
+        }
+        if !pending.is_empty() {
+            return Err(Error::InvalidFormat("missing chunk result".into()));
+        }
+        Ok(())
+    })?;
 
     let (index_offset, index_length) = if options.include_chunk_index {
         let offset = archive.stream_position()?;
@@ -726,14 +788,12 @@ impl SpoolAlignment {
     }
 }
 
-fn write_chunk(
-    archive: &mut File,
+fn encode_chunk(
     reference: &[u8],
-    first_pair: u64,
     pairs: &[AlignedPair],
     options: &crate::AlignmentCompressionOptions,
     id_mode: IdMode,
-) -> Result<ChunkIndexEntry> {
+) -> Result<EncodedChunk> {
     let mut ids = Vec::new();
     write_id_stream(&mut ids, pairs, id_mode)?;
     let mut qualities = Vec::new();
@@ -743,25 +803,35 @@ fn write_chunk(
     raw.extend(&ids);
     raw.extend(&qualities);
     raw.extend(&records);
-    let zstd_threads = u32::try_from(options.zstd_threads.max(1))
-        .map_err(|_| Error::InvalidInput("too many zstd threads".into()))?;
-    let mut encoder = zstd::stream::Encoder::new(Vec::new(), options.zstd_level)?;
-    encoder.multithread(zstd_threads)?;
-    encoder.write_all(&raw)?;
-    let compressed = encoder.finish()?;
+    let compressed = zstd::stream::encode_all(Cursor::new(&raw), options.zstd_level)?;
+    Ok(EncodedChunk {
+        pairs: pairs.len() as u32,
+        raw_len: raw.len() as u64,
+        ids_len: ids.len() as u64,
+        qualities_len: qualities.len() as u64,
+        records_len: records.len() as u64,
+        compressed,
+    })
+}
+
+fn write_encoded_chunk(
+    archive: &mut File,
+    first_pair: u64,
+    chunk: EncodedChunk,
+) -> Result<ChunkIndexEntry> {
     let offset = archive.stream_position()?;
-    write_u32(archive, pairs.len() as u32)?;
-    write_u64(archive, compressed.len() as u64)?;
-    write_u64(archive, raw.len() as u64)?;
-    write_u64(archive, ids.len() as u64)?;
-    write_u64(archive, qualities.len() as u64)?;
-    write_u64(archive, records.len() as u64)?;
-    archive.write_all(&compressed)?;
+    write_u32(archive, chunk.pairs)?;
+    write_u64(archive, chunk.compressed.len() as u64)?;
+    write_u64(archive, chunk.raw_len)?;
+    write_u64(archive, chunk.ids_len)?;
+    write_u64(archive, chunk.qualities_len)?;
+    write_u64(archive, chunk.records_len)?;
+    archive.write_all(&chunk.compressed)?;
     Ok(ChunkIndexEntry {
         offset,
         first_pair,
-        pairs: pairs.len() as u32,
-        compressed_size: compressed.len() as u64,
+        pairs: chunk.pairs,
+        compressed_size: chunk.compressed.len() as u64,
     })
 }
 
@@ -1209,7 +1279,7 @@ fn encode_noise(
                 ref_pos = ref_end;
                 query_pos = query_end;
             }
-            CigarOpKind::Ins | CigarOpKind::SoftClip => {
+            CigarOpKind::Ins => {
                 let end = query_pos
                     .checked_add(len)
                     .ok_or_else(|| Error::InvalidInput("query position overflow".into()))?;
@@ -1217,6 +1287,16 @@ fn encode_noise(
                     return Err(Error::InvalidFormat("CIGAR exceeds query bounds".into()));
                 }
                 output.extend(&oriented[query_pos..end]);
+                query_pos = end;
+            }
+            CigarOpKind::SoftClip => {
+                let end = query_pos
+                    .checked_add(len)
+                    .ok_or_else(|| Error::InvalidInput("query position overflow".into()))?;
+                if end > oriented.len() {
+                    return Err(Error::InvalidFormat("CIGAR exceeds query bounds".into()));
+                }
+                write_softclip(output, &oriented[query_pos..end])?;
                 query_pos = end;
             }
             CigarOpKind::Del | CigarOpKind::Skip => {
@@ -1279,7 +1359,7 @@ fn reconstruct_with_noise(
                 }
                 ref_pos = end;
             }
-            CigarOpKind::Ins | CigarOpKind::SoftClip => {
+            CigarOpKind::Ins => {
                 let end = sequence.len().checked_add(len).ok_or_else(|| {
                     Error::InvalidFormat("inserted sequence length overflow".into())
                 })?;
@@ -1291,6 +1371,10 @@ fn reconstruct_with_noise(
                         "inserted sequence length mismatch".into(),
                     ));
                 }
+            }
+            CigarOpKind::SoftClip => {
+                let bases = read_softclip(input, len)?;
+                sequence.extend_from_slice(&bases);
             }
             CigarOpKind::Del | CigarOpKind::Skip => {
                 ref_pos = ref_pos
@@ -1423,12 +1507,7 @@ fn encode_reference(
         previous_end = start + length;
     }
 
-    let zstd_threads = u32::try_from(options.zstd_threads.max(1))
-        .map_err(|_| Error::InvalidInput("too many zstd threads".into()))?;
-    let mut encoder = zstd::stream::Encoder::new(Vec::new(), options.zstd_level)?;
-    encoder.multithread(zstd_threads)?;
-    encoder.write_all(&raw)?;
-    let compressed = encoder.finish()?;
+    let compressed = zstd::stream::encode_all(Cursor::new(&raw), options.zstd_level)?;
     let mut block = Vec::new();
     write_u64(&mut block, raw.len() as u64)?;
     block.extend(compressed);
@@ -1505,6 +1584,35 @@ fn read_packed(input: &mut Cursor<Vec<u8>>) -> Result<PackedSequence> {
     let mut body = vec![0; body_len];
     input.read_exact(&mut body)?;
     PackedSequence::from_encoded(length, packed, body)
+}
+
+fn write_softclip(output: &mut Vec<u8>, sequence: &[u8]) -> Result<()> {
+    let packed = PackedSequence::try_from_bytes(sequence)?;
+    if packed.is_packed() {
+        write_u8(output, 0)?;
+        output.extend(packed.encoded_bytes());
+    } else {
+        write_u8(output, 1)?;
+        output.extend(sequence);
+    }
+    Ok(())
+}
+
+fn read_softclip(input: &mut Cursor<Vec<u8>>, length: usize) -> Result<Vec<u8>> {
+    match read_u8(input)? {
+        0 => {
+            let body_len = length.div_ceil(4);
+            let mut body = vec![0; body_len];
+            input.read_exact(&mut body)?;
+            PackedSequence::from_encoded(length as u32, true, body).map(|value| value.decode())
+        }
+        1 => {
+            let mut sequence = vec![0; length];
+            input.read_exact(&mut sequence)?;
+            Ok(sequence)
+        }
+        _ => Err(Error::InvalidFormat("unknown soft-clip encoding".into())),
+    }
 }
 fn reverse_complement(sequence: &mut [u8]) {
     sequence.reverse();
@@ -1681,6 +1789,16 @@ mod tests {
             let decoded = decode_ids(&encoded, 1, mode).unwrap();
             assert_eq!(decoded[0][0], expected_first);
             assert_eq!(decoded[1][0], expected_second);
+        }
+    }
+
+    #[test]
+    fn softclip_payload_uses_two_bit_encoding_with_raw_fallback() {
+        for sequence in [b"ACGTAC".as_slice(), b"ACNTac".as_slice()] {
+            let mut encoded = Vec::new();
+            write_softclip(&mut encoded, sequence).unwrap();
+            let decoded = read_softclip(&mut Cursor::new(encoded), sequence.len()).unwrap();
+            assert_eq!(decoded, sequence);
         }
     }
 }

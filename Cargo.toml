@@ -14,7 +14,7 @@ minibwa = { git = "https://github.com/regulatory-genomics/minibwa-rs" }
 rayon = "1"
 rkyv = { version = "0.8", features = ["bytecheck"] }
 tempfile = "3"
-zstd = { version = "0.13", features = ["zstdmt"] }
+zstd = "0.13"
 
 [dev-dependencies]
 criterion = "0.8"

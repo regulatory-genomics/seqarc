@@ -7,7 +7,7 @@ use std::io::{BufReader, Read};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"SPRSP001";
+const MAGIC: &[u8; 8] = b"SARCSP01";
 #[cfg(test)]
 const HEADER_LEN: u64 = 16;
 

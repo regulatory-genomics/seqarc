@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use spring_rs::{canonical_minimizers, PairStore, ReadRecord, ReorderOptions};
+use seqarc::{canonical_minimizers, PairStore, ReadRecord, ReorderOptions};
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -88,7 +88,7 @@ fn external_sort(c: &mut Criterion) {
                             ..ReorderOptions::default()
                         };
                         black_box(
-                            spring_rs::reorder::sort_store_minimizers(
+                            seqarc::reorder::sort_store_minimizers(
                                 &mut store,
                                 &options,
                                 temp.path(),

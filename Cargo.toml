@@ -1,8 +1,8 @@
 [package]
-name = "spring-rs"
+name = "seqarc"
 version = "0.1.0"
 edition = "2021"
-description = "Rust-native library for compressing sequencing reads"
+description = "Rust-native library for archiving compressed sequencing reads"
 license = "MIT"
 
 [dependencies]

@@ -1,7 +1,6 @@
 //! A Rust-native, library-only sequencing read compressor.
 //!
-//! The archive format is intentionally independent from the original C++
-//! SPRING format. RS4 archives are self-describing and support range decoding
+//! SeqArc archives are self-describing and support range decoding
 //! without a command-line interface.
 
 mod alignment_archive;
@@ -308,10 +307,11 @@ pub fn compress_paired_fastq_files(
     output: impl AsRef<Path>,
     options: &CompressionOptions,
 ) -> Result<CompressionMetadata> {
-    let temp_dir =
-        options.reorder.temp_dir.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("spring-rs-{}", std::process::id()))
-        });
+    let temp_dir = options
+        .reorder
+        .temp_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("seqarc-{}", std::process::id())));
     compress_reordered_paired_fastq_files(input_1, input_2, output, options, temp_dir)
 }
 
@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn illumina_binning_matches_spring_table() {
+    fn illumina_binning_matches_expected_table() {
         let mut record =
             ReadRecord::new("read", b"ACGTACGT".to_vec(), Some((33u8..=127).collect()));
         apply_quality(&mut record, &QualityMode::IlluminaBinning);
@@ -872,7 +872,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let genome = directory.path().join("genome.fa");
         std::fs::write(&genome, b">chr1\nacnGT\n>chr2\ntgcaRY\n").unwrap();
-        let index_file = directory.path().join("genome.spring-mbi");
+        let index_file = directory.path().join("genome.seqarc-index");
 
         let index = build_genome_index(&genome, &index_file).unwrap();
 
@@ -890,7 +890,7 @@ mod tests {
     fn dna_batch_alignment_returns_first_hit_and_strand() {
         let directory = tempfile::tempdir().unwrap();
         let genome = directory.path().join("genome.fa");
-        let prefix = directory.path().join("genome.spring-mbi");
+        let prefix = directory.path().join("genome.seqarc-index");
         let reference =
             b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
         std::fs::write(&genome, [b">chr1\n".as_slice(), reference, b"\n"].concat()).unwrap();
@@ -1197,7 +1197,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let input_1 = directory.path().join("reads.1.fastq.gz");
         let input_2 = directory.path().join("reads.2.fastq.gz");
-        let output = directory.path().join("reads.spring-rs");
+        let output = directory.path().join("reads.seqarc");
         let mut encoder_1 = gzip_writer(File::create(&input_1).unwrap(), 1);
         let mut encoder_2 = gzip_writer(File::create(&input_2).unwrap(), 1);
         let first = [b"ACGTACGT".as_slice(), b"ACGTACGA", b"ACGTACGG"];
@@ -1227,11 +1227,11 @@ mod tests {
         };
         compress_paired_fastq_files(&input_1, &input_2, &output, &options).unwrap();
         let work = options.reorder.temp_dir.as_ref().unwrap();
-        assert!(!work.join("spring-rs-record-store").exists());
+        assert!(!work.join("seqarc-record-store").exists());
         assert!(!work.join("sequences.0.spool").exists());
         assert!(!work.join("sequences.1.spool").exists());
         assert_eq!(std::fs::read_dir(work).unwrap().count(), 0);
-        assert!(!output.with_extension("spring-rs.partial").exists());
+        assert!(!output.with_extension("seqarc.partial").exists());
         let decoded = decompress(
             BufReader::new(File::open(output).unwrap()),
             &DecompressionOptions::default(),
@@ -1266,7 +1266,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let input_1 = directory.path().join("reads.1.fastq.gz");
         let input_2 = directory.path().join("reads.2.fastq.gz");
-        let output = directory.path().join("reads.spring-rs");
+        let output = directory.path().join("reads.seqarc");
         let work = directory.path().join("work");
         let mut first = gzip_writer(File::create(&input_1).unwrap(), 1);
         let mut second = gzip_writer(File::create(&input_2).unwrap(), 1);
@@ -1284,7 +1284,7 @@ mod tests {
 
         assert!(compress_paired_fastq_files(input_1, input_2, &output, &options).is_err());
         assert!(!output.exists());
-        assert!(!output.with_extension("spring-rs.partial").exists());
+        assert!(!output.with_extension("seqarc.partial").exists());
         assert_eq!(std::fs::read_dir(work).unwrap().count(), 0);
     }
 

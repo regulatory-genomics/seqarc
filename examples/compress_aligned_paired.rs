@@ -1,29 +1,29 @@
-use spring_rs::{
+use seqarc::{
     compress_aligned_paired_fastq_files_with_index_profiled, AlignmentCompressionOptions,
 };
 use std::env;
 use std::path::PathBuf;
 
-fn main() -> spring_rs::Result<()> {
+fn main() -> seqarc::Result<()> {
     let mut args = env::args_os().skip(1);
     let index_file = PathBuf::from(
         args.next()
-            .ok_or_else(|| spring_rs::Error::InvalidInput("missing index file".into()))?,
+            .ok_or_else(|| seqarc::Error::InvalidInput("missing index file".into()))?,
     );
     let input_1 = PathBuf::from(
         args.next()
-            .ok_or_else(|| spring_rs::Error::InvalidInput("missing mate-1 FASTQ".into()))?,
+            .ok_or_else(|| seqarc::Error::InvalidInput("missing mate-1 FASTQ".into()))?,
     );
     let input_2 = PathBuf::from(
         args.next()
-            .ok_or_else(|| spring_rs::Error::InvalidInput("missing mate-2 FASTQ".into()))?,
+            .ok_or_else(|| seqarc::Error::InvalidInput("missing mate-2 FASTQ".into()))?,
     );
     let output = PathBuf::from(
         args.next()
-            .ok_or_else(|| spring_rs::Error::InvalidInput("missing output archive".into()))?,
+            .ok_or_else(|| seqarc::Error::InvalidInput("missing output archive".into()))?,
     );
     if args.next().is_some() {
-        return Err(spring_rs::Error::InvalidInput(
+        return Err(seqarc::Error::InvalidInput(
             "expected index file, two FASTQ files, and output".into(),
         ));
     }

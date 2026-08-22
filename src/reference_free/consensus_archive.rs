@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-const MAGIC: &[u8; 9] = b"SPRNG-RS4";
+const MAGIC: &[u8; 9] = b"SEQARC-RS";
 const VERSION: u32 = 8;
 const LONG_DISTANCE_WINDOW_LOG: u32 = 27;
 const ORDER_ENTRY_SIZE: usize = 9;
@@ -87,11 +87,13 @@ pub fn read_reordered<R: Read>(
     let mut magic = [0; 9];
     input.read_exact(&mut magic)?;
     if magic != *MAGIC {
-        return Err(Error::InvalidFormat("bad RS4 magic".into()));
+        return Err(Error::InvalidFormat("bad SeqArc archive magic".into()));
     }
     let version = read_u32(&mut input)?;
     if version != VERSION {
-        return Err(Error::InvalidFormat("unsupported RS4 version".into()));
+        return Err(Error::InvalidFormat(
+            "unsupported SeqArc archive version".into(),
+        ));
     }
     let streams = read_u16(&mut input)? as usize;
     let flags = read_u16(&mut input)?;
@@ -206,10 +208,12 @@ pub(crate) fn read_paired_into<R: Read, S: crate::PairedRecordSink>(
     let mut magic = [0; 9];
     input.read_exact(&mut magic)?;
     if magic != *MAGIC {
-        return Err(Error::InvalidFormat("bad RS4 magic".into()));
+        return Err(Error::InvalidFormat("bad SeqArc archive magic".into()));
     }
     if read_u32(&mut input)? != VERSION {
-        return Err(Error::InvalidFormat("unsupported RS4 version".into()));
+        return Err(Error::InvalidFormat(
+            "unsupported SeqArc archive version".into(),
+        ));
     }
     let streams = read_u16(&mut input)? as usize;
     let flags = read_u16(&mut input)?;
@@ -517,7 +521,7 @@ fn unique_decode_workspace(root: &Path) -> Result<std::path::PathBuf> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     for _ in 0..1000 {
         let path = root.join(format!(
-            "spring-rs-decode-{}-{}",
+            "seqarc-decode-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1096,7 +1100,7 @@ pub fn write_reordered_store_profiled<W: Write>(
 
         let payload_start = std::time::Instant::now();
         let (record_columns, id_pattern) = build_store_record_columns(store, options, temp_dir)?;
-        let payload_path = temp_dir.join("spring-rs3.payload");
+        let payload_path = temp_dir.join("seqarc.payload");
         let payload_file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -1141,7 +1145,7 @@ pub fn write_reordered_store_profiled<W: Write>(
         let checksum_start = std::time::Instant::now();
         let checksum = checksum_file(std::fs::File::open(&payload_path)?)?;
         let checksum_time = checksum_start.elapsed();
-        let encoded_path = temp_dir.join("spring-rs3.payload.zst");
+        let encoded_path = temp_dir.join("seqarc.payload.zst");
         let encoded_file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -1268,7 +1272,7 @@ pub(crate) fn write_prepared_profiled<W: Write>(
         let assignment_bytes = spool_paths.iter().try_fold(0u64, |total, path| {
             Ok::<_, Error>(total + std::fs::metadata(path)?.len())
         })?;
-        let payload_path = temp_dir.join("spring-rs3.payload");
+        let payload_path = temp_dir.join("seqarc.payload");
         let payload_file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -1366,7 +1370,7 @@ pub(crate) fn write_prepared_profiled<W: Write>(
         let checksum_start = std::time::Instant::now();
         let checksum = checksum_file(std::fs::File::open(&payload_path)?)?;
         let checksum_time = checksum_start.elapsed();
-        let encoded_path = temp_dir.join("spring-rs3.payload.zst");
+        let encoded_path = temp_dir.join("seqarc.payload.zst");
         let encoded_file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -5147,6 +5151,19 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_foreign_archive_magic() {
+        let mut archive = vec![0; MAGIC.len()];
+        archive.extend(VERSION.to_le_bytes());
+        assert!(matches!(
+            read_reordered(
+                std::io::Cursor::new(archive),
+                &crate::DecompressionOptions::default()
+            ),
+            Err(Error::InvalidFormat(message)) if message == "bad SeqArc archive magic"
+        ));
+    }
 
     #[test]
     fn id_stream_round_trips_fixed_variable_prefix_and_arbitrary_values() {

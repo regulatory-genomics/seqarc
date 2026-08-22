@@ -1,11 +1,11 @@
-use spring_rs::{compress_paired_fastq_files, CompressionOptions, ReorderOptions};
+use seqarc::{compress_paired_fastq_files, CompressionOptions, ReorderOptions};
 
-fn main() -> spring_rs::Result<()> {
-    let temp_dir = std::env::var("SPRING_RS_WORK_DIR").ok().map(Into::into);
+fn main() -> seqarc::Result<()> {
+    let temp_dir = std::env::var("SEQARC_WORK_DIR").ok().map(Into::into);
     let reorder = ReorderOptions {
-        kmer_size: env_usize("SPRING_RS_KMER", 21),
-        window_size: env_usize("SPRING_RS_WINDOW", 31),
-        max_bucket_records: env_usize("SPRING_RS_MAX_BUCKET", 4_096),
+        kmer_size: env_usize("SEQARC_KMER", 21),
+        window_size: env_usize("SEQARC_WINDOW", 31),
+        max_bucket_records: env_usize("SEQARC_MAX_BUCKET", 4_096),
         temp_dir,
         ..ReorderOptions::default()
     };
@@ -13,12 +13,12 @@ fn main() -> spring_rs::Result<()> {
         reorder,
         ..CompressionOptions::default()
     };
-    let input_1 = std::env::var("SPRING_RS_INPUT_1")
-        .unwrap_or_else(|_| "data/20250816gan-2_R1.fastq.gz".into());
-    let input_2 = std::env::var("SPRING_RS_INPUT_2")
-        .unwrap_or_else(|_| "data/20250816gan-2_R2.fastq.gz".into());
+    let input_1 =
+        std::env::var("SEQARC_INPUT_1").unwrap_or_else(|_| "data/20250816gan-2_R1.fastq.gz".into());
+    let input_2 =
+        std::env::var("SEQARC_INPUT_2").unwrap_or_else(|_| "data/20250816gan-2_R2.fastq.gz".into());
     let output =
-        std::env::var("SPRING_RS_OUTPUT").unwrap_or_else(|_| "data/20250816gan-2.spring-rs".into());
+        std::env::var("SEQARC_OUTPUT").unwrap_or_else(|_| "data/20250816gan-2.seqarc".into());
     let start = std::time::Instant::now();
     let metadata = compress_paired_fastq_files(input_1, input_2, output, &options)?;
     println!(

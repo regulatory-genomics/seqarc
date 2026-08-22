@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-const INDEX_MAGIC: &[u8; 8] = b"SPRMBI1\0";
+const INDEX_MAGIC: &[u8; 8] = b"SARCIDX1";
 const INDEX_VERSION: u32 = 1;
 const INDEX_HEADER_SIZE: u64 = 64;
 
@@ -640,5 +640,20 @@ fn cigar_kind(code: u32) -> Result<CigarKind> {
         7 => Ok(CigarKind::Eq),
         8 => Ok(CigarKind::Diff),
         _ => Err(Error("unknown minibwa CIGAR operation".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_foreign_index_magic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("old.index");
+        let mut header = vec![0; INDEX_HEADER_SIZE as usize];
+        header[8..12].copy_from_slice(&INDEX_VERSION.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+        assert!(Index::load(path, false).is_err());
     }
 }

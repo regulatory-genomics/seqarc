@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-const MAGIC: &[u8; 9] = b"SPRNG-AL2";
+const MAGIC: &[u8; 9] = b"SEQARC-AL";
 const VERSION: u32 = 9;
 const CHUNK_HEADER_SIZE: u64 = 44;
 const BATCH_SIZE: usize = 256;
@@ -210,7 +210,8 @@ pub(crate) fn compress_paired_fastq_files(
     options: &crate::AlignmentCompressionOptions,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let workspace = tempfile::tempdir()?;
-    let index = crate::build_genome_index(genome_fasta, workspace.path().join("index.spring-mbi"))?;
+    let index =
+        crate::build_genome_index(genome_fasta, workspace.path().join("index.seqarc-index"))?;
     compress_with_index(&index, input_1, input_2, output, options)
 }
 
@@ -468,7 +469,7 @@ fn compress_with_index(
 
     let (index_offset, index_length) = if options.include_chunk_index {
         let offset = archive.stream_position()?;
-        archive.write_all(b"AL2IDX\0\0")?;
+        archive.write_all(b"SARCIDX\0")?;
         write_u64(&mut archive, chunks.len() as u64)?;
         for entry in &chunks {
             write_u64(&mut archive, entry.offset)?;
@@ -2155,6 +2156,16 @@ mod tests {
                     if message == "unsupported alignment archive version"
             ));
         }
+    }
+
+    #[test]
+    fn rejects_foreign_alignment_magic() {
+        let mut header = vec![0; MAGIC.len()];
+        write_u32(&mut header, VERSION).unwrap();
+        assert!(matches!(
+            read_header(&mut Cursor::new(header)),
+            Err(Error::InvalidFormat(message)) if message == "bad alignment archive magic"
+        ));
     }
 
     #[test]

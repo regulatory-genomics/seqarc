@@ -1,5 +1,5 @@
 use flate2::read::MultiGzDecoder;
-use spring_rs::{
+use seqarc::{
     decompress_aligned_paired_into, gzip_reader, DecompressionOptions, Error, FastxReader, Format,
     PairedRecordSink, ReadRecord, Result,
 };

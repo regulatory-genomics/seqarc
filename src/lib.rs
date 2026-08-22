@@ -272,7 +272,15 @@ pub struct CompressionProfile {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AlignedCompressionProfile {
+    pub total: Duration,
+    pub index: Duration,
+    pub map_and_spool: Duration,
+    pub reference: Duration,
+    pub chunks: Duration,
     pub pairs: u64,
+    pub chunk_count: u64,
+    pub spool_bytes: u64,
+    pub max_pending_chunks: u64,
     pub candidate_hits: u64,
     pub mapped_reads: u64,
     pub raw_reads: u64,
@@ -986,10 +994,17 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.records, 2);
         assert_eq!(profile.pairs, 2);
+        assert_eq!(profile.chunk_count, 2);
         assert_eq!(profile.mapped_reads + profile.raw_reads, 4);
+        assert!(profile.spool_bytes > 0);
         assert!(profile.reference_bases > 0);
         assert!(profile.reference_compressed_bytes > 0);
-        assert!(profile.archive_bytes > profile.chunks_compressed_bytes);
+        assert_eq!(
+            profile.archive_bytes,
+            31 + profile.reference_compressed_bytes
+                + 44 * profile.chunk_count
+                + profile.chunks_compressed_bytes
+        );
         let mut archive = Vec::new();
         File::open(&output)
             .unwrap()

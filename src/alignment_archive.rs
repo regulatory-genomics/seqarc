@@ -200,10 +200,29 @@ pub(crate) fn compress_paired_fastq_files(
     output: impl AsRef<Path>,
     options: &crate::AlignmentCompressionOptions,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
+    let total_started = std::time::Instant::now();
     let workspace = tempfile::tempdir()?;
+    eprintln!(
+        "[seqarc] stage=index_build start reference={}",
+        genome_fasta.as_ref().display()
+    );
+    let index_started = std::time::Instant::now();
     let index =
         crate::build_genome_index(genome_fasta, workspace.path().join("index.seqarc-index"))?;
-    compress_with_index(&index, input_1, input_2, output, options)
+    let index_elapsed = index_started.elapsed();
+    eprintln!(
+        "[seqarc] stage=index_build done elapsed={} reference_bases={}",
+        display_duration(index_elapsed),
+        index.reference_len()
+    );
+    let (metadata, mut profile) = compress_with_index(&index, input_1, input_2, output, options)?;
+    profile.index = index_elapsed;
+    profile.total = total_started.elapsed();
+    eprintln!(
+        "[seqarc] stage=total done elapsed={}",
+        display_duration(profile.total)
+    );
+    Ok((metadata, profile))
 }
 
 pub(crate) fn compress_paired_fastq_files_with_index(
@@ -213,9 +232,29 @@ pub(crate) fn compress_paired_fastq_files_with_index(
     output: impl AsRef<Path>,
     options: &crate::AlignmentCompressionOptions,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
+    let total_started = std::time::Instant::now();
+    let index_file = index_file.as_ref();
+    eprintln!(
+        "[seqarc] stage=index_load start path={}",
+        index_file.display()
+    );
+    let index_started = std::time::Instant::now();
     let index =
         Index::load(index_file, false).map_err(|error| Error::InvalidInput(error.to_string()))?;
-    compress_with_index(&index, input_1, input_2, output, options)
+    let index_elapsed = index_started.elapsed();
+    eprintln!(
+        "[seqarc] stage=index_load done elapsed={} reference_bases={}",
+        display_duration(index_elapsed),
+        index.reference_len()
+    );
+    let (metadata, mut profile) = compress_with_index(&index, input_1, input_2, output, options)?;
+    profile.index = index_elapsed;
+    profile.total = total_started.elapsed();
+    eprintln!(
+        "[seqarc] stage=total done elapsed={}",
+        display_duration(profile.total)
+    );
+    Ok((metadata, profile))
 }
 
 fn compress_with_index(
@@ -225,6 +264,7 @@ fn compress_with_index(
     output: impl AsRef<Path>,
     options: &crate::AlignmentCompressionOptions,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
+    let pipeline_started = std::time::Instant::now();
     let mapping_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads.max(1))
         .build()
@@ -232,6 +272,14 @@ fn compress_with_index(
     let progress = ProgressBar::new_spinner();
     progress.enable_steady_tick(std::time::Duration::from_millis(250));
     progress.set_message("aligned 0 reads");
+    stage_log(&progress, format!(
+        "[seqarc] stage=initialize threads={} chunk_pairs={} zstd_level={} preserve_ids={} preserve_quality={}",
+        options.threads.max(1),
+        options.chunk_pairs.max(1),
+        options.zstd_level,
+        options.preserve_ids,
+        options.preserve_quality
+    ));
     let temp_dir = tempfile::tempdir()?;
     let spool_path = temp_dir.path().join("aligned-pairs.lz4");
     let mut spool_builder = ExternalChunkBuilder::new(File::create(&spool_path)?, 1)
@@ -244,6 +292,8 @@ fn compress_with_index(
     let mapper_options = options.clone();
     let (parse_tx, parse_rx) = crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(4);
     let (mapped_tx, mapped_rx) = crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(4);
+    stage_log(&progress, "[seqarc] stage=map_and_spool start");
+    let map_started = std::time::Instant::now();
     let result = std::thread::scope(|scope| -> Result<()> {
         let producer_tx = parse_tx.clone();
         let producer = scope.spawn(move || -> Result<()> {
@@ -333,13 +383,37 @@ fn compress_with_index(
         .finish()
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     drop(spool_chunk);
+    profile.map_and_spool = map_started.elapsed();
+    profile.spool_bytes = std::fs::metadata(&spool_path)?.len();
+    let mapped_pairs = (profile.mapped_reads + profile.raw_reads) / 2;
+    stage_log(&progress, format!(
+        "[seqarc] stage=map_and_spool done elapsed={} pairs={} mapped_reads={} raw_reads={} candidate_hits={} spool_bytes={}",
+        display_duration(profile.map_and_spool),
+        mapped_pairs,
+        profile.mapped_reads,
+        profile.raw_reads,
+        profile.candidate_hits,
+        profile.spool_bytes
+    ));
     progress.set_message("pruning reference".to_owned());
+    stage_log(&progress, "[seqarc] stage=reference start");
+    let reference_started = std::time::Instant::now();
     let (compact_reference, kept_runs) = compact_reference(index, &mask)?;
     let id_mode = id_detector.finish();
     let reference_block = encode_reference(&compact_reference, options)?;
     profile.reference_bases = compact_reference.len() as u64;
     profile.reference_raw_bytes = reference_block.raw_len;
     profile.reference_compressed_bytes = reference_block.block.len() as u64;
+    profile.reference = reference_started.elapsed();
+    stage_log(&progress, format!(
+        "[seqarc] stage=reference done elapsed={} original_bases={} retained_bases={} retained_runs={} raw_bytes={} compressed_bytes={}",
+        display_duration(profile.reference),
+        index.reference_len(),
+        profile.reference_bases,
+        kept_runs.len(),
+        profile.reference_raw_bytes,
+        profile.reference_compressed_bytes
+    ));
     let mut archive = File::create(output)?;
     let header_size = 9 + 4 + 2 + 8 * 2;
     archive.write_all(MAGIC)?;
@@ -363,6 +437,15 @@ fn compress_with_index(
     let mut replay_pair_count = 0u64;
     progress.set_message("compressing chunks".to_owned());
     let worker_count = options.threads.max(1);
+    stage_log(
+        &progress,
+        format!(
+            "[seqarc] stage=chunks start workers={} chunk_pairs={}",
+            worker_count,
+            options.chunk_pairs.max(1)
+        ),
+    );
+    let chunks_started = std::time::Instant::now();
     let (job_tx, job_rx) =
         crossbeam_channel::bounded::<Result<(usize, Vec<AlignedPair>)>>(worker_count);
     let (result_tx, result_rx) =
@@ -422,6 +505,7 @@ fn compress_with_index(
         while let Ok(result) = result_rx.recv() {
             let (index, chunk) = result?;
             pending.insert(index, chunk);
+            profile.max_pending_chunks = profile.max_pending_chunks.max(pending.len() as u64);
             while let Some(chunk) = pending.remove(&next_chunk) {
                 profile.ids_raw_bytes += chunk.ids_len;
                 profile.qualities_raw_bytes += chunk.qualities_len;
@@ -449,6 +533,17 @@ fn compress_with_index(
         }
         Ok(())
     })?;
+    profile.chunks = chunks_started.elapsed();
+    profile.chunk_count = written_chunks;
+    stage_log(&progress, format!(
+        "[seqarc] stage=chunks done elapsed={} chunks={} pairs={} raw_bytes={} compressed_bytes={} max_pending={}",
+        display_duration(profile.chunks),
+        profile.chunk_count,
+        replay_pair_count,
+        profile.ids_raw_bytes + profile.qualities_raw_bytes + profile.records_raw_bytes,
+        profile.chunks_compressed_bytes,
+        profile.max_pending_chunks
+    ));
 
     let end = archive.stream_position()?;
     archive.seek(SeekFrom::Start(chunk_count_pos))?;
@@ -457,6 +552,16 @@ fn compress_with_index(
     archive.flush()?;
     profile.archive_bytes = end;
     profile.pairs = replay_pair_count;
+    stage_log(
+        &progress,
+        format!(
+            "[seqarc] stage=archive done elapsed={} pairs={} chunks={} archive_bytes={}",
+            display_duration(pipeline_started.elapsed()),
+            profile.pairs,
+            profile.chunk_count,
+            profile.archive_bytes
+        ),
+    );
     progress.finish_with_message(format!("aligned {} reads", progress.position()));
 
     Ok((
@@ -1975,6 +2080,23 @@ fn usize_from(value: u64, what: &str) -> Result<usize> {
 }
 fn nonnegative_usize(value: i64, what: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::InvalidFormat(format!("invalid {what}")))
+}
+
+fn display_duration(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds >= 60.0 {
+        format!("{:.2}m", seconds / 60.0)
+    } else {
+        format!("{seconds:.2}s")
+    }
+}
+
+fn stage_log(progress: &ProgressBar, message: impl AsRef<str>) {
+    if progress.is_hidden() {
+        eprintln!("{}", message.as_ref());
+    } else {
+        progress.println(message.as_ref());
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,595 @@
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
+use seqarc::{
+    build_genome_index, compress_aligned_paired_fastq_files_with_index_profiled,
+    decompress_aligned_paired_into, gzip_reader, AlignmentCompressionOptions, DecompressionOptions,
+    Error, FastxReader, Format, PairedRecordSink, QualityMode, ReadRecord, Result,
+};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
+use std::ops::RangeInclusive;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+#[derive(Parser)]
+#[command(name = "seqarc", version, about = "Archive paired sequencing reads")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Build a single-file SeqArc genome index.
+    Index(IndexArgs),
+    /// Compress paired gzipped FASTQ files.
+    Compress(CompressArgs),
+    /// Decompress an aligned SeqArc archive.
+    Decompress(DecompressArgs),
+    /// Fully decode and validate an aligned SeqArc archive.
+    Validate(ValidateArgs),
+}
+
+#[derive(Args)]
+struct IndexArgs {
+    /// Input FASTA or FASTA.gz reference.
+    reference: PathBuf,
+    /// Output .seqarc-index file.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Replace an existing output file.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum QualityChoice {
+    Lossless,
+    Illumina,
+    Binary,
+}
+
+#[derive(Args)]
+struct CompressArgs {
+    /// Input .seqarc-index file.
+    #[arg(short, long)]
+    index: PathBuf,
+    /// Mate-1 gzipped FASTQ.
+    #[arg(short = '1', long)]
+    mate_1: PathBuf,
+    /// Mate-2 gzipped FASTQ.
+    #[arg(short = '2', long)]
+    mate_2: PathBuf,
+    /// Output .seqarc archive.
+    #[arg(short, long)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 16)]
+    threads: usize,
+    #[arg(long, default_value_t = 250_000)]
+    chunk_pairs: usize,
+    #[arg(long, default_value_t = 19)]
+    zstd_level: i32,
+    #[arg(long)]
+    no_ids: bool,
+    #[arg(long)]
+    no_quality: bool,
+    #[arg(long, value_enum, default_value_t = QualityChoice::Lossless)]
+    quality_mode: QualityChoice,
+    #[arg(long, requires = "binary_high", requires = "binary_low")]
+    binary_threshold: Option<u8>,
+    #[arg(long, requires = "binary_threshold", requires = "binary_low")]
+    binary_high: Option<u8>,
+    #[arg(long, requires = "binary_threshold", requires = "binary_high")]
+    binary_low: Option<u8>,
+    /// Print detailed component sizes and mapping statistics.
+    #[arg(long)]
+    profile: bool,
+    /// Replace an existing output file.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Fastq,
+    Fasta,
+}
+
+impl From<OutputFormat> for Format {
+    fn from(value: OutputFormat) -> Self {
+        match value {
+            OutputFormat::Fastq => Format::Fastq,
+            OutputFormat::Fasta => Format::Fasta,
+        }
+    }
+}
+
+#[derive(Args)]
+struct DecompressArgs {
+    /// Input aligned .seqarc archive.
+    archive: PathBuf,
+    /// Mate-1 output FASTQ/FASTA.
+    #[arg(short = '1', long)]
+    mate_1: PathBuf,
+    /// Mate-2 output FASTQ/FASTA.
+    #[arg(short = '2', long)]
+    mate_2: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Fastq)]
+    format: OutputFormat,
+    /// Force gzip output regardless of output suffix.
+    #[arg(long, conflicts_with = "plain")]
+    gzip: bool,
+    /// Force plain output regardless of output suffix.
+    #[arg(long, conflicts_with = "gzip")]
+    plain: bool,
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(0..=9))]
+    gzip_level: u32,
+    /// Inclusive zero-based pair range as START:END.
+    #[arg(long, value_parser = parse_range)]
+    range: Option<RangeInclusive<u64>>,
+    /// Replace existing output files.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct ValidateArgs {
+    /// Input aligned .seqarc archive.
+    archive: PathBuf,
+    /// Original mate-1 gzipped FASTQ for byte comparison.
+    #[arg(long, requires = "mate_2")]
+    mate_1: Option<PathBuf>,
+    /// Original mate-2 gzipped FASTQ for byte comparison.
+    #[arg(long, requires = "mate_1")]
+    mate_2: Option<PathBuf>,
+}
+
+fn parse_range(value: &str) -> std::result::Result<RangeInclusive<u64>, String> {
+    let (start, end) = value
+        .split_once(':')
+        .ok_or_else(|| "range must be START:END".to_owned())?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| "invalid range start".to_owned())?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| "invalid range end".to_owned())?;
+    if start > end {
+        return Err("range start must not exceed range end".into());
+    }
+    Ok(start..=end)
+}
+
+struct AtomicPath {
+    final_path: PathBuf,
+    partial_path: PathBuf,
+    force: bool,
+    committed: bool,
+}
+
+impl AtomicPath {
+    fn new(final_path: PathBuf, force: bool) -> Result<Self> {
+        if final_path.exists() && !force {
+            return Err(Error::InvalidInput(format!(
+                "output already exists: {}",
+                final_path.display()
+            )));
+        }
+        let file_name = final_path
+            .file_name()
+            .ok_or_else(|| Error::InvalidInput("output path has no file name".into()))?
+            .to_string_lossy();
+        let partial_path =
+            final_path.with_file_name(format!(".{file_name}.partial.{}", std::process::id()));
+        let _ = std::fs::remove_file(&partial_path);
+        Ok(Self {
+            final_path,
+            partial_path,
+            force,
+            committed: false,
+        })
+    }
+
+    fn partial(&self) -> &Path {
+        &self.partial_path
+    }
+
+    fn commit(mut self) -> Result<()> {
+        if self.force && self.final_path.exists() {
+            std::fs::remove_file(&self.final_path)?;
+        }
+        std::fs::rename(&self.partial_path, &self.final_path)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for AtomicPath {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.partial_path);
+        }
+    }
+}
+
+enum RecordWriter {
+    Plain(BufWriter<File>),
+    Gzip(GzEncoder<BufWriter<File>>),
+}
+
+impl Write for RecordWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(writer) => writer.write(bytes),
+            Self::Gzip(writer) => writer.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.flush(),
+            Self::Gzip(writer) => writer.flush(),
+        }
+    }
+}
+
+impl RecordWriter {
+    fn create(path: &Path, gzip: bool, level: u32) -> Result<Self> {
+        let writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create(path)?);
+        Ok(if gzip {
+            Self::Gzip(seqarc::gzip_writer(writer, level))
+        } else {
+            Self::Plain(writer)
+        })
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Plain(mut writer) => writer.flush().map_err(Into::into),
+            Self::Gzip(writer) => {
+                let mut writer = writer.finish()?;
+                writer.flush().map_err(Into::into)
+            }
+        }
+    }
+}
+
+struct PairedOutputSink {
+    first: Option<RecordWriter>,
+    second: Option<RecordWriter>,
+    format: Format,
+}
+
+impl PairedRecordSink for PairedOutputSink {
+    fn write_pair(
+        &mut self,
+        _original_id: u64,
+        first: ReadRecord,
+        second: ReadRecord,
+    ) -> Result<()> {
+        write_record(self.first.as_mut().unwrap(), &first, self.format)?;
+        write_record(self.second.as_mut().unwrap(), &second, self.format)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.first.take().unwrap().finish()?;
+        self.second.take().unwrap().finish()
+    }
+}
+
+fn write_record(writer: &mut impl Write, record: &ReadRecord, format: Format) -> Result<()> {
+    match format {
+        Format::Fastq => {
+            let quality = record.quality.as_ref().ok_or_else(|| {
+                Error::InvalidInput("FASTQ output requires quality values".into())
+            })?;
+            if quality.len() != record.sequence.len() {
+                return Err(Error::InvalidFormat("quality length mismatch".into()));
+            }
+            writer.write_all(b"@")?;
+            writer.write_all(&record.id)?;
+            writer.write_all(b"\n")?;
+            writer.write_all(&record.sequence)?;
+            writer.write_all(b"\n+\n")?;
+            writer.write_all(quality)?;
+            writer.write_all(b"\n")?;
+        }
+        Format::Fasta => {
+            writer.write_all(b">")?;
+            writer.write_all(&record.id)?;
+            writer.write_all(b"\n")?;
+            writer.write_all(&record.sequence)?;
+            writer.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+struct CountingSink {
+    pairs: u64,
+}
+
+impl PairedRecordSink for CountingSink {
+    fn write_pair(&mut self, _: u64, _: ReadRecord, _: ReadRecord) -> Result<()> {
+        self.pairs += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+type OriginalReader = FastxReader<BufReader<MultiGzDecoder<File>>>;
+
+struct ComparisonSink {
+    first: OriginalReader,
+    second: OriginalReader,
+    pairs: u64,
+}
+
+impl ComparisonSink {
+    fn expected(reader: &mut OriginalReader) -> Result<ReadRecord> {
+        reader
+            .next()
+            .ok_or_else(|| Error::InvalidInput("archive has extra records".into()))?
+    }
+}
+
+impl PairedRecordSink for ComparisonSink {
+    fn write_pair(
+        &mut self,
+        original_id: u64,
+        first: ReadRecord,
+        second: ReadRecord,
+    ) -> Result<()> {
+        if first != Self::expected(&mut self.first)? {
+            return Err(Error::InvalidInput(format!(
+                "mismatch at pair {original_id}, mate 1"
+            )));
+        }
+        if second != Self::expected(&mut self.second)? {
+            return Err(Error::InvalidInput(format!(
+                "mismatch at pair {original_id}, mate 2"
+            )));
+        }
+        self.pairs += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.first.next().is_some() || self.second.next().is_some() {
+            return Err(Error::InvalidInput(
+                "original FASTQ contains extra records".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn quality_mode(args: &CompressArgs) -> Result<QualityMode> {
+    if args.no_quality && !matches!(args.quality_mode, QualityChoice::Lossless) {
+        return Err(Error::InvalidInput(
+            "--quality-mode cannot be used with --no-quality".into(),
+        ));
+    }
+    let binary_values = [args.binary_threshold, args.binary_high, args.binary_low];
+    if !matches!(args.quality_mode, QualityChoice::Binary)
+        && binary_values.iter().any(Option::is_some)
+    {
+        return Err(Error::InvalidInput(
+            "binary quality options require --quality-mode binary".into(),
+        ));
+    }
+    match args.quality_mode {
+        QualityChoice::Lossless => Ok(QualityMode::Lossless),
+        QualityChoice::Illumina => Ok(QualityMode::IlluminaBinning),
+        QualityChoice::Binary => {
+            let threshold = args.binary_threshold.ok_or_else(|| {
+                Error::InvalidInput("binary quality mode requires --binary-threshold".into())
+            })?;
+            let high = args.binary_high.ok_or_else(|| {
+                Error::InvalidInput("binary quality mode requires --binary-high".into())
+            })?;
+            let low = args.binary_low.ok_or_else(|| {
+                Error::InvalidInput("binary quality mode requires --binary-low".into())
+            })?;
+            if threshold > 93 || high > 93 || low > 93 {
+                return Err(Error::InvalidInput(
+                    "binary quality values must be in the Phred range 0..=93".into(),
+                ));
+            }
+            Ok(QualityMode::Binary {
+                threshold,
+                high,
+                low,
+            })
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Command::Index(args) => {
+            let output = AtomicPath::new(args.output, args.force)?;
+            build_genome_index(args.reference, output.partial())?;
+            output.commit()
+        }
+        Command::Compress(args) => {
+            if args.threads == 0 || args.chunk_pairs == 0 {
+                return Err(Error::InvalidInput(
+                    "--threads and --chunk-pairs must be nonzero".into(),
+                ));
+            }
+            let options = AlignmentCompressionOptions {
+                chunk_pairs: args.chunk_pairs,
+                threads: args.threads,
+                preserve_ids: !args.no_ids,
+                preserve_quality: !args.no_quality,
+                quality_mode: quality_mode(&args)?,
+                zstd_level: args.zstd_level,
+            };
+            let output = AtomicPath::new(args.output, args.force)?;
+            let (metadata, profile) = compress_aligned_paired_fastq_files_with_index_profiled(
+                args.index,
+                args.mate_1,
+                args.mate_2,
+                output.partial(),
+                &options,
+            )?;
+            output.commit()?;
+            eprintln!("compressed {} pairs", metadata.records);
+            if args.profile {
+                eprintln!(
+                    "timings: total {:?}, index {:?}, map/spool {:?}, reference {:?}, chunks {:?}",
+                    profile.total,
+                    profile.index,
+                    profile.map_and_spool,
+                    profile.reference,
+                    profile.chunks
+                );
+                eprintln!("archive bytes: {}", profile.archive_bytes);
+                eprintln!(
+                    "reference: {} bases, {} bytes",
+                    profile.reference_bases, profile.reference_compressed_bytes
+                );
+                eprintln!(
+                    "compressed sections: ids {}, qualities {}, records {} bytes",
+                    profile.ids_compressed_bytes,
+                    profile.qualities_compressed_bytes,
+                    profile.records_compressed_bytes
+                );
+                eprintln!(
+                    "mapping: {} mapped, {} raw, {} candidates, {} non-first, {} rejected",
+                    profile.mapped_reads,
+                    profile.raw_reads,
+                    profile.candidate_hits,
+                    profile.selected_non_first_hits,
+                    profile.rejected_alignments
+                );
+                eprintln!(
+                    "pipeline: {} chunks, {} spool bytes, max {} pending chunks",
+                    profile.chunk_count, profile.spool_bytes, profile.max_pending_chunks
+                );
+            }
+            Ok(())
+        }
+        Command::Decompress(args) => decompress_command(args),
+        Command::Validate(args) => validate_command(args),
+    }
+}
+
+fn decompress_command(args: DecompressArgs) -> Result<()> {
+    if args.mate_1 == args.mate_2 {
+        return Err(Error::InvalidInput(
+            "mate output paths must be different".into(),
+        ));
+    }
+    let first_path = AtomicPath::new(args.mate_1, args.force)?;
+    let second_path = AtomicPath::new(args.mate_2, args.force)?;
+    let gzip_first = output_is_gzip(&first_path.final_path, args.gzip, args.plain);
+    let gzip_second = output_is_gzip(&second_path.final_path, args.gzip, args.plain);
+    let mut sink = PairedOutputSink {
+        first: Some(RecordWriter::create(
+            first_path.partial(),
+            gzip_first,
+            args.gzip_level,
+        )?),
+        second: Some(RecordWriter::create(
+            second_path.partial(),
+            gzip_second,
+            args.gzip_level,
+        )?),
+        format: args.format.into(),
+    };
+    let options = DecompressionOptions {
+        original_range: args.range,
+        ..DecompressionOptions::default()
+    };
+    let metadata = decompress_aligned_paired_into(
+        BufReader::with_capacity(16 * 1024 * 1024, File::open(args.archive)?),
+        &options,
+        &mut sink,
+    )?;
+    first_path.commit()?;
+    second_path.commit()?;
+    eprintln!("decompressed {} pairs", metadata.pairs);
+    Ok(())
+}
+
+fn output_is_gzip(path: &Path, force_gzip: bool, force_plain: bool) -> bool {
+    force_gzip
+        || (!force_plain
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gz")))
+}
+
+fn validate_command(args: ValidateArgs) -> Result<()> {
+    let archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(args.archive)?);
+    if let (Some(first), Some(second)) = (args.mate_1, args.mate_2) {
+        let mut sink = ComparisonSink {
+            first: FastxReader::new(
+                BufReader::new(gzip_reader(File::open(first)?)),
+                Format::Fastq,
+            ),
+            second: FastxReader::new(
+                BufReader::new(gzip_reader(File::open(second)?)),
+                Format::Fastq,
+            ),
+            pairs: 0,
+        };
+        decompress_aligned_paired_into(archive, &DecompressionOptions::default(), &mut sink)?;
+        println!("validated {} pairs byte-for-byte", sink.pairs);
+    } else {
+        let mut sink = CountingSink { pairs: 0 };
+        decompress_aligned_paired_into(archive, &DecompressionOptions::default(), &mut sink)?;
+        println!("validated {} pairs", sink.pairs);
+    }
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("seqarc: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_inclusive_range() {
+        assert_eq!(parse_range("4:9").unwrap(), 4..=9);
+        assert!(parse_range("9:4").is_err());
+    }
+
+    #[test]
+    fn compression_requires_binary_parameters() {
+        let cli = Cli::try_parse_from([
+            "seqarc",
+            "compress",
+            "--index",
+            "genome.seqarc-index",
+            "-1",
+            "r1.fastq.gz",
+            "-2",
+            "r2.fastq.gz",
+            "-o",
+            "reads.seqarc",
+            "--quality-mode",
+            "binary",
+        ])
+        .unwrap();
+        let Command::Compress(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert!(quality_mode(&args).is_err());
+    }
+}

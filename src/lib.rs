@@ -6,6 +6,7 @@
 
 mod alignment_archive;
 mod fastx;
+pub mod minibwa;
 mod packed_sequence;
 #[allow(dead_code)]
 mod quality_blocks;
@@ -549,40 +550,28 @@ pub fn compress_aligned_paired_fastq_files_profiled(
 
 /// Compress paired gzipped FASTQ files using an existing minibwa index.
 pub fn compress_aligned_paired_fastq_files_with_index(
-    genome_fasta: impl AsRef<Path>,
-    index_prefix: impl AsRef<Path>,
+    index_file: impl AsRef<Path>,
     input_1: impl AsRef<Path>,
     input_2: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: &AlignmentCompressionOptions,
 ) -> Result<CompressionMetadata> {
     compress_aligned_paired_fastq_files_with_index_profiled(
-        genome_fasta,
-        index_prefix,
-        input_1,
-        input_2,
-        output,
-        options,
+        index_file, input_1, input_2, output, options,
     )
     .map(|(metadata, _)| metadata)
 }
 
 /// Compress using an existing minibwa index and report archive size details.
 pub fn compress_aligned_paired_fastq_files_with_index_profiled(
-    genome_fasta: impl AsRef<Path>,
-    index_prefix: impl AsRef<Path>,
+    index_file: impl AsRef<Path>,
     input_1: impl AsRef<Path>,
     input_2: impl AsRef<Path>,
     output: impl AsRef<Path>,
     options: &AlignmentCompressionOptions,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     alignment_archive::compress_paired_fastq_files_with_index(
-        genome_fasta,
-        index_prefix,
-        input_1,
-        input_2,
-        output,
-        options,
+        index_file, input_1, input_2, output, options,
     )
 }
 
@@ -709,7 +698,7 @@ pub fn write_fastx<W: Write>(records: &[ReadRecord], output: W, format: Format) 
 /// into one synthetic contig.
 pub fn build_genome_index(
     genome_fasta: impl AsRef<Path>,
-    index_prefix: impl AsRef<Path>,
+    index_file: impl AsRef<Path>,
 ) -> Result<minibwa::Index> {
     let genome_fasta = genome_fasta.as_ref();
     let input = File::open(genome_fasta)?;
@@ -721,24 +710,56 @@ pub fn build_genome_index(
     } else {
         Box::new(input)
     };
-    let mut genome = Vec::new();
-    for record in FastxReader::new(BufReader::new(reader), Format::Fasta) {
-        genome.extend(record?.sequence);
-    }
-    if genome.is_empty() {
-        return Err(Error::InvalidInput(
-            "genome FASTA does not contain any sequence".into(),
-        ));
-    }
-
     let mut fasta = tempfile::NamedTempFile::new()?;
-    fasta.write_all(b">genome\n")?;
-    fasta.write_all(&genome)?;
-    fasta.write_all(b"\n")?;
+    {
+        let mut writer = std::io::BufWriter::new(fasta.as_file_mut());
+        writer.write_all(b">genome\n")?;
+        let mut output = Vec::with_capacity(1 << 20);
+        let mut line_length = 0usize;
+        let mut reference_length = 0u64;
+        for record in FastxReader::new(BufReader::new(reader), Format::Fasta) {
+            for base in record?.sequence {
+                let base = base.to_ascii_uppercase();
+                if !matches!(base, b'A' | b'C' | b'G' | b'T') {
+                    continue;
+                }
+                output.push(base);
+                reference_length += 1;
+                line_length += 1;
+                if line_length == 80 {
+                    output.push(b'\n');
+                    line_length = 0;
+                }
+                if output.len() >= 1 << 20 {
+                    writer.write_all(&output)?;
+                    output.clear();
+                }
+            }
+        }
+        if reference_length == 0 {
+            return Err(Error::InvalidInput(
+                "genome FASTA does not contain any ACGT bases".into(),
+            ));
+        }
+        if line_length != 0 {
+            output.push(b'\n');
+        }
+        writer.write_all(&output)?;
+        writer.flush()?;
+    }
     fasta.as_file_mut().sync_all()?;
 
-    minibwa::Index::build(fasta.path(), index_prefix, 4, false)
-        .map_err(|error| Error::InvalidInput(error.to_string()))
+    let index_file = index_file.as_ref();
+    minibwa::Index::build_from_fasta(fasta.path(), index_file, false, 4)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let index = minibwa::Index::load(index_file, false)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    if index.reference_len() == 0 {
+        return Err(Error::InvalidInput(
+            "built genome index has an empty reference".into(),
+        ));
+    }
+    Ok(index)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -762,29 +783,23 @@ pub fn align_dna_batch(
     let names: Vec<String> = (0..sequences.len())
         .map(|index| format!("read-{index}"))
         .collect();
-    let queries: Vec<_> = names
-        .iter()
-        .zip(sequences)
-        .map(|(name, sequence)| minibwa::Query {
-            name,
-            sequence: sequence.as_ref(),
-            methylation_type: 0,
-        })
-        .collect();
-    let mut options = minibwa::Options::default();
-    options.set_paired_end(false);
-    let hits = minibwa::map_batch(index, &options, &queries, None)
+    let sequences = sequences.iter().map(AsRef::as_ref).collect::<Vec<&[u8]>>();
+    let options = minibwa::Opts::new().set_paired(false);
+    let aligner = minibwa::Aligner::new(index, &options);
+    let mut buffer = minibwa::ThreadBuf::new();
+    let hits = aligner
+        .map_many(&mut buffer, &names, &sequences)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
 
     Ok(hits
         .into_iter()
         .map(|hits| {
             hits.into_iter().next().map(|hit| GenomeAlignment {
-                start: hit.target_start,
+                start: hit.ref_start,
                 query_start: hit.query_start,
                 query_end: hit.query_end,
                 cigar: hit.cigar,
-                is_reverse: hit.is_reverse,
+                is_reverse: hit.strand == minibwa::Strand::Reverse,
             })
         })
         .collect())
@@ -856,20 +871,26 @@ mod tests {
     fn genome_index_concatenates_chromosomes() {
         let directory = tempfile::tempdir().unwrap();
         let genome = directory.path().join("genome.fa");
-        std::fs::write(&genome, b">chr1\nACGT\n>chr2\nTGCA\n").unwrap();
-        let prefix = directory.path().join("genome-index");
+        std::fs::write(&genome, b">chr1\nacnGT\n>chr2\ntgcaRY\n").unwrap();
+        let index_file = directory.path().join("genome.spring-mbi");
 
-        let _index = build_genome_index(&genome, &prefix).unwrap();
+        let index = build_genome_index(&genome, &index_file).unwrap();
 
-        assert!(prefix.with_extension("l2b").exists());
-        assert!(prefix.with_extension("mbw").exists());
+        assert!(index_file.exists());
+        assert_eq!(index.reference_len(), 8);
+        assert_eq!(
+            (0..index.reference_len())
+                .map(|position| index.reference_base(position).unwrap())
+                .collect::<Vec<_>>(),
+            b"ACGTTGCA"
+        );
     }
 
     #[test]
     fn dna_batch_alignment_returns_first_hit_and_strand() {
         let directory = tempfile::tempdir().unwrap();
         let genome = directory.path().join("genome.fa");
-        let prefix = directory.path().join("genome-index");
+        let prefix = directory.path().join("genome.spring-mbi");
         let reference =
             b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
         std::fs::write(&genome, [b">chr1\n".as_slice(), reference, b"\n"].concat()).unwrap();

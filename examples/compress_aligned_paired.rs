@@ -6,13 +6,9 @@ use std::path::PathBuf;
 
 fn main() -> spring_rs::Result<()> {
     let mut args = env::args_os().skip(1);
-    let reference = PathBuf::from(
+    let index_file = PathBuf::from(
         args.next()
-            .ok_or_else(|| spring_rs::Error::InvalidInput("missing reference FASTA".into()))?,
-    );
-    let index_prefix = PathBuf::from(
-        args.next()
-            .ok_or_else(|| spring_rs::Error::InvalidInput("missing index prefix".into()))?,
+            .ok_or_else(|| spring_rs::Error::InvalidInput("missing index file".into()))?,
     );
     let input_1 = PathBuf::from(
         args.next()
@@ -28,12 +24,11 @@ fn main() -> spring_rs::Result<()> {
     );
     if args.next().is_some() {
         return Err(spring_rs::Error::InvalidInput(
-            "expected reference, index prefix, two FASTQ files, and output".into(),
+            "expected index file, two FASTQ files, and output".into(),
         ));
     }
     let (_, profile) = compress_aligned_paired_fastq_files_with_index_profiled(
-        reference,
-        index_prefix,
+        index_file,
         input_1,
         input_2,
         output,

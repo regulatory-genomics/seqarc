@@ -7,15 +7,15 @@ fn main() -> spring_rs::Result<()> {
         args.next()
             .ok_or_else(|| spring_rs::Error::InvalidInput("missing genome FASTA".into()))?,
     );
-    let prefix = PathBuf::from(
+    let index_file = PathBuf::from(
         args.next()
-            .ok_or_else(|| spring_rs::Error::InvalidInput("missing index prefix".into()))?,
+            .ok_or_else(|| spring_rs::Error::InvalidInput("missing index file".into()))?,
     );
     if args.next().is_some() {
         return Err(spring_rs::Error::InvalidInput(
-            "expected genome FASTA and index prefix".into(),
+            "expected genome FASTA and index file".into(),
         ));
     }
-    let _index = spring_rs::build_genome_index(genome, prefix)?;
+    let _index = spring_rs::build_genome_index(genome, index_file)?;
     Ok(())
 }

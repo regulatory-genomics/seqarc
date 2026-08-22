@@ -149,7 +149,6 @@ pub struct CompressionOptions {
 #[derive(Clone, Debug)]
 pub struct AlignmentCompressionOptions {
     pub chunk_pairs: usize,
-    pub include_chunk_index: bool,
     pub threads: usize,
     pub preserve_ids: bool,
     pub preserve_quality: bool,
@@ -161,7 +160,6 @@ impl Default for AlignmentCompressionOptions {
     fn default() -> Self {
         Self {
             chunk_pairs: 250_000,
-            include_chunk_index: true,
             threads: 16,
             preserve_ids: true,
             preserve_quality: true,

@@ -16,8 +16,7 @@ use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
-const VERSION: u32 = 9;
-const CHUNK_HEADER_SIZE: u64 = 44;
+const VERSION: u32 = 10;
 const BATCH_SIZE: usize = 256;
 const PARSE_BATCH_PAIRS: usize = 4096;
 
@@ -82,14 +81,6 @@ struct KeptRun {
     original_start: usize,
     compact_start: usize,
     length: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ChunkIndexEntry {
-    offset: u64,
-    first_pair: u64,
-    pairs: u32,
-    compressed_size: u64,
 }
 
 struct EncodedChunk {
@@ -350,7 +341,7 @@ fn compress_with_index(
     profile.reference_raw_bytes = reference_block.raw_len;
     profile.reference_compressed_bytes = reference_block.block.len() as u64;
     let mut archive = File::create(output)?;
-    let header_size = 9 + 4 + 2 + 8 * 4;
+    let header_size = 9 + 4 + 2 + 8 * 2;
     archive.write_all(MAGIC)?;
     write_u32(&mut archive, VERSION)?;
     let mut flags = 0u16;
@@ -360,29 +351,22 @@ fn compress_with_index(
     if options.preserve_quality {
         flags |= 2;
     }
-    if options.include_chunk_index {
-        flags |= 4;
-    }
     flags |= (id_mode as u16) << 3;
     write_u16(&mut archive, flags)?;
     write_u64(&mut archive, reference_block.block.len() as u64)?;
     let chunk_count_pos = archive.stream_position()?;
     write_u64(&mut archive, 0)?;
-    let index_offset_pos = archive.stream_position()?;
-    write_u64(&mut archive, 0)?;
-    let index_length_pos = archive.stream_position()?;
-    write_u64(&mut archive, 0)?;
     debug_assert_eq!(archive.stream_position()?, header_size as u64);
     archive.write_all(&reference_block.block)?;
 
-    let mut chunks = Vec::new();
+    let mut written_chunks = 0u64;
     let mut replay_pair_count = 0u64;
     progress.set_message("compressing chunks".to_owned());
     let worker_count = options.threads.max(1);
     let (job_tx, job_rx) =
-        crossbeam_channel::bounded::<Result<(usize, u64, Vec<AlignedPair>)>>(worker_count);
+        crossbeam_channel::bounded::<Result<(usize, Vec<AlignedPair>)>>(worker_count);
     let (result_tx, result_rx) =
-        crossbeam_channel::bounded::<Result<(usize, u64, EncodedChunk)>>(worker_count);
+        crossbeam_channel::bounded::<Result<(usize, EncodedChunk)>>(worker_count);
     let reference_for_workers = compact_reference.as_slice();
     std::thread::scope(|scope| -> Result<()> {
         let dispatcher = scope.spawn({
@@ -393,23 +377,21 @@ fn compress_with_index(
                 let spool = ExternalChunk::<SpoolPair>::open(File::open(spool_path)?)
                     .map_err(|error| Error::InvalidFormat(error.to_string()))?;
                 let mut pairs = Vec::with_capacity(options.chunk_pairs.max(1));
-                let mut first_pair = 0u64;
                 let mut chunk_index = 0usize;
                 for item in spool {
                     let item = item.map_err(|error| Error::InvalidFormat(error.to_string()))?;
                     pairs.push(item.into_aligned_pair(&kept_runs)?);
                     if pairs.len() == options.chunk_pairs.max(1) {
                         job_tx
-                            .send(Ok((chunk_index, first_pair, std::mem::take(&mut pairs))))
+                            .send(Ok((chunk_index, std::mem::take(&mut pairs))))
                             .map_err(|_| Error::InvalidInput("chunk workers exited".into()))?;
-                        first_pair += options.chunk_pairs.max(1) as u64;
                         chunk_index += 1;
                         pairs = Vec::with_capacity(options.chunk_pairs.max(1));
                     }
                 }
                 if !pairs.is_empty() {
                     job_tx
-                        .send(Ok((chunk_index, first_pair, pairs)))
+                        .send(Ok((chunk_index, pairs)))
                         .map_err(|_| Error::InvalidInput("chunk workers exited".into()))?;
                 }
                 Ok(())
@@ -422,9 +404,9 @@ fn compress_with_index(
             let result_tx = result_tx.clone();
             workers.push(scope.spawn(move || -> Result<()> {
                 while let Ok(job) = job_rx.recv() {
-                    let result = job.and_then(|(index, first_pair, pairs)| {
+                    let result = job.and_then(|(index, pairs)| {
                         encode_chunk(reference_for_workers, &pairs, options, id_mode)
-                            .map(|chunk| (index, first_pair, chunk))
+                            .map(|chunk| (index, chunk))
                     });
                     if result_tx.send(result).is_err() {
                         break;
@@ -438,9 +420,9 @@ fn compress_with_index(
         let mut pending = BTreeMap::new();
         let mut next_chunk = 0usize;
         while let Ok(result) = result_rx.recv() {
-            let (index, first_pair, chunk) = result?;
-            pending.insert(index, (first_pair, chunk));
-            while let Some((first_pair, chunk)) = pending.remove(&next_chunk) {
+            let (index, chunk) = result?;
+            pending.insert(index, chunk);
+            while let Some(chunk) = pending.remove(&next_chunk) {
                 profile.ids_raw_bytes += chunk.ids_len;
                 profile.qualities_raw_bytes += chunk.qualities_len;
                 profile.records_raw_bytes += chunk.records_len;
@@ -448,8 +430,9 @@ fn compress_with_index(
                 profile.qualities_compressed_bytes += chunk.qualities_compressed_len;
                 profile.records_compressed_bytes += chunk.records_compressed_len;
                 profile.chunks_compressed_bytes += chunk.compressed.len() as u64;
-                chunks.push(write_encoded_chunk(&mut archive, first_pair, chunk)?);
-                replay_pair_count += chunks.last().unwrap().pairs as u64;
+                replay_pair_count += chunk.pairs as u64;
+                write_encoded_chunk(&mut archive, chunk)?;
+                written_chunks += 1;
                 next_chunk += 1;
             }
         }
@@ -467,27 +450,9 @@ fn compress_with_index(
         Ok(())
     })?;
 
-    let (index_offset, index_length) = if options.include_chunk_index {
-        let offset = archive.stream_position()?;
-        archive.write_all(b"SARCIDX\0")?;
-        write_u64(&mut archive, chunks.len() as u64)?;
-        for entry in &chunks {
-            write_u64(&mut archive, entry.offset)?;
-            write_u64(&mut archive, entry.first_pair)?;
-            write_u32(&mut archive, entry.pairs)?;
-            write_u64(&mut archive, entry.compressed_size)?;
-        }
-        (offset, archive.stream_position()? - offset)
-    } else {
-        (0, 0)
-    };
     let end = archive.stream_position()?;
     archive.seek(SeekFrom::Start(chunk_count_pos))?;
-    write_u64(&mut archive, chunks.len() as u64)?;
-    archive.seek(SeekFrom::Start(index_offset_pos))?;
-    write_u64(&mut archive, index_offset)?;
-    archive.seek(SeekFrom::Start(index_length_pos))?;
-    write_u64(&mut archive, index_length)?;
+    write_u64(&mut archive, written_chunks)?;
     archive.seek(SeekFrom::Start(end))?;
     archive.flush()?;
     profile.archive_bytes = end;
@@ -543,17 +508,10 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
     options: &DecompressionOptions,
     mut emit: F,
 ) -> Result<()> {
-    let (flags, id_mode, chunk_count, index_offset, reference, mut position) =
-        read_header(&mut input)?;
+    let (flags, id_mode, chunk_count, reference) = read_header(&mut input)?;
     let preserve_quality = flags & 2 != 0;
-    let has_index = flags & 4 != 0;
     let mut first_pair = 0u64;
     for _ in 0..chunk_count {
-        if has_index && position == index_offset {
-            return Err(Error::InvalidFormat(
-                "chunk count reaches index early".into(),
-            ));
-        }
         let pair_count = read_u32(&mut input)? as usize;
         let compressed_len = usize_from(read_u64(&mut input)?, "chunk compressed size")?;
         let raw_len = usize_from(read_u64(&mut input)?, "chunk uncompressed size")?;
@@ -562,9 +520,6 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
         let records_len = usize_from(read_u64(&mut input)?, "chunk record block size")?;
         let mut compressed = vec![0; compressed_len];
         input.read_exact(&mut compressed)?;
-        position = position
-            .checked_add(CHUNK_HEADER_SIZE + compressed_len as u64)
-            .ok_or_else(|| Error::InvalidFormat("archive position overflow".into()))?;
         let raw = decode_chunk_sections(&compressed, ids_len, qualities_len, records_len)?;
         if raw.len() != raw_len || ids_len + qualities_len + records_len != raw.len() {
             return Err(Error::InvalidFormat(
@@ -603,8 +558,11 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
             .checked_add(pair_count as u64)
             .ok_or_else(|| Error::InvalidFormat("pair count overflow".into()))?;
     }
-    if has_index && position != index_offset {
-        return Err(Error::InvalidFormat("chunk index offset mismatch".into()));
+    let mut trailing = [0; 1];
+    if input.read(&mut trailing)? != 0 {
+        return Err(Error::InvalidFormat(
+            "trailing aligned archive bytes".into(),
+        ));
     }
     Ok(())
 }
@@ -950,12 +908,7 @@ fn encode_chunk(
     })
 }
 
-fn write_encoded_chunk(
-    archive: &mut File,
-    first_pair: u64,
-    chunk: EncodedChunk,
-) -> Result<ChunkIndexEntry> {
-    let offset = archive.stream_position()?;
+fn write_encoded_chunk(archive: &mut File, chunk: EncodedChunk) -> Result<()> {
     write_u32(archive, chunk.pairs)?;
     write_u64(archive, chunk.compressed.len() as u64)?;
     write_u64(archive, chunk.raw_len)?;
@@ -963,12 +916,7 @@ fn write_encoded_chunk(
     write_u64(archive, chunk.qualities_len)?;
     write_u64(archive, chunk.records_len)?;
     archive.write_all(&chunk.compressed)?;
-    Ok(ChunkIndexEntry {
-        offset,
-        first_pair,
-        pairs: chunk.pairs,
-        compressed_size: chunk.compressed.len() as u64,
-    })
+    Ok(())
 }
 
 fn write_id_stream(output: &mut Vec<u8>, pairs: &[AlignedPair], mode: IdMode) -> Result<()> {
@@ -1625,7 +1573,7 @@ fn reconstruct_with_noise(
     Ok(sequence)
 }
 
-fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, u64, u64, Vec<u8>, u64)> {
+fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, u64, Vec<u8>)> {
     let mut magic = [0; 9];
     input.read_exact(&mut magic)?;
     if magic != *MAGIC {
@@ -1638,7 +1586,7 @@ fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, u64, u64, Vec<u8>
         ));
     }
     let flags = read_u16(input)?;
-    if flags & !0x1f != 0 {
+    if flags & !0x1b != 0 {
         return Err(Error::InvalidFormat(
             "unknown alignment archive flags".into(),
         ));
@@ -1646,19 +1594,9 @@ fn read_header<R: Read>(input: &mut R) -> Result<(u16, IdMode, u64, u64, Vec<u8>
     let id_mode = IdMode::from_flags(flags)?;
     let reference_len = usize_from(read_u64(input)?, "reference block")?;
     let chunks = read_u64(input)?;
-    let index_offset = read_u64(input)?;
-    let _index_len = read_u64(input)?;
     let mut reference_block = vec![0; reference_len];
     input.read_exact(&mut reference_block)?;
-    let position = 9 + 4 + 2 + 8 * 4 + reference_len as u64;
-    Ok((
-        flags,
-        id_mode,
-        chunks,
-        index_offset,
-        decode_reference(&reference_block)?,
-        position,
-    ))
+    Ok((flags, id_mode, chunks, decode_reference(&reference_block)?))
 }
 
 fn encode_reference(
@@ -2145,8 +2083,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pre_v9_archives() {
-        for version in [7, 8] {
+    fn rejects_pre_v10_archives() {
+        for version in [7, 8, 9] {
             let mut header = Vec::new();
             header.extend(MAGIC);
             write_u32(&mut header, version).unwrap();
@@ -2156,6 +2094,18 @@ mod tests {
                     if message == "unsupported alignment archive version"
             ));
         }
+    }
+
+    #[test]
+    fn rejects_removed_chunk_index_flag() {
+        let mut header = Vec::new();
+        header.extend(MAGIC);
+        write_u32(&mut header, VERSION).unwrap();
+        write_u16(&mut header, 1 << 2).unwrap();
+        assert!(matches!(
+            read_header(&mut Cursor::new(header)),
+            Err(Error::InvalidFormat(message)) if message == "unknown alignment archive flags"
+        ));
     }
 
     #[test]
@@ -2234,7 +2184,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_record_stream_round_trips_mate_relative_coordinates() {
+    fn v10_record_stream_round_trips_mate_relative_coordinates() {
         let reference =
             b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
         let first_sequence = reference[10..30].to_vec();

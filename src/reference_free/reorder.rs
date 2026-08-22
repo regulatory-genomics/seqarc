@@ -1,6 +1,6 @@
 //! Global minimizer ordering and lossless consensus residuals.
 
-use crate::record_store::PairStore;
+use crate::reference_free::record_store::PairStore;
 use crate::{Error, ReadRecord, ReorderOptions, Result};
 use bed_utils::extsort::ExternalSorterBuilder;
 use rkyv::{Archive, Deserialize, Serialize};

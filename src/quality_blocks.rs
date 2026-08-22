@@ -1,4 +1,5 @@
 use crate::{Error, Result};
+use std::io::Read;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockMode {
@@ -427,6 +428,57 @@ pub(crate) fn encode_blocks_bytes(qualities: &[&[u8]], block_records: usize) -> 
     Ok(encoded)
 }
 
+/// Encode quality rows as self-describing blocks without an outer block-count
+/// or block-size limit. The caller supplies the enclosing byte boundary.
+pub(crate) fn encode_stream_bytes(qualities: &[&[u8]]) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    let mut start = 0;
+    while start < qualities.len() {
+        let width = qualities[start].len();
+        let end = qualities[start..]
+            .iter()
+            .position(|quality| quality.len() != width)
+            .map_or(qualities.len(), |offset| start + offset);
+        let values = qualities[start..end]
+            .iter()
+            .map(|quality| (*quality).to_vec())
+            .collect::<Vec<_>>();
+        write_block(&mut encoded, &encode_block(&values)?)?;
+        start = end;
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn decode_stream_bytes(input: &[u8], expected: usize) -> Result<Vec<Vec<u8>>> {
+    let mut input = std::io::Cursor::new(input);
+    let mut values = Vec::with_capacity(expected);
+    while input.position() < input.get_ref().len() as u64 {
+        let mode = match read_u8_reader(&mut input)? {
+            0 => BlockMode::Raw,
+            1 => BlockMode::DensePacked,
+            other => {
+                return Err(Error::InvalidFormat(format!(
+                    "unknown quality block mode {other}"
+                )))
+            }
+        };
+        let width = read_u32_reader(&mut input)?;
+        let records = read_u32_reader(&mut input)? as usize;
+        let alphabet_len = read_u16_reader(&mut input)? as usize;
+        let mut alphabet = vec![0; alphabet_len];
+        input.read_exact(&mut alphabet)?;
+        let body_len = usize::try_from(read_u64_reader(&mut input)?)
+            .map_err(|_| Error::InvalidFormat("quality block body too large".into()))?;
+        let mut body = vec![0; body_len];
+        input.read_exact(&mut body)?;
+        values.extend(decode_block(mode, width, records, &alphabet, &body)?);
+    }
+    if values.len() != expected {
+        return Err(Error::InvalidFormat("quality block count mismatch".into()));
+    }
+    Ok(values)
+}
+
 fn decode_block(
     mode: BlockMode,
     width: u32,
@@ -542,6 +594,13 @@ mod tests {
         blocks.write_to(&mut buf).unwrap();
         let decoded = QualityBlocks::decode(&buf).unwrap();
         assert_eq!(decoded, qualities);
+    }
+
+    #[test]
+    fn quality_stream_round_trips_variable_width_rows() {
+        let values = vec![b"IIII".as_slice(), b"JJJJ".as_slice(), b"K".as_slice()];
+        let encoded = encode_stream_bytes(&values).unwrap();
+        assert_eq!(decode_stream_bytes(&encoded, values.len()).unwrap(), values);
     }
 
     #[test]

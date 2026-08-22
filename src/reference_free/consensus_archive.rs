@@ -1,11 +1,13 @@
-use crate::external_bytes::{copy_to as copy_external_bytes, Lz4ByteWriter};
 use crate::packed_sequence::PackedSequence;
+use crate::reference_free::external_bytes::{copy_to as copy_external_bytes, Lz4ByteWriter};
 #[cfg(test)]
-use crate::record_store::PairStore;
+use crate::reference_free::record_store::PairStore;
 #[cfg(test)]
-use crate::record_store::StoreStats;
-use crate::reorder::{ConsensusCluster, ConsensusRead};
-use crate::sequence_spool::{SequenceSpoolReader, SequenceSpoolWriter, SortableRead};
+use crate::reference_free::record_store::StoreStats;
+use crate::reference_free::reorder::{ConsensusCluster, ConsensusRead};
+#[cfg(test)]
+use crate::reference_free::sequence_spool::SequenceSpoolReader;
+use crate::reference_free::sequence_spool::{SequenceSpoolWriter, SortableRead};
 use crate::{
     ArchiveRecords, CompressionMetadata, CompressionOptions, CompressionProfile,
     DecompressionOptions, Error, ReadRecord, Result,
@@ -481,7 +483,7 @@ fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>
             } else {
                 read_consensus_read_stream(payload, original_id)?
             };
-            crate::reorder::decode_consensus_read(
+            crate::reference_free::reorder::decode_consensus_read(
                 &ConsensusCluster {
                     reference: reference.clone(),
                     reads: Vec::new(),
@@ -1074,8 +1076,18 @@ pub fn write_reordered_store_profiled<W: Write>(
         std::fs::create_dir_all(temp_dir)?;
         let assignment_start = std::time::Instant::now();
         let assignments = [
-            crate::reorder::write_store_assignments(store, &options.reorder, temp_dir, 0)?,
-            crate::reorder::write_store_assignments(store, &options.reorder, temp_dir, 1)?,
+            crate::reference_free::reorder::write_store_assignments(
+                store,
+                &options.reorder,
+                temp_dir,
+                0,
+            )?,
+            crate::reference_free::reorder::write_store_assignments(
+                store,
+                &options.reorder,
+                temp_dir,
+                1,
+            )?,
         ];
         let assignment_time = assignment_start.elapsed();
         let assignment_bytes = assignments.iter().try_fold(0u64, |total, path| {
@@ -1193,6 +1205,7 @@ pub fn write_reordered_store_profiled<W: Write>(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn write_reordered_store_profiled_v2<W: Write>(
     store: &mut PairStore,
     mut output: W,
@@ -1235,7 +1248,7 @@ fn write_reordered_store_profiled_v2<W: Write>(
     Ok((metadata, profile))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn write_prepared_profiled<W: Write>(
     prepared: PreparedRecords,
     output: W,
@@ -1429,7 +1442,7 @@ pub(crate) fn write_prepared_profiled<W: Write>(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn write_prepared_profiled_v2<W: Write>(
     prepared: PreparedRecords,
     mut output: W,
@@ -2083,6 +2096,7 @@ fn write_store_clusters<W: Write>(
     Ok(stats)
 }
 
+#[allow(dead_code)]
 struct ConsensusBucket {
     index: usize,
     multi_cluster_count: u32,
@@ -2165,11 +2179,15 @@ impl SingletonSequenceSink for StoredColumn {
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug)]
+#[cfg(test)]
+#[allow(dead_code)]
 struct SingletonRecord {
     id: u64,
     sequence: PackedSequence,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 struct SingletonRecordWriter {
     path: std::path::PathBuf,
     builder: ExternalChunkBuilder<SingletonRecord>,
@@ -2180,6 +2198,8 @@ struct SingletonRecordWriter {
     clean_records: usize,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl SingletonRecordWriter {
     fn create(temp_dir: &Path, mate: usize) -> Result<Self> {
         let path = temp_dir.join(format!("records.{mate}.singletons.lz4"));
@@ -2282,6 +2302,8 @@ impl SingletonRecordWriter {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn for_each_singleton<F>(path: &Path, expected_count: usize, mut visit: F) -> Result<()>
 where
     F: FnMut(SingletonRecord) -> Result<()>,
@@ -2574,7 +2596,7 @@ fn produce_consensus_buckets(
 ) -> Result<()> {
     let mut bucket = Vec::with_capacity(limit);
     let mut index = 0usize;
-    for assignment in crate::reorder::AssignmentReader::open(assignments)? {
+    for assignment in crate::reference_free::reorder::AssignmentReader::open(assignments)? {
         let assignment = assignment?;
         if bucket.len() == limit {
             permit_rx.recv().map_err(|_| {
@@ -3055,6 +3077,7 @@ fn reverse_complement_in_place(sequence: &mut [u8]) {
 type SingletonSequence = (u64, PackedSequence);
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct OrderEntry {
     cluster: u32,
     read: u32,
@@ -3149,7 +3172,8 @@ fn write_group_descriptor<W: Write>(writer: &mut W, group: &ConsensusCluster) ->
     let singleton = group.reads.len() == 1;
     writer.write_all(&[singleton as u8])?;
     if singleton {
-        let sequence = crate::reorder::decode_consensus_read(group, &group.reads[0])?;
+        let sequence =
+            crate::reference_free::reorder::decode_consensus_read(group, &group.reads[0])?;
         put_varint(writer, zigzag_delta(group.reads[0].original_id, 0))?;
         write_packed_sequence(writer, &PackedSequence::try_from_bytes(&sequence)?)?;
         return Ok(());
@@ -3173,6 +3197,7 @@ fn write_group_descriptor<W: Write>(writer: &mut W, group: &ConsensusCluster) ->
     Ok(())
 }
 
+#[cfg(test)]
 fn copy_group_descriptors<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,
@@ -3508,6 +3533,7 @@ fn read_packed_sequence<R: Read>(reader: &mut R) -> Result<PackedSequence> {
     PackedSequence::from_encoded(length, mode[0] != 0, bytes)
 }
 
+#[cfg(test)]
 fn write_group_metadata<W: Write>(
     output: &mut W,
     group_ids: &[u64],
@@ -3531,6 +3557,7 @@ fn write_group_metadata<W: Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_metadata_values<'a, W: Write, I: Iterator<Item = Result<&'a [u8]>>>(
     output: &mut W,
     values: I,
@@ -3607,22 +3634,9 @@ fn write_metadata_values<'a, W: Write, I: Iterator<Item = Result<&'a [u8]>>>(
     Ok(())
 }
 
+#[cfg(test)]
 const QUALITY_METADATA_PACKED: u8 = 1;
-const QUALITY_METADATA_BLOCK_RECORDS: usize = 4096;
-
-fn write_quality_metadata<'a, W: Write, I: Iterator<Item = Result<&'a [u8]>>>(
-    output: &mut W,
-    values: I,
-) -> Result<()> {
-    let values = values.collect::<Result<Vec<_>>>()?;
-    let encoded =
-        crate::quality_blocks::encode_blocks_bytes(&values, QUALITY_METADATA_BLOCK_RECORDS)?;
-    output.write_all(&[QUALITY_METADATA_PACKED])?;
-    put_varint(output, encoded.len() as u64)?;
-    output.write_all(&encoded)?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn read_group_metadata<R: Read>(
     reader: &mut ChecksummedReader<'_, R>,
     count: u64,
@@ -3754,6 +3768,7 @@ struct PreparedIdWriter {
     data_len: u64,
 }
 
+#[allow(dead_code)]
 struct PreparedIdColumn {
     path: std::path::PathBuf,
     count: u64,
@@ -3808,6 +3823,7 @@ impl PreparedIdWriter {
     }
 }
 
+#[allow(dead_code)]
 impl PreparedIdColumn {
     fn write_to<W: Write>(self, payload: &mut W, enabled: bool, count: usize) -> Result<()> {
         if !enabled {
@@ -3882,6 +3898,7 @@ struct PreparedQualityWriter {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct PreparedQuality {
     path: std::path::PathBuf,
     block_count: u32,
@@ -3995,7 +4012,7 @@ pub(crate) fn prepare_pair(
     let records = [first, second];
     let mut reads = Vec::with_capacity(2);
     for record in &records {
-        let assignment = crate::reorder::primary_minimizer(
+        let assignment = crate::reference_free::reorder::primary_minimizer(
             &record.sequence,
             options.reorder.kmer_size,
             options.reorder.window_size,
@@ -4030,6 +4047,7 @@ pub(crate) struct PreparedRecords {
     count: u64,
 }
 
+#[allow(dead_code)]
 pub(crate) struct PreparedMetadata {
     columns: [PreparedColumn; 2],
     id_pattern: PairedIdPattern,
@@ -4266,6 +4284,7 @@ fn write_store_record_columns<W: Write + Seek>(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn write_prepared_record_columns<W: Write>(
     payload: &mut W,
     columns: PreparedColumn,
@@ -4513,6 +4532,7 @@ fn create_temporary_column(path: &Path) -> Result<std::fs::File> {
         .open(path)?)
 }
 
+#[allow(dead_code)]
 fn checksum_file<R: Read>(mut reader: R) -> Result<u32> {
     let mut hash = 2166136261u32;
     let mut buffer = [0u8; 1024 * 1024];
@@ -4644,11 +4664,6 @@ impl<'a, R: Read> ChecksummedReader<'a, R> {
         self.read_exact(&mut b)?;
         Ok(u16::from_le_bytes(b))
     }
-    fn u32(&mut self) -> Result<u32> {
-        let mut b = [0; 4];
-        self.read_exact(&mut b)?;
-        Ok(u32::from_le_bytes(b))
-    }
     fn u64(&mut self) -> Result<u64> {
         let mut b = [0; 8];
         self.read_exact(&mut b)?;
@@ -4667,12 +4682,6 @@ impl<'a, R: Read> ChecksummedReader<'a, R> {
             }
         }
         Err(Error::InvalidFormat("unterminated RS4 varint".into()))
-    }
-    fn bytes_u64(&mut self) -> Result<Vec<u8>> {
-        let len = usize_from(self.u64()?, "field")?;
-        let mut value = vec![0; len];
-        self.read_exact(&mut value)?;
-        Ok(value)
     }
     fn finish(mut self, expected: u32) -> Result<()> {
         let mut buffer = [0u8; 64 * 1024];
@@ -4706,12 +4715,6 @@ fn read_one<R: Read>(reader: &mut R) -> Result<u8> {
     let mut b = [0];
     reader.read_exact(&mut b)?;
     Ok(b[0])
-}
-fn read_bytes_u64<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
-    let len = usize_from(read_u64(reader)?, "field")?;
-    let mut value = vec![0; len];
-    reader.read_exact(&mut value)?;
-    Ok(value)
 }
 fn read_varint<R: Read>(reader: &mut R) -> Result<u64> {
     let mut value = 0u64;
@@ -4782,10 +4785,12 @@ fn read_consensus_read_stream<R: Read>(
     })
 }
 
+#[allow(dead_code)]
 struct Cursor<'a> {
     data: &'a [u8],
     position: usize,
 }
+#[allow(dead_code)]
 impl<'a> Cursor<'a> {
     fn new(data: &'a [u8]) -> Self {
         Self { data, position: 0 }
@@ -5430,7 +5435,8 @@ mod tests {
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].reads.len(), 3);
         for read in &clusters[0].reads {
-            let decoded = crate::reorder::decode_consensus_read(&clusters[0], read).unwrap();
+            let decoded =
+                crate::reference_free::reorder::decode_consensus_read(&clusters[0], read).unwrap();
             assert_eq!(
                 decoded,
                 store.read_first(read.original_id).unwrap().sequence
@@ -5468,7 +5474,7 @@ mod tests {
         assert_eq!(clusters[0].reads[1].offset, 50);
         for read in &clusters[0].reads {
             assert_eq!(
-                crate::reorder::decode_consensus_read(&clusters[0], read).unwrap(),
+                crate::reference_free::reorder::decode_consensus_read(&clusters[0], read).unwrap(),
                 if read.original_id == 0 {
                     first.sequence.clone()
                 } else {
@@ -5504,7 +5510,7 @@ mod tests {
             ..crate::ReorderOptions::default()
         };
         for mate in 0..2 {
-            let assignments = crate::reorder::write_store_assignments(
+            let assignments = crate::reference_free::reorder::write_store_assignments(
                 &mut store,
                 &options,
                 directory.path(),

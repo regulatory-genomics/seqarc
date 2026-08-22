@@ -1,5 +1,5 @@
 use crate::packed_sequence::PackedSequence;
-use crate::quality_blocks::{encode_blocks_bytes, QualityBlockReader};
+use crate::quality_blocks::{decode_stream_bytes, encode_stream_bytes};
 use crate::{
     apply_quality, gzip_reader, ArchiveRecords, CompressionMetadata, DecompressionOptions, Error,
     FastxReader, Format, GenomeAlignment, PairedRecordSink, ReadRecord, Result,
@@ -13,9 +13,10 @@ use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 9] = b"SPRNG-AL2";
-const VERSION: u32 = 4;
+const VERSION: u32 = 6;
 const CHUNK_HEADER_SIZE: u64 = 44;
 const BATCH_SIZE: usize = 256;
+const PARSE_BATCH_PAIRS: usize = 4096;
 
 #[derive(Clone, Debug)]
 struct AlignedPair {
@@ -187,62 +188,92 @@ fn compress_with_index(
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let mut mask = ReferenceMask::new(reference.len());
     let mut id_detector = IdModeDetector::new(options.preserve_ids);
-    let mut first = FastxReader::new(
-        BufReader::new(gzip_reader(File::open(input_1)?)),
-        Format::Fastq,
-    );
-    let mut second = FastxReader::new(
-        BufReader::new(gzip_reader(File::open(input_2)?)),
-        Format::Fastq,
-    );
-    let mut pairs = Vec::with_capacity(options.chunk_pairs.max(1));
-    loop {
-        match (first.next(), second.next()) {
-            (None, None) => break,
-            (Some(Ok(mut first)), Some(Ok(mut second))) => {
-                first.validate(true)?;
-                second.validate(true)?;
-                if options.preserve_quality {
-                    apply_quality(&mut first, &options.quality_mode);
-                    apply_quality(&mut second, &options.quality_mode);
+    let input_1 = input_1.as_ref().to_path_buf();
+    let input_2 = input_2.as_ref().to_path_buf();
+    let mapper_options = options.clone();
+    let (parse_tx, parse_rx) = crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(4);
+    let (mapped_tx, mapped_rx) = crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(4);
+    let result = std::thread::scope(|scope| -> Result<()> {
+        let producer_tx = parse_tx.clone();
+        let producer = scope.spawn(move || -> Result<()> {
+            let mut first = FastxReader::new(
+                BufReader::new(gzip_reader(File::open(input_1)?)),
+                Format::Fastq,
+            );
+            let mut second = FastxReader::new(
+                BufReader::new(gzip_reader(File::open(input_2)?)),
+                Format::Fastq,
+            );
+            let mut pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
+            loop {
+                match (first.next(), second.next()) {
+                    (None, None) => break,
+                    (Some(Ok(mut first)), Some(Ok(mut second))) => {
+                        first.validate(true)?;
+                        second.validate(true)?;
+                        if mapper_options.preserve_quality {
+                            apply_quality(&mut first, &mapper_options.quality_mode);
+                            apply_quality(&mut second, &mapper_options.quality_mode);
+                        }
+                        pairs.push(AlignedPair {
+                            first,
+                            second,
+                            first_hit: None,
+                            second_hit: None,
+                        });
+                        if pairs.len() == PARSE_BATCH_PAIRS {
+                            producer_tx
+                                .send(Ok(std::mem::take(&mut pairs)))
+                                .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
+                            pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
+                        }
+                    }
+                    (None, Some(_)) | (Some(_), None) => {
+                        return Err(Error::InvalidInput(
+                            "paired streams have different record counts".into(),
+                        ));
+                    }
+                    (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
                 }
-                id_detector.observe(&first.id, &second.id);
-                pairs.push(AlignedPair {
-                    first,
-                    second,
-                    first_hit: None,
-                    second_hit: None,
+            }
+            if !pairs.is_empty() {
+                producer_tx
+                    .send(Ok(pairs))
+                    .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
+            }
+            Ok(())
+        });
+        drop(parse_tx);
+
+        let mapper_tx = mapped_tx.clone();
+        let mapper_progress = progress.clone();
+        let mapper = scope.spawn(move || -> Result<()> {
+            while let Ok(batch) = parse_rx.recv() {
+                let mapped = batch.and_then(|mut pairs| {
+                    map_pairs(&index, &mut pairs, &mapping_pool, &mapper_progress)?;
+                    Ok(pairs)
                 });
-                if pairs.len() == options.chunk_pairs.max(1) {
-                    align_and_spool(
-                        &index,
-                        &mut pairs,
-                        &mapping_pool,
-                        &progress,
-                        &mut mask,
-                        &mut spool_builder,
-                    )?;
-                    pairs.clear();
+                if mapper_tx.send(mapped).is_err() {
+                    break;
                 }
             }
-            (None, Some(_)) | (Some(_), None) => {
-                return Err(Error::InvalidInput(
-                    "paired streams have different record counts".into(),
-                ));
-            }
-            (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
+            Ok(())
+        });
+        drop(mapped_tx);
+
+        while let Ok(batch) = mapped_rx.recv() {
+            let pairs = batch?;
+            spool_mapped_pairs(&pairs, &mut id_detector, &mut mask, &mut spool_builder)?;
         }
-    }
-    if !pairs.is_empty() {
-        align_and_spool(
-            &index,
-            &mut pairs,
-            &mapping_pool,
-            &progress,
-            &mut mask,
-            &mut spool_builder,
-        )?;
-    }
+        producer
+            .join()
+            .map_err(|_| Error::InvalidInput("FASTQ producer panicked".into()))??;
+        mapper
+            .join()
+            .map_err(|_| Error::InvalidInput("mapping worker panicked".into()))??;
+        Ok(())
+    });
+    result?;
 
     let spool_chunk = spool_builder
         .finish()
@@ -448,24 +479,37 @@ fn decode_paired<R: Read, F: FnMut(u64, ReadRecord, ReadRecord) -> Result<()>>(
     Ok(())
 }
 
-fn align_and_spool(
+fn map_pairs(
     index: &Index,
     pairs: &mut [AlignedPair],
     mapping_pool: &rayon::ThreadPool,
     progress: &ProgressBar,
-    mask: &mut ReferenceMask,
-    spool_builder: &mut ExternalChunkBuilder<SpoolPair>,
 ) -> Result<()> {
     let first_hits = map_mate(index, pairs, 0, mapping_pool, progress)?;
     let second_hits = map_mate(index, pairs, 1, mapping_pool, progress)?;
     for ((pair, first_hit), second_hit) in pairs.iter_mut().zip(first_hits).zip(second_hits) {
-        if let Some(hit) = &first_hit {
+        pair.first_hit = first_hit;
+        pair.second_hit = second_hit;
+    }
+    Ok(())
+}
+
+fn spool_mapped_pairs(
+    pairs: &[AlignedPair],
+    id_detector: &mut IdModeDetector,
+    mask: &mut ReferenceMask,
+    spool_builder: &mut ExternalChunkBuilder<SpoolPair>,
+) -> Result<()> {
+    for pair in pairs {
+        id_detector.observe(&pair.first.id, &pair.second.id);
+        if let Some(hit) = &pair.first_hit {
             mask.mark_hit(hit)?;
         }
-        if let Some(hit) = &second_hit {
+        if let Some(hit) = &pair.second_hit {
             mask.mark_hit(hit)?;
         }
-        let spool_pair = SpoolPair::from_records(pair, first_hit, second_hit)?;
+        let spool_pair =
+            SpoolPair::from_records(pair, pair.first_hit.clone(), pair.second_hit.clone())?;
         spool_builder
             .add(spool_pair)
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
@@ -782,7 +826,7 @@ fn write_quality_stream(
             })
             .collect::<Vec<_>>();
         let block = if options.preserve_quality {
-            encode_blocks_bytes(&values, 4096)?
+            encode_stream_bytes(&values)?
         } else {
             Vec::new()
         };
@@ -877,15 +921,21 @@ fn encode_record(
             .ok_or_else(|| Error::InvalidInput("alignment offset overflow".into()))?;
         *previous_start = hit.start;
         let cigar = effective_cigar(hit, record.sequence.len())?;
-        let noise = encode_noise(&record.sequence, hit, &cigar, reference)?;
         write_varint(output, zigzag_encode(delta))?;
         write_varint(output, cigar.len() as u64)?;
+        for chunk in cigar.chunks(2) {
+            let first = cigar_code(chunk[0].op)? << 4;
+            let second = if chunk.len() == 2 {
+                cigar_code(chunk[1].op)?
+            } else {
+                0
+            };
+            write_u8(output, first | second)?;
+        }
         for op in &cigar {
-            write_u8(output, cigar_code(op.op)? << 4)?;
             write_varint(output, op.len as u64)?;
         }
-        write_varint(output, noise.len() as u64)?;
-        output.extend(noise);
+        encode_noise(output, &record.sequence, hit, &cigar, reference)?;
     } else {
         write_packed(output, &record.sequence)?;
     }
@@ -1036,16 +1086,10 @@ fn decode_qualities(
         let mut block = vec![0; length];
         cursor.read_exact(&mut block)?;
         if preserve {
-            let mut reader = QualityBlockReader::new(Cursor::new(block))?;
-            let mut values = Vec::new();
-            while let Some(part) = reader.next()? {
-                values.extend(part.into_iter().map(Some));
-            }
-            let rest = reader.finish()?;
-            if rest.position() != rest.get_ref().len() as u64 || values.len() != count {
-                return Err(Error::InvalidFormat("quality block count mismatch".into()));
-            }
-            result[mate] = values;
+            result[mate] = decode_stream_bytes(&block, count)?
+                .into_iter()
+                .map(Some)
+                .collect();
         } else if length != 0 {
             return Err(Error::InvalidFormat("unexpected quality bytes".into()));
         }
@@ -1063,22 +1107,27 @@ fn decode_mapped_body(
     is_reverse: bool,
 ) -> Result<Vec<u8>> {
     let count = usize_from(read_varint(input)?, "CIGAR count")?;
+    let mut op_codes = Vec::with_capacity(count);
+    for index in 0..count.div_ceil(2) {
+        let packed = read_u8(input)?;
+        op_codes.push(packed >> 4);
+        if index * 2 + 1 < count {
+            op_codes.push(packed & 0x0f);
+        }
+    }
     let mut cigar = Vec::with_capacity(count);
-    for _ in 0..count {
+    for op in op_codes {
         cigar.push(CigarOp {
-            op: cigar_kind(read_u8(input)? >> 4)?,
+            op: cigar_kind(op)?,
             len: u32::try_from(read_varint(input)?)
                 .map_err(|_| Error::InvalidFormat("CIGAR length too large".into()))?,
         });
     }
-    let length = usize_from(read_varint(input)?, "noise")?;
-    let mut noise = vec![0; length];
-    input.read_exact(&mut noise)?;
     let mut sequence = reconstruct_with_noise(
+        input,
         reference,
         nonnegative_usize(start, "alignment start")?,
         &cigar,
-        &noise,
     )?;
     if is_reverse {
         reverse_complement(&mut sequence);
@@ -1119,18 +1168,18 @@ fn effective_cigar(hit: &GenomeAlignment, read_len: usize) -> Result<Vec<CigarOp
 }
 
 fn encode_noise(
+    output: &mut Vec<u8>,
     sequence: &[u8],
     hit: &GenomeAlignment,
     cigar: &[CigarOp],
     reference: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     let mut oriented = sequence.to_vec();
     if hit.is_reverse {
         reverse_complement(&mut oriented);
     }
     let mut ref_pos = nonnegative_usize(hit.start, "alignment start")?;
     let mut query_pos = 0usize;
-    let mut edits = Vec::new();
     for op in cigar {
         let len = op.len as usize;
         match op.op {
@@ -1144,14 +1193,18 @@ fn encode_noise(
                 if ref_end > reference.len() || query_end > oriented.len() {
                     return Err(Error::InvalidFormat("CIGAR exceeds bounds".into()));
                 }
+                let mut mismatches = Vec::new();
                 for offset in 0..len {
                     if reference[ref_pos + offset] != oriented[query_pos + offset] {
-                        edits.push((
-                            0,
-                            (query_pos + offset) as u32,
-                            vec![oriented[query_pos + offset]],
-                        ));
+                        mismatches.push((offset, oriented[query_pos + offset]));
                     }
+                }
+                write_varint(output, mismatches.len() as u64)?;
+                let mut previous = 0usize;
+                for (position, base) in mismatches {
+                    write_varint(output, (position - previous) as u64)?;
+                    output.push(base);
+                    previous = position;
                 }
                 ref_pos = ref_end;
                 query_pos = query_end;
@@ -1163,7 +1216,7 @@ fn encode_noise(
                 if end > oriented.len() {
                     return Err(Error::InvalidFormat("CIGAR exceeds query bounds".into()));
                 }
-                edits.push((1, query_pos as u32, oriented[query_pos..end].to_vec()));
+                output.extend(&oriented[query_pos..end]);
                 query_pos = end;
             }
             CigarOpKind::Del | CigarOpKind::Skip => {
@@ -1185,34 +1238,14 @@ fn encode_noise(
     if query_pos != oriented.len() {
         return Err(Error::InvalidFormat("CIGAR does not consume query".into()));
     }
-    let mut output = Vec::new();
-    write_varint(&mut output, edits.len() as u64)?;
-    let mut previous_position = 0u32;
-    for (kind, position, bases) in edits {
-        write_u8(&mut output, kind)?;
-        write_varint(
-            &mut output,
-            position
-                .checked_sub(previous_position)
-                .ok_or_else(|| Error::InvalidInput("noise position order overflow".into()))?
-                as u64,
-        )?;
-        previous_position = position;
-        if kind == 0 {
-            output.push(bases[0]);
-        } else {
-            write_varint(&mut output, bases.len() as u64)?;
-            output.extend(bases);
-        }
-    }
-    Ok(output)
+    Ok(())
 }
 
 fn reconstruct_with_noise(
+    input: &mut Cursor<Vec<u8>>,
     reference: &[u8],
     start: usize,
     cigar: &[CigarOp],
-    noise: &[u8],
 ) -> Result<Vec<u8>> {
     let mut sequence = Vec::new();
     let mut ref_pos = start;
@@ -1228,10 +1261,37 @@ fn reconstruct_with_noise(
                         "CIGAR exceeds reference bounds".into(),
                     ));
                 }
+                let sequence_start = sequence.len();
                 sequence.extend_from_slice(&reference[ref_pos..end]);
+                let mismatch_count = usize_from(read_varint(input)?, "mismatch count")?;
+                let mut previous = 0usize;
+                for _ in 0..mismatch_count {
+                    let position = previous
+                        .checked_add(usize_from(read_varint(input)?, "mismatch position")?)
+                        .ok_or_else(|| Error::InvalidFormat("mismatch position overflow".into()))?;
+                    if position >= len {
+                        return Err(Error::InvalidFormat(
+                            "mismatch position out of bounds".into(),
+                        ));
+                    }
+                    sequence[sequence_start + position] = read_u8(input)?;
+                    previous = position;
+                }
                 ref_pos = end;
             }
-            CigarOpKind::Ins | CigarOpKind::SoftClip => sequence.resize(sequence.len() + len, b'N'),
+            CigarOpKind::Ins | CigarOpKind::SoftClip => {
+                let end = sequence.len().checked_add(len).ok_or_else(|| {
+                    Error::InvalidFormat("inserted sequence length overflow".into())
+                })?;
+                let mut bases = vec![0; len];
+                input.read_exact(&mut bases)?;
+                sequence.extend_from_slice(&bases);
+                if sequence.len() != end {
+                    return Err(Error::InvalidFormat(
+                        "inserted sequence length mismatch".into(),
+                    ));
+                }
+            }
             CigarOpKind::Del | CigarOpKind::Skip => {
                 ref_pos = ref_pos
                     .checked_add(len)
@@ -1247,39 +1307,6 @@ fn reconstruct_with_noise(
                 return Err(Error::InvalidFormat("unsupported CIGAR operation".into()))
             }
         }
-    }
-    let mut input = Cursor::new(noise.to_vec());
-    let mut previous_position = 0usize;
-    for _ in 0..read_varint(&mut input)? {
-        let kind = read_u8(&mut input)?;
-        let position = previous_position
-            .checked_add(usize_from(read_varint(&mut input)?, "noise position")?)
-            .ok_or_else(|| Error::InvalidFormat("noise position overflow".into()))?;
-        previous_position = position;
-        match kind {
-            0 => {
-                if position >= sequence.len() {
-                    return Err(Error::InvalidFormat("noise position out of bounds".into()));
-                }
-                sequence[position] = read_u8(&mut input)?;
-            }
-            1 => {
-                let length = usize_from(read_varint(&mut input)?, "noise length")?;
-                let mut bases = vec![0; length];
-                input.read_exact(&mut bases)?;
-                let end = position
-                    .checked_add(bases.len())
-                    .ok_or_else(|| Error::InvalidFormat("noise range overflow".into()))?;
-                if end > sequence.len() {
-                    return Err(Error::InvalidFormat("noise range out of bounds".into()));
-                }
-                sequence[position..end].copy_from_slice(&bases);
-            }
-            _ => return Err(Error::InvalidFormat("unknown noise operation".into())),
-        }
-    }
-    if input.position() != input.get_ref().len() as u64 {
-        return Err(Error::InvalidFormat("trailing noise bytes".into()));
     }
     Ok(sequence)
 }
@@ -1616,5 +1643,44 @@ mod tests {
         let encoded =
             encode_reference(reference, &crate::AlignmentCompressionOptions::default()).unwrap();
         assert_eq!(decode_reference(&encoded).unwrap(), reference);
+    }
+
+    #[test]
+    fn id_modes_round_trip_losslessly() {
+        for (mode, first_id, second_id, expected_first, expected_second) in [
+            (
+                IdMode::IdenticalMates,
+                b"read".to_vec(),
+                b"read".to_vec(),
+                b"read".to_vec(),
+                b"read".to_vec(),
+            ),
+            (
+                IdMode::SlashMate,
+                b"read/1".to_vec(),
+                b"read/2".to_vec(),
+                b"read/1".to_vec(),
+                b"read/2".to_vec(),
+            ),
+            (
+                IdMode::Independent,
+                b"first".to_vec(),
+                b"second".to_vec(),
+                b"first".to_vec(),
+                b"second".to_vec(),
+            ),
+        ] {
+            let pair = AlignedPair {
+                first: ReadRecord::new(first_id, b"A".to_vec(), None),
+                second: ReadRecord::new(second_id, b"A".to_vec(), None),
+                first_hit: None,
+                second_hit: None,
+            };
+            let mut encoded = Vec::new();
+            write_id_stream(&mut encoded, &[pair], mode).unwrap();
+            let decoded = decode_ids(&encoded, 1, mode).unwrap();
+            assert_eq!(decoded[0][0], expected_first);
+            assert_eq!(decoded[1][0], expected_second);
+        }
     }
 }

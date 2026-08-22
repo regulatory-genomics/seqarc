@@ -2,10 +2,13 @@ use crate::packed_sequence::PackedSequence;
 use crate::{Error, Result};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::{BufReader, Read};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"SPRSP001";
+#[cfg(test)]
 const HEADER_LEN: u64 = 16;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -73,6 +76,7 @@ impl SequenceSpoolWriter {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct SequenceSpoolReader {
     file: BufReader<File>,
     file_len: u64,
@@ -82,6 +86,7 @@ pub(crate) struct SequenceSpoolReader {
     failed: bool,
 }
 
+#[cfg(test)]
 impl SequenceSpoolReader {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
@@ -165,6 +170,7 @@ impl SequenceSpoolReader {
     }
 }
 
+#[cfg(test)]
 impl Iterator for SequenceSpoolReader {
     type Item = Result<SortableRead>;
 

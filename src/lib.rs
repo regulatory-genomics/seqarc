@@ -5,17 +5,11 @@
 //! without a command-line interface.
 
 mod alignment_archive;
-#[allow(dead_code)]
-mod consensus_archive;
-mod external_bytes;
 mod fastx;
 mod packed_sequence;
 #[allow(dead_code)]
 mod quality_blocks;
-mod record_store;
-pub mod reorder;
-#[allow(dead_code)]
-mod sequence_spool;
+mod reference_free;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -26,8 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub use fastx::{gzip_reader, gzip_writer, FastxReader, FastxWriter, Format};
-pub use record_store::{PairStore, StoreStats};
-pub use reorder::{
+pub use reference_free::record_store::{PairStore, StoreStats};
+pub use reference_free::reorder;
+pub use reference_free::reorder::{
     canonical_minimizers, decode_consensus_read, ConsensusCluster, ConsensusRead, MinimizerEntry,
     OrderedRead,
 };
@@ -325,7 +320,7 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     temp_dir: impl AsRef<Path>,
 ) -> Result<(CompressionMetadata, CompressionProfile)> {
     let temp_root = temp_dir.as_ref();
-    reorder::validate_options(&options.reorder)?;
+    reference_free::reorder::validate_options(&options.reorder)?;
     let output = output.as_ref();
     let partial_output =
         output.with_extension(match output.extension().and_then(|value| value.to_str()) {
@@ -335,7 +330,8 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     let mut guard = CompressionGuard::new(create_workspace(temp_root)?, partial_output);
     let temp_dir = guard.workspace().to_path_buf();
     let ingest_start = std::time::Instant::now();
-    let mut prepared = consensus_archive::PreparedRecordsBuilder::create_metadata(&temp_dir)?;
+    let mut prepared =
+        reference_free::consensus_archive::PreparedRecordsBuilder::create_metadata(&temp_dir)?;
     let input_1 = input_1.as_ref().to_path_buf();
     let input_2 = input_2.as_ref().to_path_buf();
     let workers = options.threads.max(1);
@@ -343,18 +339,18 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     let (job_tx, job_rx) =
         crossbeam_channel::bounded::<(usize, Vec<(u64, ReadRecord, ReadRecord)>)>(queue_capacity);
     let (result_tx, result_rx) = crossbeam_channel::bounded::<
-        Result<(usize, Vec<consensus_archive::PreparedPair>)>,
+        Result<(usize, Vec<reference_free::consensus_archive::PreparedPair>)>,
     >(queue_capacity);
     let (sort_0_tx, sort_0_rx) = crossbeam_channel::bounded(queue_capacity);
     let (sort_1_tx, sort_1_rx) = crossbeam_channel::bounded(queue_capacity);
     let mut pending = BTreeMap::new();
     let mut next_batch = 0usize;
     let sections = std::thread::scope(
-        |scope| -> Result<[consensus_archive::PreparedMateSection; 2]> {
+        |scope| -> Result<[reference_free::consensus_archive::PreparedMateSection; 2]> {
             let sort_options = options.clone();
             let sort_temp_dir = temp_dir.clone();
             let sort_0_handle = scope.spawn(move || {
-                consensus_archive::sort_and_write_mate(
+                reference_free::consensus_archive::sort_and_write_mate(
                     sort_0_rx,
                     u64::MAX,
                     0,
@@ -365,7 +361,7 @@ pub fn compress_reordered_paired_fastq_files_profiled(
             let sort_options = options.clone();
             let sort_temp_dir = temp_dir.clone();
             let sort_1_handle = scope.spawn(move || {
-                consensus_archive::sort_and_write_mate(
+                reference_free::consensus_archive::sort_and_write_mate(
                     sort_1_rx,
                     u64::MAX,
                     1,
@@ -452,7 +448,7 @@ pub fn compress_reordered_paired_fastq_files_profiled(
                         let result = batch
                             .into_iter()
                             .map(|(original_id, first, second)| {
-                                consensus_archive::prepare_pair(
+                                reference_free::consensus_archive::prepare_pair(
                                     first,
                                     second,
                                     original_id,
@@ -499,7 +495,7 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     let prepared = prepared.finish_metadata()?;
     let ingest = ingest_start.elapsed();
     let archive = File::create(guard.partial_output())?;
-    let (metadata, mut profile) = consensus_archive::write_streamed_profiled(
+    let (metadata, mut profile) = reference_free::consensus_archive::write_streamed_profiled(
         prepared, sections, archive, options, &temp_dir,
     )?;
     profile.store_bytes = directory_size(&temp_dir)?;
@@ -620,7 +616,7 @@ fn directory_size(path: &Path) -> Result<u64> {
 
 /// Decompress an archive, optionally selecting an inclusive zero-based record range.
 pub fn decompress<R: Read>(input: R, options: &DecompressionOptions) -> Result<ArchiveRecords> {
-    consensus_archive::read_reordered(input, options)
+    reference_free::consensus_archive::read_reordered(input, options)
 }
 
 /// Decompress an alignment archive into paired records.
@@ -648,7 +644,7 @@ pub fn decompress_paired_into<R: Read, S: PairedRecordSink>(
     options: &DecompressionOptions,
     sink: &mut S,
 ) -> Result<DecompressionMetadata> {
-    consensus_archive::read_paired_into(input, options, sink)
+    reference_free::consensus_archive::read_paired_into(input, options, sink)
 }
 
 /// Copy decoded records to FASTQ or FASTA writers.
@@ -959,7 +955,7 @@ mod tests {
             store.append(left, right).unwrap();
         }
         let mut archive = Vec::new();
-        let (_, profile) = consensus_archive::write_reordered_store_profiled(
+        let (_, profile) = reference_free::consensus_archive::write_reordered_store_profiled(
             &mut store,
             &mut archive,
             &CompressionOptions::default(),
@@ -998,7 +994,7 @@ mod tests {
             store.append(left, right).unwrap();
         }
         let mut archive = Vec::new();
-        consensus_archive::write_reordered_store_profiled(
+        reference_free::consensus_archive::write_reordered_store_profiled(
             &mut store,
             &mut archive,
             &CompressionOptions::default(),
@@ -1027,7 +1023,7 @@ mod tests {
             store.append(left, right).unwrap();
         }
         let mut archive = Vec::new();
-        consensus_archive::write_reordered_store_profiled(
+        reference_free::consensus_archive::write_reordered_store_profiled(
             &mut store,
             &mut archive,
             &CompressionOptions {
@@ -1051,7 +1047,7 @@ mod tests {
             store.append(&first, &second).unwrap();
         }
         let mut archive = Vec::new();
-        consensus_archive::write_reordered_store_profiled(
+        reference_free::consensus_archive::write_reordered_store_profiled(
             &mut store,
             &mut archive,
             &CompressionOptions {
@@ -1101,7 +1097,7 @@ mod tests {
             store.append(&record(index), &record(index + 4)).unwrap();
         }
         let mut archive = Vec::new();
-        consensus_archive::write_reordered_store_profiled(
+        reference_free::consensus_archive::write_reordered_store_profiled(
             &mut store,
             &mut archive,
             &CompressionOptions::default(),

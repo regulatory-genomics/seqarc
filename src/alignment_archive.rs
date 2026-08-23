@@ -18,8 +18,10 @@ use std::path::Path;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
 const VERSION: u32 = 11;
-const BATCH_SIZE: usize = 256;
-const PARSE_BATCH_PAIRS: usize = 4096;
+const MAP_TASK_READS: usize = 256;
+const MAP_TASKS_PER_WORKER: usize = 4;
+const MAX_MAPPING_BATCH_RECORDS: usize = 131_072;
+const PIPELINE_BATCHES: usize = 2;
 
 #[derive(Clone, Debug)]
 struct AlignedPair {
@@ -405,16 +407,23 @@ fn compress_with_index<I2: AsRef<Path>>(
     layout: AlignmentLayout,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let pipeline_started = std::time::Instant::now();
+    let mapping_threads = options.threads.max(1);
+    let mapping_batch_records = mapping_threads
+        .saturating_mul(MAP_TASKS_PER_WORKER)
+        .saturating_mul(MAP_TASK_READS)
+        .clamp(MAP_TASK_READS, MAX_MAPPING_BATCH_RECORDS);
     let mapping_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(options.threads.max(1))
+        .num_threads(mapping_threads)
         .build()
         .map_err(|error| Error::InvalidInput(format!("failed to create mapping pool: {error}")))?;
     let progress = mapping_progress();
     stage_log(&progress, format!(
-        "[seqarc] stage=initialize layout={:?} streams={} threads={} chunk_records={} zstd_level={} preserve_ids={} preserve_quality={}",
+        "[seqarc] stage=initialize layout={:?} streams={} threads={} mapping_batch_records={} map_task_reads={} chunk_records={} zstd_level={} preserve_ids={} preserve_quality={}",
         layout,
         layout.streams(),
-        options.threads.max(1),
+        mapping_threads,
+        mapping_batch_records,
+        MAP_TASK_READS,
         options.chunk_records.max(1),
         options.zstd_level,
         options.preserve_ids,
@@ -431,15 +440,17 @@ fn compress_with_index<I2: AsRef<Path>>(
     let input_1 = input_1.as_ref().to_path_buf();
     let input_2 = input_2.map(|path| path.as_ref().to_path_buf());
     let mapper_options = options.clone();
-    let (parse_tx, parse_rx) = crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(4);
-    let (mapped_tx, mapped_rx) = crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(4);
+    let (parse_tx, parse_rx) =
+        crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(PIPELINE_BATCHES);
+    let (mapped_tx, mapped_rx) =
+        crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(PIPELINE_BATCHES);
     stage_log(&progress, "[seqarc] stage=map_and_spool start");
     let map_started = std::time::Instant::now();
     let result = std::thread::scope(|scope| -> Result<()> {
         let producer_tx = parse_tx.clone();
         let producer = scope.spawn(move || -> Result<()> {
             let mut first = FastxReader::new(open_fastx_reader(input_1)?, Format::Fastq);
-            let mut pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
+            let mut pairs = Vec::with_capacity(mapping_batch_records);
             if let Some(input_2) = input_2 {
                 let mut second = FastxReader::new(open_fastx_reader(input_2)?, Format::Fastq);
                 loop {
@@ -468,11 +479,11 @@ fn compress_with_index<I2: AsRef<Path>>(
                         }
                         (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
                     }
-                    if pairs.len() == PARSE_BATCH_PAIRS {
+                    if pairs.len() == mapping_batch_records {
                         producer_tx
                             .send(Ok(std::mem::take(&mut pairs)))
                             .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
-                        pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
+                        pairs = Vec::with_capacity(mapping_batch_records);
                     }
                 }
             } else {
@@ -490,11 +501,11 @@ fn compress_with_index<I2: AsRef<Path>>(
                         first_selection: AlignmentSelection::default(),
                         second_selection: AlignmentSelection::default(),
                     });
-                    if pairs.len() == PARSE_BATCH_PAIRS {
+                    if pairs.len() == mapping_batch_records {
                         producer_tx
                             .send(Ok(std::mem::take(&mut pairs)))
                             .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
-                        pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
+                        pairs = Vec::with_capacity(mapping_batch_records);
                     }
                 }
             }
@@ -1014,7 +1025,7 @@ fn map_mate(
     mapping_pool.install(|| {
         use rayon::prelude::*;
         pairs
-            .par_chunks(BATCH_SIZE)
+            .par_chunks(MAP_TASK_READS)
             .map_init(ThreadBuf::new, |buffer, batch| {
                 let records = batch.iter().map(|pair| pair.record(mate));
                 let result = align_batch(&aligner, buffer, index, records);

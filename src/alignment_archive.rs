@@ -586,6 +586,7 @@ fn compress_with_index<I2: AsRef<Path>>(
         profile.reference_raw_bytes,
         profile.reference_compressed_bytes
     ));
+    progress.finish_and_clear();
     let mut archive = File::create(output)?;
     let header_size = 9 + 4 + 2 + 8 * 2;
     archive.write_all(MAGIC)?;
@@ -610,14 +611,15 @@ fn compress_with_index<I2: AsRef<Path>>(
 
     let mut written_chunks = 0u64;
     let mut replay_pair_count = 0u64;
-    progress.set_message("compressing chunks".to_owned());
+    let chunk_records = options.chunk_records.max(1);
+    let total_chunks = mapped_records.div_ceil(chunk_records as u64);
+    let progress = chunk_progress(total_chunks);
     let worker_count = options.threads.max(1);
     stage_log(
         &progress,
         format!(
-            "[seqarc] stage=chunks start workers={} chunk_records={}",
-            worker_count,
-            options.chunk_records.max(1)
+            "[seqarc] stage=chunks start workers={} chunk_records={} total_chunks={}",
+            worker_count, chunk_records, total_chunks
         ),
     );
     let chunks_started = std::time::Instant::now();
@@ -634,17 +636,17 @@ fn compress_with_index<I2: AsRef<Path>>(
             move || -> Result<()> {
                 let spool = ExternalChunk::<SpoolPair>::open(File::open(spool_path)?)
                     .map_err(|error| Error::InvalidFormat(error.to_string()))?;
-                let mut pairs = Vec::with_capacity(options.chunk_records.max(1));
+                let mut pairs = Vec::with_capacity(chunk_records);
                 let mut chunk_index = 0usize;
                 for item in spool {
                     let item = item.map_err(|error| Error::InvalidFormat(error.to_string()))?;
                     pairs.push(item.into_aligned_pair(&kept_runs, index.reference_len())?);
-                    if pairs.len() == options.chunk_records.max(1) {
+                    if pairs.len() == chunk_records {
                         job_tx
                             .send(Ok((chunk_index, std::mem::take(&mut pairs))))
                             .map_err(|_| Error::InvalidInput("chunk workers exited".into()))?;
                         chunk_index += 1;
-                        pairs = Vec::with_capacity(options.chunk_records.max(1));
+                        pairs = Vec::with_capacity(chunk_records);
                     }
                 }
                 if !pairs.is_empty() {
@@ -679,6 +681,7 @@ fn compress_with_index<I2: AsRef<Path>>(
         let mut next_chunk = 0usize;
         while let Ok(result) = result_rx.recv() {
             let (index, chunk) = result?;
+            progress.inc(1);
             pending.insert(index, chunk);
             profile.max_pending_chunks = profile.max_pending_chunks.max(pending.len() as u64);
             while let Some(chunk) = pending.remove(&next_chunk) {
@@ -2467,6 +2470,18 @@ fn stage_progress(message: &'static str) -> ProgressBar {
             .expect("valid stage progress template"),
     );
     progress.set_message(message);
+    progress.enable_steady_tick(std::time::Duration::from_millis(250));
+    progress
+}
+
+fn chunk_progress(total: u64) -> ProgressBar {
+    let progress = ProgressBar::new(total);
+    progress.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} compressing chunks [{elapsed_precise}] {pos}/{len} [{wide_bar:.cyan/blue}] {percent}% ETA {eta}",
+        )
+        .expect("valid chunk progress template"),
+    );
     progress.enable_steady_tick(std::time::Duration::from_millis(250));
     progress
 }

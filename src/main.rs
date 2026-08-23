@@ -1,11 +1,12 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::write::GzEncoder;
+use indicatif::{ProgressBar, ProgressStyle};
 use seqarc::{
     build_genome_index_with_options, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
-    open_fastx_reader, AlignedRecordGroup, AlignedRecordSink, AlignmentCompressionOptions,
-    DecompressionOptions, Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode,
-    ReadRecord, Result,
+    decompress_aligned_iter, open_fastx_reader, truncate_read_id, AlignedRecordGroup,
+    AlignedRecordSink, AlignmentCompressionOptions, DecompressionOptions, Error, FastxReader,
+    Format, GenomeIndexBuildOptions, QualityMode, ReadRecord, Result,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -76,6 +77,9 @@ struct CompressArgs {
     zstd_level: i32,
     #[arg(long)]
     no_ids: bool,
+    /// Retain at most the first N identifier characters, excluding FASTQ '@'.
+    #[arg(long, conflicts_with = "no_ids")]
+    id_prefix_chars: Option<usize>,
     #[arg(long)]
     no_quality: bool,
     #[arg(long, value_enum, default_value_t = QualityChoice::Lossless)]
@@ -135,6 +139,9 @@ struct DecompressArgs {
     /// Inclusive zero-based logical-record range as START:END.
     #[arg(long, value_parser = parse_range)]
     range: Option<RangeInclusive<u64>>,
+    /// Number of aligned chunk decoder threads.
+    #[arg(long, default_value_t = 1)]
+    threads: usize,
     /// Replace existing output files.
     #[arg(long)]
     force: bool,
@@ -150,6 +157,9 @@ struct ValidateArgs {
     /// Original plain, gzip, or zstd mate-2 FASTQ for byte comparison.
     #[arg(long, requires = "mate_1")]
     mate_2: Option<PathBuf>,
+    /// Apply the compression-time identifier prefix before comparison.
+    #[arg(long, requires = "mate_1")]
+    id_prefix_chars: Option<usize>,
 }
 
 fn parse_range(value: &str) -> std::result::Result<RangeInclusive<u64>, String> {
@@ -346,14 +356,19 @@ type OriginalReader = FastxReader<Box<dyn std::io::BufRead + Send>>;
 struct ComparisonSink {
     first: OriginalReader,
     second: Option<OriginalReader>,
+    id_prefix_chars: Option<usize>,
     records: u64,
 }
 
 impl ComparisonSink {
-    fn expected(reader: &mut OriginalReader) -> Result<ReadRecord> {
-        reader
+    fn expected(reader: &mut OriginalReader, id_prefix_chars: Option<usize>) -> Result<ReadRecord> {
+        let mut record = reader
             .next()
-            .ok_or_else(|| Error::InvalidInput("archive has extra records".into()))?
+            .ok_or_else(|| Error::InvalidInput("archive has extra records".into()))??;
+        if let Some(id_prefix_chars) = id_prefix_chars {
+            truncate_read_id(&mut record, id_prefix_chars)?;
+        }
+        Ok(record)
     }
 }
 
@@ -366,7 +381,7 @@ impl AlignedRecordSink for ComparisonSink {
                         "single-end archive received two original files".into(),
                     ));
                 }
-                if record != Self::expected(&mut self.first)? {
+                if record != Self::expected(&mut self.first, self.id_prefix_chars)? {
                     return Err(Error::InvalidInput(format!(
                         "mismatch at record {original_id}"
                     )));
@@ -376,12 +391,12 @@ impl AlignedRecordSink for ComparisonSink {
                 let second_reader = self.second.as_mut().ok_or_else(|| {
                     Error::InvalidInput("paired archive requires two original files".into())
                 })?;
-                if first != Self::expected(&mut self.first)? {
+                if first != Self::expected(&mut self.first, self.id_prefix_chars)? {
                     return Err(Error::InvalidInput(format!(
                         "mismatch at pair {original_id}, mate 1"
                     )));
                 }
-                if second != Self::expected(second_reader)? {
+                if second != Self::expected(second_reader, self.id_prefix_chars)? {
                     return Err(Error::InvalidInput(format!(
                         "mismatch at pair {original_id}, mate 2"
                     )));
@@ -480,6 +495,7 @@ fn run(cli: Cli) -> Result<()> {
                 threads: args.threads,
                 temp_dir: args.temp_dir.clone(),
                 preserve_ids: !args.no_ids,
+                id_prefix_chars: args.id_prefix_chars,
                 preserve_quality: !args.no_quality,
                 quality_mode: quality_mode(&args)?,
                 zstd_level: args.zstd_level,
@@ -565,6 +581,9 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn decompress_command(args: DecompressArgs) -> Result<()> {
+    if args.threads == 0 {
+        return Err(Error::InvalidInput("--threads must be nonzero".into()));
+    }
     if args
         .mate_2
         .as_ref()
@@ -598,21 +617,41 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
     };
     let options = DecompressionOptions {
         original_range: args.range,
+        threads: args.threads,
         ..DecompressionOptions::default()
     };
-    let metadata = decompress_aligned_into(
+    let mut records = decompress_aligned_iter(
         BufReader::with_capacity(16 * 1024 * 1024, File::open(args.archive)?),
         &options,
-        &mut sink,
     )?;
+    let layout = records.layout();
+    let total_chunks = records.total_chunks();
+    let progress = decompression_progress(total_chunks);
+    if progress.is_hidden() {
+        eprintln!("[seqarc] stage=decompress start total_chunks={total_chunks}");
+    }
+    let mut record_count = 0u64;
+    while let Some(record) = records.next() {
+        progress.set_position(records.decoded_chunks());
+        let (original_id, group) = record?;
+        sink.write_group(original_id, group)?;
+        record_count += 1;
+    }
+    progress.set_position(records.decoded_chunks());
+    sink.finish()?;
+    if progress.is_hidden() {
+        eprintln!(
+            "[seqarc] stage=decompress done decoded_chunks={} total_chunks={}",
+            records.decoded_chunks(),
+            total_chunks
+        );
+    }
+    progress.finish_and_clear();
     first_path.commit()?;
     if let Some(second_path) = second_path {
         second_path.commit()?;
     }
-    eprintln!(
-        "decompressed {} records ({:?})",
-        metadata.records, metadata.layout
-    );
+    eprintln!("decompressed {} records ({:?})", record_count, layout);
     Ok(())
 }
 
@@ -622,6 +661,18 @@ fn output_is_gzip(path: &Path, force_gzip: bool, force_plain: bool) -> bool {
             && path
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("gz")))
+}
+
+fn decompression_progress(total_chunks: u64) -> ProgressBar {
+    let progress = ProgressBar::new(total_chunks);
+    progress.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} decoding chunks [{elapsed_precise}] {pos}/{len} [{wide_bar:.cyan/blue}] {percent}% ETA {eta}",
+        )
+        .expect("valid decompression progress template"),
+    );
+    progress.enable_steady_tick(std::time::Duration::from_millis(250));
+    progress
 }
 
 fn validate_command(args: ValidateArgs) -> Result<()> {
@@ -635,12 +686,13 @@ fn validate_command(args: ValidateArgs) -> Result<()> {
                     open_fastx_reader(second).map(|reader| FastxReader::new(reader, Format::Fastq))
                 })
                 .transpose()?,
+            id_prefix_chars: args.id_prefix_chars,
             records: 0,
         };
         let metadata =
             decompress_aligned_into(archive, &DecompressionOptions::default(), &mut sink)?;
         println!(
-            "validated {} records byte-for-byte ({:?})",
+            "validated {} records against originals ({:?})",
             sink.records, metadata.layout
         );
     } else {
@@ -699,5 +751,20 @@ mod tests {
             panic!("wrong command")
         };
         assert!(quality_mode(&args).is_err());
+
+        assert!(Cli::try_parse_from([
+            "seqarc",
+            "compress",
+            "--index",
+            "genome.seqarc-index",
+            "-1",
+            "r1.fastq.gz",
+            "-o",
+            "reads.seqarc",
+            "--no-ids",
+            "--id-prefix-chars",
+            "8",
+        ])
+        .is_err());
     }
 }

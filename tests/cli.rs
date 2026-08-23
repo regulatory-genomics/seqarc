@@ -120,6 +120,8 @@ fn aligned_cli_round_trip_and_validation() {
         .arg(&archive_path)
         .arg("--chunk-records")
         .arg("1")
+        .arg("--id-prefix-chars")
+        .arg("5")
         .arg("--temp-dir")
         .arg(&temp_root)
         .assert()
@@ -144,9 +146,22 @@ fn aligned_cli_round_trip_and_validation() {
         .arg("--mate-2")
         .arg(&second_path)
         .assert()
+        .failure();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--id-prefix-chars")
+        .arg("5")
+        .assert()
         .success()
         .stdout(predicate::str::contains(
-            "validated 2 records byte-for-byte (PairedEnd)",
+            "validated 2 records against originals (PairedEnd)",
         ));
 
     let incomplete_output = directory.path().join("incomplete.fastq");
@@ -168,13 +183,30 @@ fn aligned_cli_round_trip_and_validation() {
         .arg(&decoded_first)
         .arg("--mate-2")
         .arg(&decoded_second)
+        .arg("--threads")
+        .arg("2")
         .assert()
-        .success();
+        .success()
+        .stderr(predicate::str::contains(
+            "stage=decompress start total_chunks=2",
+        ))
+        .stderr(predicate::str::contains(
+            "stage=decompress done decoded_chunks=2 total_chunks=2",
+        ));
 
-    assert_eq!(std::fs::read_to_string(decoded_first).unwrap(), first_fastq);
+    let expected_first = first_fastq
+        .replace("@pair0/1", "@pair0")
+        .replace("@pair1/1", "@pair1");
+    let expected_second = second_fastq
+        .replace("@pair0/2", "@pair0")
+        .replace("@pair1/2", "@pair1");
+    assert_eq!(
+        std::fs::read_to_string(decoded_first).unwrap(),
+        expected_first
+    );
     assert_eq!(
         std::fs::read_to_string(decoded_second).unwrap(),
-        second_fastq
+        expected_second
     );
 }
 
@@ -257,7 +289,7 @@ fn single_end_cli_round_trip_and_validation() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "validated 2 records byte-for-byte (SingleEnd)",
+            "validated 2 records against originals (SingleEnd)",
         ));
 
     let invalid_first = directory.path().join("invalid.1.fastq");

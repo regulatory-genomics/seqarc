@@ -3,10 +3,10 @@ use crate::minibwa::{Aligner, CigarKind, CigarOp, Index, Opts, Strand, ThreadBuf
 use crate::packed_sequence::PackedSequence;
 use crate::quality_blocks::{decode_stream_bytes, encode_stream_bytes};
 use crate::{
-    apply_quality, open_fastx_reader, AlignedCompressionProfile, AlignedDecompressionMetadata,
-    AlignedRecordGroup, AlignedRecordSink, AlignmentLayout, ArchiveRecords, CompressionMetadata,
-    DecompressionOptions, Error, FastxReader, Format, GenomeAlignment, PairedRecordSink,
-    ReadRecord, Result,
+    apply_quality, open_fastx_reader, truncate_read_id, AlignedCompressionProfile,
+    AlignedDecompressionMetadata, AlignedRecordGroup, AlignedRecordSink, AlignmentLayout,
+    ArchiveRecords, CompressionMetadata, DecompressionOptions, Error, FastxReader, Format,
+    GenomeAlignment, PairedRecordSink, ReadRecord, Result,
 };
 use bed_utils::extsort::{ExternalChunk, ExternalChunkBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -159,6 +159,8 @@ pub struct AlignedRecordIter<R: Read> {
     layout: AlignmentLayout,
     preserve_quality: bool,
     original_range: Option<RangeInclusive<u64>>,
+    total_chunks: u64,
+    decoded_chunks: u64,
     chunks_remaining: u64,
     next_submit_chunk: u64,
     next_submit_record: u64,
@@ -442,6 +444,19 @@ pub(crate) fn compress_single_fastq_file_with_index(
     Ok((metadata, profile))
 }
 
+fn apply_identifier_policy(
+    record: &mut ReadRecord,
+    preserve_ids: bool,
+    prefix_chars: Option<usize>,
+) -> Result<()> {
+    if !preserve_ids {
+        record.id.clear();
+    } else if let Some(prefix_chars) = prefix_chars {
+        truncate_read_id(record, prefix_chars)?;
+    }
+    Ok(())
+}
+
 fn compress_with_index<I2: AsRef<Path>>(
     index: &Index,
     input_1: impl AsRef<Path>,
@@ -451,6 +466,12 @@ fn compress_with_index<I2: AsRef<Path>>(
     layout: AlignmentLayout,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let pipeline_started = std::time::Instant::now();
+    if !options.preserve_ids && options.id_prefix_chars.is_some_and(|length| length != 0) {
+        return Err(Error::InvalidInput(
+            "identifier prefix cannot be retained when identifiers are disabled".into(),
+        ));
+    }
+    let preserve_ids = options.preserve_ids && options.id_prefix_chars != Some(0);
     let mapping_threads = options.threads.max(1);
     let mapping_batch_records = mapping_threads
         .saturating_mul(MAP_TASKS_PER_WORKER)
@@ -462,7 +483,7 @@ fn compress_with_index<I2: AsRef<Path>>(
         .map_err(|error| Error::InvalidInput(format!("failed to create mapping pool: {error}")))?;
     let progress = mapping_progress();
     stage_log(&progress, format!(
-        "[seqarc] stage=initialize layout={:?} streams={} threads={} mapping_batch_records={} map_task_reads={} chunk_records={} zstd_level={} preserve_ids={} preserve_quality={}",
+        "[seqarc] stage=initialize layout={:?} streams={} threads={} mapping_batch_records={} map_task_reads={} chunk_records={} zstd_level={} preserve_ids={} id_prefix_chars={:?} preserve_quality={}",
         layout,
         layout.streams(),
         mapping_threads,
@@ -470,7 +491,8 @@ fn compress_with_index<I2: AsRef<Path>>(
         MAP_TASK_READS,
         options.chunk_records.max(1),
         options.zstd_level,
-        options.preserve_ids,
+        preserve_ids,
+        options.id_prefix_chars,
         options.preserve_quality
     ));
     let temp_dir =
@@ -479,7 +501,7 @@ fn compress_with_index<I2: AsRef<Path>>(
     let mut spool_builder = ExternalChunkBuilder::new(File::create(&spool_path)?, 1)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let mut mask = ReferenceMask::new(index.reference_len());
-    let mut id_detector = IdModeDetector::new(options.preserve_ids, layout);
+    let mut id_detector = IdModeDetector::new(preserve_ids, layout);
     let mut profile = AlignedCompressionProfile::default();
     let input_1 = input_1.as_ref().to_path_buf();
     let input_2 = input_2.map(|path| path.as_ref().to_path_buf());
@@ -503,6 +525,16 @@ fn compress_with_index<I2: AsRef<Path>>(
                         (Some(Ok(mut first)), Some(Ok(mut second))) => {
                             first.validate(true)?;
                             second.validate(true)?;
+                            apply_identifier_policy(
+                                &mut first,
+                                preserve_ids,
+                                mapper_options.id_prefix_chars,
+                            )?;
+                            apply_identifier_policy(
+                                &mut second,
+                                preserve_ids,
+                                mapper_options.id_prefix_chars,
+                            )?;
                             if mapper_options.preserve_quality {
                                 apply_quality(&mut first, &mapper_options.quality_mode);
                                 apply_quality(&mut second, &mapper_options.quality_mode);
@@ -534,6 +566,11 @@ fn compress_with_index<I2: AsRef<Path>>(
                 for first in first {
                     let mut first = first?;
                     first.validate(true)?;
+                    apply_identifier_policy(
+                        &mut first,
+                        preserve_ids,
+                        mapper_options.id_prefix_chars,
+                    )?;
                     if mapper_options.preserve_quality {
                         apply_quality(&mut first, &mapper_options.quality_mode);
                     }
@@ -636,7 +673,7 @@ fn compress_with_index<I2: AsRef<Path>>(
     archive.write_all(MAGIC)?;
     write_u32(&mut archive, VERSION)?;
     let mut flags = 0u16;
-    if options.preserve_ids {
+    if preserve_ids {
         flags |= 1;
     }
     if options.preserve_quality {
@@ -791,7 +828,7 @@ fn compress_with_index<I2: AsRef<Path>>(
         CompressionMetadata {
             streams: layout.streams(),
             records: replay_pair_count,
-            preserved_ids: options.preserve_ids,
+            preserved_ids: preserve_ids,
             preserved_quality: options.preserve_quality,
             preserved_order: true,
         },
@@ -926,6 +963,8 @@ pub(crate) fn decompress_iter<R: Read>(
         layout,
         preserve_quality: flags & 2 != 0,
         original_range: options.original_range.clone(),
+        total_chunks: chunk_count,
+        decoded_chunks: 0,
         chunks_remaining: chunk_count,
         next_submit_chunk: 0,
         next_submit_record: 0,
@@ -952,6 +991,14 @@ impl<R: Read> AlignedRecordIter<R> {
 
     pub fn streams(&self) -> usize {
         self.layout.streams()
+    }
+
+    pub fn total_chunks(&self) -> u64 {
+        self.total_chunks
+    }
+
+    pub fn decoded_chunks(&self) -> u64 {
+        self.decoded_chunks
     }
 
     fn resident_chunks(&self) -> usize {
@@ -1036,6 +1083,9 @@ impl<R: Read> AlignedRecordIter<R> {
                     self.preserve_quality,
                     &self.reference,
                 );
+                if result.is_ok() {
+                    self.decoded_chunks += 1;
+                }
                 self.pending.insert(chunk_index, result);
             }
             debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
@@ -1054,6 +1104,9 @@ impl<R: Read> AlignedRecordIter<R> {
                         .outstanding_jobs
                         .checked_sub(1)
                         .ok_or_else(|| Error::InvalidFormat("unexpected decoded chunk".into()))?;
+                    if result.is_ok() {
+                        self.decoded_chunks += 1;
+                    }
                     self.pending.insert(chunk_index, result);
                     debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
                 }
@@ -1100,6 +1153,9 @@ impl<R: Read> AlignedRecordIter<R> {
                 .outstanding_jobs
                 .checked_sub(1)
                 .ok_or_else(|| Error::InvalidFormat("unexpected decoded chunk".into()))?;
+            if result.is_ok() {
+                self.decoded_chunks += 1;
+            }
             self.pending.insert(chunk_index, result);
             debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
         }

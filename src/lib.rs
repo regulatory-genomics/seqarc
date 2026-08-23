@@ -129,6 +129,18 @@ pub(crate) fn apply_quality(record: &mut ReadRecord, mode: &QualityMode) {
     }
 }
 
+/// Truncate a read identifier to at most `max_chars` Unicode scalar values.
+pub fn truncate_read_id(record: &mut ReadRecord, max_chars: usize) -> Result<()> {
+    let id = std::str::from_utf8(&record.id)
+        .map_err(|_| Error::InvalidInput("read identifier is not valid UTF-8".into()))?;
+    let end = id
+        .char_indices()
+        .nth(max_chars)
+        .map_or(id.len(), |(index, _)| index);
+    record.id.truncate(end);
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum QualityMode {
     Lossless,
@@ -153,6 +165,7 @@ pub struct AlignmentCompressionOptions {
     pub threads: usize,
     pub temp_dir: Option<std::path::PathBuf>,
     pub preserve_ids: bool,
+    pub id_prefix_chars: Option<usize>,
     pub preserve_quality: bool,
     pub quality_mode: QualityMode,
     pub zstd_level: i32,
@@ -165,6 +178,7 @@ impl Default for AlignmentCompressionOptions {
             threads: 16,
             temp_dir: None,
             preserve_ids: true,
+            id_prefix_chars: None,
             preserve_quality: true,
             quality_mode: QualityMode::Lossless,
             zstd_level: 19,
@@ -958,6 +972,15 @@ mod tests {
     }
 
     #[test]
+    fn identifier_prefix_truncation_preserves_utf8_boundaries() {
+        let mut record = ReadRecord::new("réad/1 suffix", b"ACGT".to_vec(), None);
+        truncate_read_id(&mut record, 2).unwrap();
+        assert_eq!(record.id, "ré".as_bytes());
+        truncate_read_id(&mut record, 0).unwrap();
+        assert!(record.id.is_empty());
+    }
+
+    #[test]
     fn illumina_binning_matches_expected_table() {
         let mut record =
             ReadRecord::new("read", b"ACGTACGT".to_vec(), Some((33u8..=127).collect()));
@@ -1158,11 +1181,14 @@ mod tests {
             threads: 4,
             ..DecompressionOptions::default()
         };
-        let iter =
+        let mut iter =
             decompress_aligned_iter(Cursor::new(archive.clone()), &parallel_options).unwrap();
         assert_eq!(iter.layout(), AlignmentLayout::PairedEnd);
         assert_eq!(iter.streams(), 2);
-        let selected = iter.collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(iter.total_chunks(), 2);
+        assert_eq!(iter.decoded_chunks(), 0);
+        let selected = iter.by_ref().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(iter.decoded_chunks(), 2);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].0, 1);
         let AlignedRecordGroup::Paired(first, second) = &selected[0].1 else {

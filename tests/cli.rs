@@ -123,7 +123,11 @@ fn aligned_cli_round_trip_and_validation() {
         .stderr(predicate::str::contains("stage=map_and_spool done"))
         .stderr(predicate::str::contains("stage=reference done"))
         .stderr(predicate::str::contains("stage=chunks done"))
-        .stderr(predicate::str::contains("stage=archive done"));
+        .stderr(predicate::str::contains("stage=archive done"))
+        .stderr(predicate::str::contains("% aligned"))
+        .stderr(predicate::str::contains("% unaligned"))
+        .stderr(predicate::str::contains("% no hit"))
+        .stderr(predicate::str::contains("% not compressible"));
     assert_directory_empty(&temp_root);
 
     Command::cargo_bin("seqarc")

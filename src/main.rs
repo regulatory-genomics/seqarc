@@ -448,6 +448,14 @@ fn quality_mode(args: &CompressArgs) -> Result<QualityMode> {
     }
 }
 
+fn percentage(count: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 * 100.0 / total as f64
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Index(args) => {
@@ -503,6 +511,18 @@ fn run(cli: Cli) -> Result<()> {
                     "paired-end"
                 }
             );
+            debug_assert!(profile.rejected_alignments <= profile.raw_reads);
+            let total_reads = profile.mapped_reads + profile.raw_reads;
+            let no_hit_reads = profile
+                .raw_reads
+                .saturating_sub(profile.rejected_alignments);
+            eprintln!(
+                "alignment: {:.2}% aligned, {:.2}% unaligned ({:.2}% no hit, {:.2}% not compressible)",
+                percentage(profile.mapped_reads, total_reads),
+                percentage(profile.raw_reads, total_reads),
+                percentage(no_hit_reads, total_reads),
+                percentage(profile.rejected_alignments, total_reads)
+            );
             if args.profile {
                 eprintln!(
                     "timings: total {:?}, index {:?}, map/spool {:?}, reference {:?}, chunks {:?}",
@@ -524,12 +544,13 @@ fn run(cli: Cli) -> Result<()> {
                     profile.records_compressed_bytes
                 );
                 eprintln!(
-                    "mapping: {} mapped, {} raw, {} candidates, {} non-first, {} rejected",
+                    "mapping: {} mapped, {} raw ({} no-hit, {} not-compressible), {} candidates, {} non-first",
                     profile.mapped_reads,
                     profile.raw_reads,
+                    no_hit_reads,
+                    profile.rejected_alignments,
                     profile.candidate_hits,
-                    profile.selected_non_first_hits,
-                    profile.rejected_alignments
+                    profile.selected_non_first_hits
                 );
                 eprintln!(
                     "pipeline: {} chunks, {} spool bytes, max {} pending chunks",
@@ -654,6 +675,12 @@ mod tests {
     fn parses_inclusive_range() {
         assert_eq!(parse_range("4:9").unwrap(), 4..=9);
         assert!(parse_range("9:4").is_err());
+    }
+
+    #[test]
+    fn percentage_handles_counts_and_empty_inputs() {
+        assert_eq!(percentage(1, 4), 25.0);
+        assert_eq!(percentage(0, 0), 0.0);
     }
 
     #[test]

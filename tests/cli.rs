@@ -10,6 +10,11 @@ fn write_gzip(path: &std::path::Path, contents: &[u8]) {
     writer.finish().unwrap();
 }
 
+fn assert_directory_empty(path: &std::path::Path) {
+    assert!(path.is_dir());
+    assert!(std::fs::read_dir(path).unwrap().next().is_none());
+}
+
 #[test]
 fn help_lists_aligned_workflow_commands() {
     Command::cargo_bin("seqarc")
@@ -33,6 +38,7 @@ fn aligned_cli_round_trip_and_validation() {
     let archive_path = directory.path().join("reads.seqarc");
     let decoded_first = directory.path().join("decoded.1.fastq");
     let decoded_second = directory.path().join("decoded.2.fastq");
+    let temp_root = directory.path().join("temporary");
 
     let reference =
         b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
@@ -75,8 +81,27 @@ fn aligned_cli_round_trip_and_validation() {
         .unwrap()
         .args(["index", reference_path.to_str().unwrap(), "--output"])
         .arg(&index_path)
+        .arg("--temp-dir")
+        .arg(&temp_root)
         .assert()
         .success();
+    assert_directory_empty(&temp_root);
+
+    let failed_archive = directory.path().join("failed.seqarc");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(directory.path().join("missing.fastq.gz"))
+        .arg("--output")
+        .arg(&failed_archive)
+        .arg("--temp-dir")
+        .arg(&temp_root)
+        .assert()
+        .failure();
+    assert_directory_empty(&temp_root);
+    assert!(!failed_archive.exists());
 
     Command::cargo_bin("seqarc")
         .unwrap()
@@ -90,6 +115,8 @@ fn aligned_cli_round_trip_and_validation() {
         .arg(&archive_path)
         .arg("--chunk-records")
         .arg("1")
+        .arg("--temp-dir")
+        .arg(&temp_root)
         .assert()
         .success()
         .stderr(predicate::str::contains("stage=index_load done"))
@@ -97,6 +124,7 @@ fn aligned_cli_round_trip_and_validation() {
         .stderr(predicate::str::contains("stage=reference done"))
         .stderr(predicate::str::contains("stage=chunks done"))
         .stderr(predicate::str::contains("stage=archive done"));
+    assert_directory_empty(&temp_root);
 
     Command::cargo_bin("seqarc")
         .unwrap()
@@ -139,6 +167,29 @@ fn aligned_cli_round_trip_and_validation() {
         std::fs::read_to_string(decoded_second).unwrap(),
         second_fastq
     );
+}
+
+#[test]
+fn index_cleans_custom_temp_directory_after_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("empty.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let temp_root = directory.path().join("temporary");
+    std::fs::write(&reference_path, b">empty\n").unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("index")
+        .arg(&reference_path)
+        .arg("--output")
+        .arg(&index_path)
+        .arg("--temp-dir")
+        .arg(&temp_root)
+        .assert()
+        .failure();
+
+    assert_directory_empty(&temp_root);
+    assert!(!index_path.exists());
 }
 
 #[test]

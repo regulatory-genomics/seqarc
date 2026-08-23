@@ -150,6 +150,7 @@ pub struct CompressionOptions {
 pub struct AlignmentCompressionOptions {
     pub chunk_records: usize,
     pub threads: usize,
+    pub temp_dir: Option<std::path::PathBuf>,
     pub preserve_ids: bool,
     pub preserve_quality: bool,
     pub quality_mode: QualityMode,
@@ -161,12 +162,18 @@ impl Default for AlignmentCompressionOptions {
         Self {
             chunk_records: 250_000,
             threads: 16,
+            temp_dir: None,
             preserve_ids: true,
             preserve_quality: true,
             quality_mode: QualityMode::Lossless,
             zstd_level: 19,
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GenomeIndexBuildOptions {
+    pub temp_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -731,6 +738,22 @@ fn directory_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
+pub(crate) fn temporary_directory(root: Option<&Path>, prefix: &str) -> Result<tempfile::TempDir> {
+    match root {
+        Some(root) => {
+            std::fs::create_dir_all(root)?;
+            tempfile::Builder::new()
+                .prefix(prefix)
+                .tempdir_in(root)
+                .map_err(Into::into)
+        }
+        None => tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .map_err(Into::into),
+    }
+}
+
 /// Decompress an archive, optionally selecting an inclusive zero-based record range.
 pub fn decompress<R: Read>(input: R, options: &DecompressionOptions) -> Result<ArchiveRecords> {
     reference_free::consensus_archive::read_reordered(input, options)
@@ -794,6 +817,19 @@ pub fn build_genome_index(
     genome_fasta: impl AsRef<Path>,
     index_file: impl AsRef<Path>,
 ) -> Result<minibwa::Index> {
+    build_genome_index_with_options(
+        genome_fasta,
+        index_file,
+        &GenomeIndexBuildOptions::default(),
+    )
+}
+
+pub fn build_genome_index_with_options(
+    genome_fasta: impl AsRef<Path>,
+    index_file: impl AsRef<Path>,
+    options: &GenomeIndexBuildOptions,
+) -> Result<minibwa::Index> {
+    let workspace = temporary_directory(options.temp_dir.as_deref(), "seqarc-index-")?;
     let genome_fasta = genome_fasta.as_ref();
     let input = File::open(genome_fasta)?;
     let reader: Box<dyn Read> = if genome_fasta
@@ -804,7 +840,7 @@ pub fn build_genome_index(
     } else {
         Box::new(input)
     };
-    let mut fasta = tempfile::NamedTempFile::new()?;
+    let mut fasta = tempfile::NamedTempFile::new_in(workspace.path())?;
     {
         let mut writer = std::io::BufWriter::new(fasta.as_file_mut());
         writer.write_all(b">genome\n")?;
@@ -844,7 +880,7 @@ pub fn build_genome_index(
     fasta.as_file_mut().sync_all()?;
 
     let index_file = index_file.as_ref();
-    minibwa::Index::build_from_fasta(fasta.path(), index_file, false, 4)
+    minibwa::Index::build_from_fasta_in(fasta.path(), index_file, false, 4, workspace.path())
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let index = minibwa::Index::load(index_file, false)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;

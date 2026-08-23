@@ -33,10 +33,24 @@ impl Index {
         methylation: bool,
         threads: u32,
     ) -> Result<()> {
+        let workspace = crate::temporary_directory(None, "seqarc-minibwa-")
+            .map_err(|error| Error(error.to_string()))?;
+        Self::build_from_fasta_in(fasta, output, methylation, threads, workspace.path())
+    }
+
+    pub fn build_from_fasta_in(
+        fasta: impl AsRef<Path>,
+        output: impl AsRef<Path>,
+        methylation: bool,
+        threads: u32,
+        temp_root: impl AsRef<Path>,
+    ) -> Result<()> {
         if methylation {
             return Err(Error("methylation indexes are not supported".into()));
         }
-        let workspace = tempfile::tempdir().map_err(|error| Error(error.to_string()))?;
+        let workspace =
+            crate::temporary_directory(Some(temp_root.as_ref()), "seqarc-minibwa-components-")
+                .map_err(|error| Error(error.to_string()))?;
         let prefix = workspace.path().join("index");
         let mut arguments = vec![
             "index".to_owned(),

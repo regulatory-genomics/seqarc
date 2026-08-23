@@ -2,10 +2,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use seqarc::{
-    build_genome_index, compress_aligned_paired_fastq_files_with_index_profiled,
+    build_genome_index_with_options, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into, gzip_reader,
     AlignedRecordGroup, AlignedRecordSink, AlignmentCompressionOptions, DecompressionOptions,
-    Error, FastxReader, Format, QualityMode, ReadRecord, Result,
+    Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode, ReadRecord, Result,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -42,6 +42,9 @@ struct IndexArgs {
     /// Replace an existing output file.
     #[arg(long)]
     force: bool,
+    /// Directory in which to create temporary index-build files.
+    #[arg(long)]
+    temp_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -89,6 +92,9 @@ struct CompressArgs {
     /// Replace an existing output file.
     #[arg(long)]
     force: bool,
+    /// Directory in which to create temporary compression files.
+    #[arg(long)]
+    temp_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -446,7 +452,13 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Index(args) => {
             let output = AtomicPath::new(args.output, args.force)?;
-            build_genome_index(args.reference, output.partial())?;
+            build_genome_index_with_options(
+                args.reference,
+                output.partial(),
+                &GenomeIndexBuildOptions {
+                    temp_dir: args.temp_dir,
+                },
+            )?;
             output.commit()
         }
         Command::Compress(args) => {
@@ -458,6 +470,7 @@ fn run(cli: Cli) -> Result<()> {
             let options = AlignmentCompressionOptions {
                 chunk_records: args.chunk_records,
                 threads: args.threads,
+                temp_dir: args.temp_dir.clone(),
                 preserve_ids: !args.no_ids,
                 preserve_quality: !args.no_quality,
                 quality_mode: quality_mode(&args)?,

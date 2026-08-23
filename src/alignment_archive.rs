@@ -238,14 +238,20 @@ pub(crate) fn compress_paired_fastq_files(
     options: &crate::AlignmentCompressionOptions,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let total_started = std::time::Instant::now();
-    let workspace = tempfile::tempdir()?;
+    let workspace =
+        crate::temporary_directory(options.temp_dir.as_deref(), "seqarc-aligned-index-")?;
     eprintln!(
         "[seqarc] stage=index_build start reference={}",
         genome_fasta.as_ref().display()
     );
     let index_started = std::time::Instant::now();
-    let index =
-        crate::build_genome_index(genome_fasta, workspace.path().join("index.seqarc-index"))?;
+    let index = crate::build_genome_index_with_options(
+        genome_fasta,
+        workspace.path().join("index.seqarc-index"),
+        &crate::GenomeIndexBuildOptions {
+            temp_dir: Some(workspace.path().to_path_buf()),
+        },
+    )?;
     let index_elapsed = index_started.elapsed();
     eprintln!(
         "[seqarc] stage=index_build done elapsed={} reference_bases={}",
@@ -315,14 +321,20 @@ pub(crate) fn compress_single_fastq_file(
     options: &crate::AlignmentCompressionOptions,
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let total_started = std::time::Instant::now();
-    let workspace = tempfile::tempdir()?;
+    let workspace =
+        crate::temporary_directory(options.temp_dir.as_deref(), "seqarc-aligned-index-")?;
     eprintln!(
         "[seqarc] stage=index_build start reference={}",
         genome_fasta.as_ref().display()
     );
     let index_started = std::time::Instant::now();
-    let index =
-        crate::build_genome_index(genome_fasta, workspace.path().join("index.seqarc-index"))?;
+    let index = crate::build_genome_index_with_options(
+        genome_fasta,
+        workspace.path().join("index.seqarc-index"),
+        &crate::GenomeIndexBuildOptions {
+            temp_dir: Some(workspace.path().to_path_buf()),
+        },
+    )?;
     let index_elapsed = index_started.elapsed();
     eprintln!(
         "[seqarc] stage=index_build done elapsed={} reference_bases={}",
@@ -408,7 +420,8 @@ fn compress_with_index<I2: AsRef<Path>>(
         options.preserve_ids,
         options.preserve_quality
     ));
-    let temp_dir = tempfile::tempdir()?;
+    let temp_dir =
+        crate::temporary_directory(options.temp_dir.as_deref(), "seqarc-aligned-spool-")?;
     let spool_path = temp_dir.path().join("aligned-pairs.lz4");
     let mut spool_builder = ExternalChunkBuilder::new(File::create(&spool_path)?, 1)
         .map_err(|error| Error::InvalidInput(error.to_string()))?;

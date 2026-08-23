@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+pub use alignment_archive::AlignedRecordIter;
 pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
 pub use reference_free::record_store::{PairStore, StoreStats};
 pub use reference_free::reorder;
@@ -213,11 +214,23 @@ impl Default for CompressionOptions {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DecompressionOptions {
     pub original_range: Option<RangeInclusive<u64>>,
     pub output_order: OutputOrder,
     pub temp_dir: Option<std::path::PathBuf>,
+    pub threads: usize,
+}
+
+impl Default for DecompressionOptions {
+    fn default() -> Self {
+        Self {
+            original_range: None,
+            output_order: OutputOrder::Original,
+            temp_dir: None,
+            threads: 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -756,6 +769,20 @@ pub fn decompress_aligned_single<R: Read>(
     alignment_archive::decompress_single(input, options)
 }
 
+/// Lazily decode aligned records in original logical-record order.
+///
+/// Up to `options.threads` chunks are decoded concurrently. At most twice that
+/// many chunks are resident across active, completed, and currently yielded
+/// work, applying backpressure when downstream consumption is slower. Exhaust
+/// the iterator to validate all chunks and confirm that no bytes follow the
+/// declared archive.
+pub fn decompress_aligned_iter<R: Read>(
+    input: R,
+    options: &DecompressionOptions,
+) -> Result<AlignedRecordIter<R>> {
+    alignment_archive::decompress_iter(input, options)
+}
+
 pub fn decompress_aligned_into<R: Read, S: AlignedRecordSink>(
     input: R,
     options: &DecompressionOptions,
@@ -1108,9 +1135,11 @@ mod tests {
             .unwrap()
             .read_to_end(&mut archive)
             .unwrap();
-        let decoded =
-            decompress_aligned_paired(Cursor::new(archive), &DecompressionOptions::default())
-                .unwrap();
+        let decoded = decompress_aligned_paired(
+            Cursor::new(archive.clone()),
+            &DecompressionOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(decoded.streams[0].len(), 2);
         assert_eq!(decoded.streams[1].len(), 2);
@@ -1123,6 +1152,43 @@ mod tests {
             Some(vec![b'I'; forward.len()].as_slice())
         );
         assert_eq!(decoded.streams[0][0].id, b"pair0/1");
+
+        let parallel_options = DecompressionOptions {
+            original_range: Some(1..=1),
+            threads: 4,
+            ..DecompressionOptions::default()
+        };
+        let iter =
+            decompress_aligned_iter(Cursor::new(archive.clone()), &parallel_options).unwrap();
+        assert_eq!(iter.layout(), AlignmentLayout::PairedEnd);
+        assert_eq!(iter.streams(), 2);
+        let selected = iter.collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0, 1);
+        let AlignedRecordGroup::Paired(first, second) = &selected[0].1 else {
+            panic!("expected paired record")
+        };
+        assert_eq!(first.sequence, unknown);
+        assert_eq!(second.sequence, unknown);
+
+        let mut trailing = archive;
+        trailing.push(0);
+        let mut iter = decompress_aligned_iter(
+            Cursor::new(trailing),
+            &DecompressionOptions {
+                threads: 2,
+                ..DecompressionOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(iter.next().unwrap().unwrap().0, 0);
+        assert_eq!(iter.next().unwrap().unwrap().0, 1);
+        assert!(matches!(
+            iter.next(),
+            Some(Err(Error::InvalidFormat(message)))
+                if message == "trailing aligned archive bytes"
+        ));
+        assert!(iter.next().is_none());
     }
 
     #[test]

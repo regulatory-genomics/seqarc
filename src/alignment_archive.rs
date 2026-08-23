@@ -14,7 +14,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::ops::RangeInclusive;
 use std::path::Path;
+use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
 const VERSION: u32 = 11;
@@ -127,6 +129,48 @@ struct EncodedChunk {
 struct EncodedReference {
     block: Vec<u8>,
     raw_len: u64,
+}
+
+struct EncodedArchiveChunk {
+    first_record: u64,
+    record_count: usize,
+    raw_len: usize,
+    ids_len: usize,
+    qualities_len: usize,
+    records_len: usize,
+    compressed: Vec<u8>,
+}
+
+struct DecodedArchiveChunk {
+    first_record: u64,
+    next_record: usize,
+    ids: Vec<Vec<Vec<u8>>>,
+    qualities: Vec<Vec<Option<Vec<u8>>>>,
+    sequences: Vec<Vec<Vec<u8>>>,
+}
+
+pub struct AlignedRecordIter<R: Read> {
+    input: R,
+    pool: Option<rayon::ThreadPool>,
+    result_tx: Option<crossbeam_channel::Sender<(u64, Result<DecodedArchiveChunk>)>>,
+    result_rx: Option<crossbeam_channel::Receiver<(u64, Result<DecodedArchiveChunk>)>>,
+    reference: Arc<Vec<u8>>,
+    id_mode: IdMode,
+    layout: AlignmentLayout,
+    preserve_quality: bool,
+    original_range: Option<RangeInclusive<u64>>,
+    chunks_remaining: u64,
+    next_submit_chunk: u64,
+    next_submit_record: u64,
+    next_yield_chunk: u64,
+    terminal_chunk: u64,
+    outstanding_jobs: usize,
+    target_jobs: usize,
+    max_resident_chunks: usize,
+    pending: BTreeMap<u64, Result<DecodedArchiveChunk>>,
+    current: Option<DecodedArchiveChunk>,
+    input_finished: bool,
+    done: bool,
 }
 
 trait ReferenceBases: Sync {
@@ -759,17 +803,23 @@ pub(crate) fn decompress_paired<R: Read>(
     input: R,
     options: &DecompressionOptions,
 ) -> Result<ArchiveRecords> {
-    let mut streams = vec![Vec::new(), Vec::new()];
-    decode_aligned(input, options, |_, group| match group {
-        AlignedRecordGroup::Paired(first, second) => {
-            streams[0].push(first);
-            streams[1].push(second);
-            Ok(())
-        }
-        AlignedRecordGroup::Single(_) => Err(Error::InvalidFormat(
+    let records = decompress_iter(input, options)?;
+    if records.layout() != AlignmentLayout::PairedEnd {
+        return Err(Error::InvalidFormat(
             "single-end archive passed to paired decoder".into(),
-        )),
-    })?;
+        ));
+    }
+    let mut streams = vec![Vec::new(), Vec::new()];
+    for record in records {
+        let (_, group) = record?;
+        match group {
+            AlignedRecordGroup::Paired(first, second) => {
+                streams[0].push(first);
+                streams[1].push(second);
+            }
+            AlignedRecordGroup::Single(_) => unreachable!(),
+        }
+    }
     Ok(ArchiveRecords { streams })
 }
 
@@ -777,16 +827,20 @@ pub(crate) fn decompress_single<R: Read>(
     input: R,
     options: &DecompressionOptions,
 ) -> Result<ArchiveRecords> {
-    let mut stream = Vec::new();
-    decode_aligned(input, options, |_, group| match group {
-        AlignedRecordGroup::Single(record) => {
-            stream.push(record);
-            Ok(())
-        }
-        AlignedRecordGroup::Paired(_, _) => Err(Error::InvalidFormat(
+    let records = decompress_iter(input, options)?;
+    if records.layout() != AlignmentLayout::SingleEnd {
+        return Err(Error::InvalidFormat(
             "paired archive passed to single-end decoder".into(),
-        )),
-    })?;
+        ));
+    }
+    let mut stream = Vec::new();
+    for record in records {
+        let (_, group) = record?;
+        match group {
+            AlignedRecordGroup::Single(record) => stream.push(record),
+            AlignedRecordGroup::Paired(_, _) => unreachable!(),
+        }
+    }
     Ok(ArchiveRecords {
         streams: vec![stream],
     })
@@ -797,17 +851,23 @@ pub(crate) fn decompress_paired_into<R: Read, S: PairedRecordSink>(
     options: &DecompressionOptions,
     sink: &mut S,
 ) -> Result<crate::DecompressionMetadata> {
-    let mut pairs = 0;
-    decode_aligned(input, options, |original_id, group| match group {
-        AlignedRecordGroup::Paired(first, second) => {
-            sink.write_pair(original_id, first, second)?;
-            pairs += 1;
-            Ok(())
-        }
-        AlignedRecordGroup::Single(_) => Err(Error::InvalidFormat(
+    let records = decompress_iter(input, options)?;
+    if records.layout() != AlignmentLayout::PairedEnd {
+        return Err(Error::InvalidFormat(
             "single-end archive passed to paired decoder".into(),
-        )),
-    })?;
+        ));
+    }
+    let mut pairs = 0;
+    for record in records {
+        let (original_id, group) = record?;
+        match group {
+            AlignedRecordGroup::Paired(first, second) => {
+                sink.write_pair(original_id, first, second)?;
+                pairs += 1;
+            }
+            AlignedRecordGroup::Single(_) => unreachable!(),
+        }
+    }
     sink.finish()?;
     Ok(crate::DecompressionMetadata {
         streams: 2,
@@ -821,12 +881,14 @@ pub(crate) fn decompress_into<R: Read, S: AlignedRecordSink>(
     options: &DecompressionOptions,
     sink: &mut S,
 ) -> Result<AlignedDecompressionMetadata> {
+    let decoded = decompress_iter(input, options)?;
+    let layout = decoded.layout();
     let mut records = 0;
-    let layout = decode_aligned(input, options, |original_id, group| {
+    for record in decoded {
+        let (original_id, group) = record?;
         sink.write_group(original_id, group)?;
         records += 1;
-        Ok(())
-    })?;
+    }
     sink.finish()?;
     Ok(AlignedDecompressionMetadata {
         layout,
@@ -836,53 +898,231 @@ pub(crate) fn decompress_into<R: Read, S: AlignedRecordSink>(
     })
 }
 
-fn decode_aligned<R: Read, F: FnMut(u64, AlignedRecordGroup) -> Result<()>>(
+pub(crate) fn decompress_iter<R: Read>(
     mut input: R,
     options: &DecompressionOptions,
-    mut emit: F,
-) -> Result<AlignmentLayout> {
+) -> Result<AlignedRecordIter<R>> {
     let (flags, id_mode, layout, chunk_count, reference) = read_header(&mut input)?;
-    let preserve_quality = flags & 2 != 0;
-    let mut first_pair = 0u64;
-    for _ in 0..chunk_count {
-        let pair_count = read_u32(&mut input)? as usize;
-        let compressed_len = usize_from(read_u64(&mut input)?, "chunk compressed size")?;
-        let raw_len = usize_from(read_u64(&mut input)?, "chunk uncompressed size")?;
-        let ids_len = usize_from(read_u64(&mut input)?, "chunk ID block size")?;
-        let qualities_len = usize_from(read_u64(&mut input)?, "chunk quality block size")?;
-        let records_len = usize_from(read_u64(&mut input)?, "chunk record block size")?;
-        let mut compressed = vec![0; compressed_len];
-        input.read_exact(&mut compressed)?;
-        let raw = decode_chunk_sections(&compressed, ids_len, qualities_len, records_len)?;
-        if raw.len() != raw_len || ids_len + qualities_len + records_len != raw.len() {
-            return Err(Error::InvalidFormat(
-                "chunk block sizes do not match".into(),
-            ));
+    let decoder_threads = options.threads.max(1);
+    let (pool, result_tx, result_rx) = if decoder_threads == 1 {
+        (None, None, None)
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(decoder_threads)
+            .build()
+            .map_err(|error| {
+                Error::InvalidInput(format!("failed to create decoder pool: {error}"))
+            })?;
+        let (result_tx, result_rx) = crossbeam_channel::unbounded();
+        (Some(pool), Some(result_tx), Some(result_rx))
+    };
+    Ok(AlignedRecordIter {
+        input,
+        pool,
+        result_tx,
+        result_rx,
+        reference: Arc::new(reference),
+        id_mode,
+        layout,
+        preserve_quality: flags & 2 != 0,
+        original_range: options.original_range.clone(),
+        chunks_remaining: chunk_count,
+        next_submit_chunk: 0,
+        next_submit_record: 0,
+        next_yield_chunk: 0,
+        terminal_chunk: chunk_count,
+        outstanding_jobs: 0,
+        target_jobs: decoder_threads,
+        max_resident_chunks: if decoder_threads == 1 {
+            1
+        } else {
+            decoder_threads.saturating_mul(2)
+        },
+        pending: BTreeMap::new(),
+        current: None,
+        input_finished: false,
+        done: false,
+    })
+}
+
+impl<R: Read> AlignedRecordIter<R> {
+    pub fn layout(&self) -> AlignmentLayout {
+        self.layout
+    }
+
+    pub fn streams(&self) -> usize {
+        self.layout.streams()
+    }
+
+    fn resident_chunks(&self) -> usize {
+        self.outstanding_jobs + self.pending.len() + usize::from(self.current.is_some())
+    }
+
+    fn stop_input_with_error(&mut self, chunk_index: u64, error: Error) {
+        self.pending.insert(chunk_index, Err(error));
+        self.terminal_chunk = chunk_index + 1;
+        self.chunks_remaining = 0;
+        self.input_finished = true;
+    }
+
+    fn finish_input(&mut self) {
+        if self.input_finished {
+            return;
         }
-        let ids_end = ids_len;
-        let qualities_end = ids_end + qualities_len;
-        let ids = decode_ids(&raw[..ids_end], pair_count, id_mode, layout)?;
-        let qualities = decode_qualities(
-            &raw[ids_end..qualities_end],
-            pair_count,
-            preserve_quality,
-            layout,
-        )?;
-        let records = &raw[qualities_end..];
-        let decoded = decode_records(records, pair_count, first_pair, &reference, layout)?;
-        for index in 0..pair_count {
-            let original_id = decoded[index].0;
-            if options
-                .original_range
+        let mut trailing = [0; 1];
+        match self.input.read(&mut trailing) {
+            Ok(0) => {
+                self.terminal_chunk = self.next_submit_chunk;
+                self.input_finished = true;
+            }
+            Ok(_) => self.stop_input_with_error(
+                self.next_submit_chunk,
+                Error::InvalidFormat("trailing aligned archive bytes".into()),
+            ),
+            Err(error) => self.stop_input_with_error(self.next_submit_chunk, error.into()),
+        }
+    }
+
+    fn submit_available(&mut self) {
+        while !self.input_finished
+            && self.outstanding_jobs < self.target_jobs
+            && self.resident_chunks() < self.max_resident_chunks
+        {
+            if self.chunks_remaining == 0 {
+                self.finish_input();
+                break;
+            }
+            let chunk_index = self.next_submit_chunk;
+            let first_record = self.next_submit_record;
+            let encoded = match read_encoded_archive_chunk(&mut self.input, first_record) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    self.stop_input_with_error(chunk_index, error);
+                    break;
+                }
+            };
+            let next_record = match first_record.checked_add(encoded.record_count as u64) {
+                Some(next_record) => next_record,
+                None => {
+                    self.stop_input_with_error(
+                        chunk_index,
+                        Error::InvalidFormat("record count overflow".into()),
+                    );
+                    break;
+                }
+            };
+            self.next_submit_chunk += 1;
+            self.next_submit_record = next_record;
+            self.chunks_remaining -= 1;
+            if let (Some(pool), Some(sender)) = (&self.pool, &self.result_tx) {
+                self.outstanding_jobs += 1;
+                let sender = sender.clone();
+                let reference = Arc::clone(&self.reference);
+                let id_mode = self.id_mode;
+                let layout = self.layout;
+                let preserve_quality = self.preserve_quality;
+                pool.spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decode_archive_chunk(encoded, id_mode, layout, preserve_quality, &reference)
+                    }))
+                    .unwrap_or_else(|_| Err(Error::InvalidInput("chunk decoder panicked".into())));
+                    let _ = sender.send((chunk_index, result));
+                });
+            } else {
+                let result = decode_archive_chunk(
+                    encoded,
+                    self.id_mode,
+                    self.layout,
+                    self.preserve_quality,
+                    &self.reference,
+                );
+                self.pending.insert(chunk_index, result);
+            }
+            debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
+        }
+    }
+
+    fn harvest_ready_results(&mut self) -> Result<()> {
+        loop {
+            let result = match self.result_rx.as_ref() {
+                Some(receiver) => receiver.try_recv(),
+                None => return Ok(()),
+            };
+            match result {
+                Ok((chunk_index, result)) => {
+                    self.outstanding_jobs = self
+                        .outstanding_jobs
+                        .checked_sub(1)
+                        .ok_or_else(|| Error::InvalidFormat("unexpected decoded chunk".into()))?;
+                    self.pending.insert(chunk_index, result);
+                    debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => return Ok(()),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    return if self.outstanding_jobs == 0 {
+                        Ok(())
+                    } else {
+                        Err(Error::InvalidFormat("chunk decoder exited".into()))
+                    };
+                }
+            }
+        }
+    }
+
+    fn maintain_parallelism(&mut self) -> Result<()> {
+        self.harvest_ready_results()?;
+        self.submit_available();
+        Ok(())
+    }
+
+    fn load_next_chunk(&mut self) -> Result<bool> {
+        loop {
+            self.maintain_parallelism()?;
+            if let Some(result) = self.pending.remove(&self.next_yield_chunk) {
+                self.next_yield_chunk += 1;
+                self.current = Some(result?);
+                debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
+                return Ok(true);
+            }
+            if self.input_finished && self.outstanding_jobs == 0 {
+                if self.next_yield_chunk >= self.terminal_chunk {
+                    return Ok(false);
+                }
+                return Err(Error::InvalidFormat("missing decoded chunk".into()));
+            }
+            let (chunk_index, result) = self
+                .result_rx
                 .as_ref()
-                .is_some_and(|range| !range.contains(&original_id))
-            {
+                .ok_or_else(|| Error::InvalidFormat("missing chunk decoder".into()))?
+                .recv()
+                .map_err(|_| Error::InvalidFormat("chunk decoder exited".into()))?;
+            self.outstanding_jobs = self
+                .outstanding_jobs
+                .checked_sub(1)
+                .ok_or_else(|| Error::InvalidFormat("unexpected decoded chunk".into()))?;
+            self.pending.insert(chunk_index, result);
+            debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
+        }
+    }
+}
+
+impl DecodedArchiveChunk {
+    fn next_group(
+        &mut self,
+        layout: AlignmentLayout,
+        range: Option<&RangeInclusive<u64>>,
+    ) -> Option<(u64, AlignedRecordGroup)> {
+        while self.next_record < self.ids[0].len() {
+            let index = self.next_record;
+            self.next_record += 1;
+            let original_id = self.first_record + index as u64;
+            if range.is_some_and(|range| !range.contains(&original_id)) {
                 continue;
             }
             let first = ReadRecord::new(
-                ids[0][index].clone(),
-                decoded[index].1[0].clone(),
-                qualities[0][index].clone(),
+                std::mem::take(&mut self.ids[0][index]),
+                std::mem::take(&mut self.sequences[0][index]),
+                self.qualities[0][index].take(),
             );
             let group = if layout == AlignmentLayout::SingleEnd {
                 AlignedRecordGroup::Single(first)
@@ -890,25 +1130,124 @@ fn decode_aligned<R: Read, F: FnMut(u64, AlignedRecordGroup) -> Result<()>>(
                 AlignedRecordGroup::Paired(
                     first,
                     ReadRecord::new(
-                        ids[1][index].clone(),
-                        decoded[index].1[1].clone(),
-                        qualities[1][index].clone(),
+                        std::mem::take(&mut self.ids[1][index]),
+                        std::mem::take(&mut self.sequences[1][index]),
+                        self.qualities[1][index].take(),
                     ),
                 )
             };
-            emit(original_id, group)?;
+            return Some((original_id, group));
         }
-        first_pair = first_pair
-            .checked_add(pair_count as u64)
-            .ok_or_else(|| Error::InvalidFormat("pair count overflow".into()))?;
+        None
     }
-    let mut trailing = [0; 1];
-    if input.read(&mut trailing)? != 0 {
+}
+
+impl<R: Read> Iterator for AlignedRecordIter<R> {
+    type Item = Result<(u64, AlignedRecordGroup)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if let Err(error) = self.maintain_parallelism() {
+                self.done = true;
+                self.current = None;
+                self.pending.clear();
+                return Some(Err(error));
+            }
+            if let Some(current) = &mut self.current {
+                if let Some(record) = current.next_group(self.layout, self.original_range.as_ref())
+                {
+                    return Some(Ok(record));
+                }
+                self.current = None;
+                debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
+            }
+            match self.load_next_chunk() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(error) => {
+                    self.done = true;
+                    self.current = None;
+                    self.pending.clear();
+                    return Some(Err(error));
+                }
+            }
+        }
+    }
+}
+
+impl<R: Read> std::iter::FusedIterator for AlignedRecordIter<R> {}
+
+fn read_encoded_archive_chunk<R: Read>(
+    input: &mut R,
+    first_record: u64,
+) -> Result<EncodedArchiveChunk> {
+    let record_count = read_u32(input)? as usize;
+    let compressed_len = usize_from(read_u64(input)?, "chunk compressed size")?;
+    let raw_len = usize_from(read_u64(input)?, "chunk uncompressed size")?;
+    let ids_len = usize_from(read_u64(input)?, "chunk ID block size")?;
+    let qualities_len = usize_from(read_u64(input)?, "chunk quality block size")?;
+    let records_len = usize_from(read_u64(input)?, "chunk record block size")?;
+    let mut compressed = vec![0; compressed_len];
+    input.read_exact(&mut compressed)?;
+    Ok(EncodedArchiveChunk {
+        first_record,
+        record_count,
+        raw_len,
+        ids_len,
+        qualities_len,
+        records_len,
+        compressed,
+    })
+}
+
+fn decode_archive_chunk(
+    encoded: EncodedArchiveChunk,
+    id_mode: IdMode,
+    layout: AlignmentLayout,
+    preserve_quality: bool,
+    reference: &[u8],
+) -> Result<DecodedArchiveChunk> {
+    let raw = decode_chunk_sections(
+        &encoded.compressed,
+        encoded.ids_len,
+        encoded.qualities_len,
+        encoded.records_len,
+    )?;
+    let expected_raw_len = encoded
+        .ids_len
+        .checked_add(encoded.qualities_len)
+        .and_then(|length| length.checked_add(encoded.records_len))
+        .ok_or_else(|| Error::InvalidFormat("chunk block size overflow".into()))?;
+    if raw.len() != encoded.raw_len || expected_raw_len != raw.len() {
         return Err(Error::InvalidFormat(
-            "trailing aligned archive bytes".into(),
+            "chunk block sizes do not match".into(),
         ));
     }
-    Ok(layout)
+    let ids_end = encoded.ids_len;
+    let qualities_end = ids_end + encoded.qualities_len;
+    Ok(DecodedArchiveChunk {
+        first_record: encoded.first_record,
+        next_record: 0,
+        ids: decode_ids(&raw[..ids_end], encoded.record_count, id_mode, layout)?,
+        qualities: decode_qualities(
+            &raw[ids_end..qualities_end],
+            encoded.record_count,
+            preserve_quality,
+            layout,
+        )?,
+        sequences: decode_records(
+            &raw[qualities_end..],
+            encoded.record_count,
+            reference,
+            layout,
+        )?,
+    })
 }
 
 fn decode_chunk_sections(
@@ -1570,10 +1909,9 @@ fn encode_record_body<R: ReferenceBases + ?Sized>(
 fn decode_records(
     input: &[u8],
     count: usize,
-    first_pair: u64,
     reference: &[u8],
     layout: AlignmentLayout,
-) -> Result<Vec<(u64, Vec<Vec<u8>>)>> {
+) -> Result<Vec<Vec<Vec<u8>>>> {
     let mut cursor = Cursor::new(input.to_vec());
     let mut starts = [0i64; 2];
     let mut first_starts = vec![None; count];
@@ -1629,14 +1967,7 @@ fn decode_records(
     if cursor.position() != cursor.get_ref().len() as u64 {
         return Err(Error::InvalidFormat("trailing record bytes".into()));
     }
-    Ok((0..count)
-        .map(|index| {
-            (
-                first_pair + index as u64,
-                all.iter().map(|stream| stream[index].clone()).collect(),
-            )
-        })
-        .collect())
+    Ok(all)
 }
 
 fn decode_ids(
@@ -2989,17 +3320,11 @@ mod tests {
         let reference_slice = reference.as_slice();
         let encoded =
             write_record_stream(reference_slice, &pairs, AlignmentLayout::PairedEnd).unwrap();
-        let decoded = decode_records(
-            &encoded,
-            pairs.len(),
-            0,
-            reference,
-            AlignmentLayout::PairedEnd,
-        )
-        .unwrap();
-        assert_eq!(decoded[0].1[0], first_sequence);
-        assert_eq!(decoded[0].1[1], second_sequence);
-        assert_eq!(decoded[1].1[0], b"ACGTNCGT");
-        assert_eq!(decoded[1].1[1], b"NNNNNNNN");
+        let decoded =
+            decode_records(&encoded, pairs.len(), reference, AlignmentLayout::PairedEnd).unwrap();
+        assert_eq!(decoded[0][0], first_sequence);
+        assert_eq!(decoded[1][0], second_sequence);
+        assert_eq!(decoded[0][1], b"ACGTNCGT");
+        assert_eq!(decoded[1][1], b"NNNNNNNN");
     }
 }

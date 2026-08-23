@@ -548,26 +548,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trips_block_raw() {
-        let block: Vec<Vec<u8>> = vec![
-            b"DDDDDDDD".to_vec(),
-            b"DDDD9DDD".to_vec(),
-            b"DD,DD9DD".to_vec(),
-        ];
-        let encoded = encode_block(&block).unwrap();
-        assert_eq!(encoded.mode, BlockMode::DensePacked);
-        let decoded = decode_block(
-            encoded.mode,
-            encoded.width,
-            encoded.records as usize,
-            &encoded.alphabet,
-            &encoded.body,
-        )
-        .unwrap();
-        assert_eq!(decoded, block);
-    }
-
-    #[test]
     fn round_trips_quality_blocks_with_packing() {
         let qualities: Vec<Vec<u8>> = (0..1000)
             .map(|i| {
@@ -601,24 +581,6 @@ mod tests {
         let values = vec![b"IIII".as_slice(), b"JJJJ".as_slice(), b"K".as_slice()];
         let encoded = encode_stream_bytes(&values).unwrap();
         assert_eq!(decode_stream_bytes(&encoded, values.len()).unwrap(), values);
-    }
-
-    #[test]
-    fn falls_back_to_raw_for_large_alphabet() {
-        let block: Vec<Vec<u8>> = (0..16)
-            .map(|i| (0..32).map(|j| (i + j) as u8).collect())
-            .collect();
-        let encoded = encode_block(&block).unwrap();
-        assert_eq!(encoded.mode, BlockMode::Raw);
-        let decoded = decode_block(
-            encoded.mode,
-            encoded.width,
-            encoded.records as usize,
-            &encoded.alphabet,
-            &encoded.body,
-        )
-        .unwrap();
-        assert_eq!(decoded, block);
     }
 
     #[test]

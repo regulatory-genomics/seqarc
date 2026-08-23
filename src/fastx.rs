@@ -2,7 +2,19 @@ use crate::{Error, ReadRecord, Result};
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use std::io::{BufRead, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+
+const INPUT_BUFFER_SIZE: usize = 1024 * 1024;
+const DECODED_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputCompression {
+    Plain,
+    Gzip,
+    Zstd,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -16,6 +28,37 @@ pub fn gzip_reader<R: std::io::Read>(reader: R) -> MultiGzDecoder<R> {
 
 pub fn gzip_writer<W: Write>(writer: W, level: u32) -> GzEncoder<W> {
     GzEncoder::new(writer, Compression::new(level.min(9)))
+}
+
+/// Open a plain, gzip, or zstd-compressed input detected from its magic bytes.
+pub fn open_fastx_reader(path: impl AsRef<Path>) -> Result<Box<dyn BufRead + Send>> {
+    let mut input = BufReader::with_capacity(INPUT_BUFFER_SIZE, File::open(path)?);
+    let compression = detect_compression(input.fill_buf()?);
+    let reader: Box<dyn BufRead + Send> = match compression {
+        InputCompression::Plain => Box::new(input),
+        InputCompression::Gzip => Box::new(BufReader::with_capacity(
+            DECODED_BUFFER_SIZE,
+            gzip_reader(input),
+        )),
+        InputCompression::Zstd => Box::new(BufReader::with_capacity(
+            DECODED_BUFFER_SIZE,
+            zstd::stream::read::Decoder::with_buffer(input)?,
+        )),
+    };
+    Ok(reader)
+}
+
+fn detect_compression(prefix: &[u8]) -> InputCompression {
+    if prefix.starts_with(&[0x1f, 0x8b]) {
+        return InputCompression::Gzip;
+    }
+    if prefix.len() >= 4 {
+        let magic = u32::from_le_bytes(prefix[..4].try_into().unwrap());
+        if magic == 0xfd2f_b528 || magic & 0xffff_fff0 == 0x184d_2a50 {
+            return InputCompression::Zstd;
+        }
+    }
+    InputCompression::Plain
 }
 
 pub struct FastxReader<R> {
@@ -151,5 +194,57 @@ impl<W: Write> FastxWriter<W> {
     }
     pub fn finish(mut self) -> Result<()> {
         self.writer.flush().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn opens_plain_gzip_and_concatenated_zstd_with_misleading_extensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let parts = [
+            b"@read0\nACGT\n+\nIIII\n".as_slice(),
+            b"@read1\nTGCA\n+\nJJJJ\n",
+        ];
+        let expected = parts.concat();
+
+        let plain = directory.path().join("plain.fastq.zst");
+        std::fs::write(&plain, &expected).unwrap();
+
+        let gzip = directory.path().join("gzip.fastq");
+        let mut gzip_writer = gzip_writer(File::create(&gzip).unwrap(), 1);
+        gzip_writer.write_all(&expected).unwrap();
+        gzip_writer.finish().unwrap();
+
+        let zstd = directory.path().join("zstd.fastq.gz");
+        let mut encoded = Vec::from([0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0]);
+        for part in parts {
+            let mut encoder = zstd::stream::write::Encoder::new(&mut encoded, 1).unwrap();
+            encoder.write_all(part).unwrap();
+            encoder.finish().unwrap();
+        }
+        std::fs::write(&zstd, encoded).unwrap();
+
+        for path in [plain, gzip, zstd] {
+            let mut decoded = Vec::new();
+            open_fastx_reader(path)
+                .unwrap()
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn malformed_zstd_is_reported_while_reading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("truncated.fastq");
+        std::fs::write(&path, [0x28, 0xb5, 0x2f, 0xfd, 0x00]).unwrap();
+        let mut reader = open_fastx_reader(path).unwrap();
+        let mut decoded = Vec::new();
+        assert!(reader.read_to_end(&mut decoded).is_err());
     }
 }

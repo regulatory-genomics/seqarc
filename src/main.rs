@@ -1,11 +1,11 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use seqarc::{
     build_genome_index_with_options, compress_aligned_paired_fastq_files_with_index_profiled,
-    compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into, gzip_reader,
-    AlignedRecordGroup, AlignedRecordSink, AlignmentCompressionOptions, DecompressionOptions,
-    Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode, ReadRecord, Result,
+    compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
+    open_fastx_reader, AlignedRecordGroup, AlignedRecordSink, AlignmentCompressionOptions,
+    DecompressionOptions, Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode,
+    ReadRecord, Result,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -24,7 +24,7 @@ struct Cli {
 enum Command {
     /// Build a single-file SeqArc genome index.
     Index(IndexArgs),
-    /// Compress single-end or paired gzipped FASTQ files.
+    /// Compress single-end or paired plain, gzip, or zstd FASTQ files.
     Compress(CompressArgs),
     /// Decompress an aligned SeqArc archive.
     Decompress(DecompressArgs),
@@ -34,7 +34,7 @@ enum Command {
 
 #[derive(Args)]
 struct IndexArgs {
-    /// Input FASTA or FASTA.gz reference.
+    /// Input plain, gzip, or zstd FASTA reference.
     reference: PathBuf,
     /// Output .seqarc-index file.
     #[arg(short, long)]
@@ -59,10 +59,10 @@ struct CompressArgs {
     /// Input .seqarc-index file.
     #[arg(short, long)]
     index: PathBuf,
-    /// Input gzipped FASTQ; mate 1 for paired input.
+    /// Input plain, gzip, or zstd FASTQ; mate 1 for paired input.
     #[arg(short = '1', long)]
     mate_1: PathBuf,
-    /// Optional mate-2 gzipped FASTQ. Omit for single-end input.
+    /// Optional plain, gzip, or zstd mate-2 FASTQ. Omit for single-end input.
     #[arg(short = '2', long)]
     mate_2: Option<PathBuf>,
     /// Output .seqarc archive.
@@ -144,10 +144,10 @@ struct DecompressArgs {
 struct ValidateArgs {
     /// Input aligned .seqarc archive.
     archive: PathBuf,
-    /// Original input FASTQ; mate 1 for paired comparison.
+    /// Original plain, gzip, or zstd FASTQ; mate 1 for paired comparison.
     #[arg(long)]
     mate_1: Option<PathBuf>,
-    /// Original mate-2 gzipped FASTQ for byte comparison.
+    /// Original plain, gzip, or zstd mate-2 FASTQ for byte comparison.
     #[arg(long, requires = "mate_1")]
     mate_2: Option<PathBuf>,
 }
@@ -341,7 +341,7 @@ impl AlignedRecordSink for CountingSink {
     }
 }
 
-type OriginalReader = FastxReader<BufReader<MultiGzDecoder<File>>>;
+type OriginalReader = FastxReader<Box<dyn std::io::BufRead + Send>>;
 
 struct ComparisonSink {
     first: OriginalReader,
@@ -628,16 +628,11 @@ fn validate_command(args: ValidateArgs) -> Result<()> {
     let archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(args.archive)?);
     if let Some(first) = args.mate_1 {
         let mut sink = ComparisonSink {
-            first: FastxReader::new(
-                BufReader::new(gzip_reader(File::open(first)?)),
-                Format::Fastq,
-            ),
+            first: FastxReader::new(open_fastx_reader(first)?, Format::Fastq),
             second: args
                 .mate_2
                 .map(|second| {
-                    File::open(second).map(|file| {
-                        FastxReader::new(BufReader::new(gzip_reader(file)), Format::Fastq)
-                    })
+                    open_fastx_reader(second).map(|reader| FastxReader::new(reader, Format::Fastq))
                 })
                 .transpose()?,
             records: 0,

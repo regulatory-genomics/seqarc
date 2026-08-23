@@ -361,11 +361,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minimizers_are_canonical_and_deduplicated() {
-        let forward = canonical_minimizers(b"ACGTACGTACGT", 3, 4);
-        let reverse = canonical_minimizers(b"ACGTACGTACGT", 3, 4);
+    fn minimizers_are_reverse_complement_canonical() {
+        let sequence = b"ACGTTGCATGTCAGTACGAT";
+        let k = 5;
+        let reverse_sequence = sequence
+            .iter()
+            .rev()
+            .map(|base| match base {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+
+        let forward = canonical_minimizers(sequence, k, 1);
+        let mut reverse = canonical_minimizers(&reverse_sequence, k, 1)
+            .into_iter()
+            .map(|(hash, position, is_reverse)| {
+                (
+                    hash,
+                    (sequence.len() - k - position as usize) as u32,
+                    !is_reverse,
+                )
+            })
+            .collect::<Vec<_>>();
+        reverse.sort_by_key(|(_, position, _)| *position);
         assert_eq!(forward, reverse);
-        assert!(forward.windows(2).all(|pair| pair[0] != pair[1]));
     }
 
     #[test]

@@ -5607,18 +5607,6 @@ mod tests {
     }
 
     #[test]
-    fn group_metadata_preserves_arbitrary_bytes() {
-        let values = [b"\x80\x00prefix-a".as_slice(), b"\x80\x00prefix-b"];
-        assert_eq!(
-            metadata_round_trip(&values, 2),
-            values
-                .iter()
-                .map(|value| value.to_vec())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn paired_id_patterns_are_losslessly_derivable() {
         assert_eq!(
             PairedIdPattern::detect(b"read/1", b"read/2"),

@@ -13,13 +13,13 @@ mod reference_free;
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub use fastx::{gzip_reader, gzip_writer, FastxReader, FastxWriter, Format};
+pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
 pub use reference_free::record_store::{PairStore, StoreStats};
 pub use reference_free::reorder;
 pub use reference_free::reorder::{
@@ -346,7 +346,7 @@ pub struct ArchiveRecords {
     pub streams: Vec<Vec<ReadRecord>>,
 }
 
-/// Compress paired gzipped FASTQ files into a native archive.
+/// Compress paired plain, gzip, or zstd FASTQ files into a native archive.
 ///
 /// Uses the store-backed RS4 consensus path.
 pub fn compress_paired_fastq_files(
@@ -439,26 +439,8 @@ pub fn compress_reordered_paired_fastq_files_profiled(
             let producer_options = options.clone();
             scope.spawn(move || {
                 let result = (|| -> Result<()> {
-                    let first = FastxReader::new(
-                        BufReader::with_capacity(
-                            8 * 1024 * 1024,
-                            gzip_reader(BufReader::with_capacity(
-                                1024 * 1024,
-                                File::open(input_1)?,
-                            )),
-                        ),
-                        Format::Fastq,
-                    );
-                    let second = FastxReader::new(
-                        BufReader::with_capacity(
-                            8 * 1024 * 1024,
-                            gzip_reader(BufReader::with_capacity(
-                                1024 * 1024,
-                                File::open(input_2)?,
-                            )),
-                        ),
-                        Format::Fastq,
-                    );
+                    let first = FastxReader::new(open_fastx_reader(input_1)?, Format::Fastq);
+                    let second = FastxReader::new(open_fastx_reader(input_2)?, Format::Fastq);
                     let mut first = first;
                     let mut second = second;
                     let mut batch = Vec::with_capacity(2048);
@@ -570,7 +552,7 @@ pub fn compress_reordered_paired_fastq_files_profiled(
     Ok((metadata, profile))
 }
 
-/// Compress paired gzipped FASTQ files against an embedded genome reference.
+/// Compress paired plain, gzip, or zstd FASTQ files against a genome reference.
 ///
 /// Mapped reads store their reference offset, strand, CIGAR, and sequence noise.
 /// Reads without a minibwa alignment are stored using the packed/raw fallback.
@@ -585,7 +567,7 @@ pub fn compress_aligned_paired_fastq_files(
         .map(|(metadata, _)| metadata)
 }
 
-/// Compress paired gzipped FASTQ files and report aligned archive size details.
+/// Compress paired plain, gzip, or zstd FASTQ files and report archive details.
 pub fn compress_aligned_paired_fastq_files_profiled(
     genome_fasta: impl AsRef<Path>,
     input_1: impl AsRef<Path>,
@@ -596,7 +578,7 @@ pub fn compress_aligned_paired_fastq_files_profiled(
     alignment_archive::compress_paired_fastq_files(genome_fasta, input_1, input_2, output, options)
 }
 
-/// Compress paired gzipped FASTQ files using an existing minibwa index.
+/// Compress paired plain, gzip, or zstd FASTQ files using an existing index.
 pub fn compress_aligned_paired_fastq_files_with_index(
     index_file: impl AsRef<Path>,
     input_1: impl AsRef<Path>,
@@ -831,15 +813,7 @@ pub fn build_genome_index_with_options(
 ) -> Result<minibwa::Index> {
     let workspace = temporary_directory(options.temp_dir.as_deref(), "seqarc-index-")?;
     let genome_fasta = genome_fasta.as_ref();
-    let input = File::open(genome_fasta)?;
-    let reader: Box<dyn Read> = if genome_fasta
-        .extension()
-        .is_some_and(|extension| extension == "gz")
-    {
-        Box::new(gzip_reader(input))
-    } else {
-        Box::new(input)
-    };
+    let reader = open_fastx_reader(genome_fasta)?;
     let mut fasta = tempfile::NamedTempFile::new_in(workspace.path())?;
     {
         let mut writer = std::io::BufWriter::new(fasta.as_file_mut());
@@ -847,7 +821,7 @@ pub fn build_genome_index_with_options(
         let mut output = Vec::with_capacity(1 << 20);
         let mut line_length = 0usize;
         let mut reference_length = 0u64;
-        for record in FastxReader::new(BufReader::new(reader), Format::Fasta) {
+        for record in FastxReader::new(reader, Format::Fasta) {
             for base in record?.sequence {
                 let base = base.to_ascii_uppercase();
                 if !matches!(base, b'A' | b'C' | b'G' | b'T') {

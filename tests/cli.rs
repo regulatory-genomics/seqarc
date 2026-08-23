@@ -10,6 +10,12 @@ fn write_gzip(path: &std::path::Path, contents: &[u8]) {
     writer.finish().unwrap();
 }
 
+fn write_zstd(path: &std::path::Path, contents: &[u8]) {
+    let mut writer = zstd::stream::write::Encoder::new(File::create(path).unwrap(), 1).unwrap();
+    writer.write_all(contents).unwrap();
+    writer.finish().unwrap();
+}
+
 fn assert_directory_empty(path: &std::path::Path) {
     assert!(path.is_dir());
     assert!(std::fs::read_dir(path).unwrap().next().is_none());
@@ -31,7 +37,7 @@ fn help_lists_aligned_workflow_commands() {
 #[test]
 fn aligned_cli_round_trip_and_validation() {
     let directory = tempfile::tempdir().unwrap();
-    let reference_path = directory.path().join("reference.fa");
+    let reference_path = directory.path().join("reference.fa.zst");
     let index_path = directory.path().join("reference.seqarc-index");
     let first_path = directory.path().join("reads.1.fastq.gz");
     let second_path = directory.path().join("reads.2.fastq.gz");
@@ -42,11 +48,10 @@ fn aligned_cli_round_trip_and_validation() {
 
     let reference =
         b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
-    std::fs::write(
+    write_zstd(
         &reference_path,
-        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
-    )
-    .unwrap();
+        &[b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    );
 
     let first_sequence = &reference[20..60];
     let second_sequence = reference[20..60]
@@ -75,7 +80,7 @@ fn aligned_cli_round_trip_and_validation() {
         "$".repeat(40),
     );
     write_gzip(&first_path, first_fastq.as_bytes());
-    write_gzip(&second_path, second_fastq.as_bytes());
+    write_zstd(&second_path, second_fastq.as_bytes());
 
     Command::cargo_bin("seqarc")
         .unwrap()
@@ -201,7 +206,7 @@ fn single_end_cli_round_trip_and_validation() {
     let directory = tempfile::tempdir().unwrap();
     let reference_path = directory.path().join("reference.fa");
     let index_path = directory.path().join("reference.seqarc-index");
-    let input_path = directory.path().join("reads.fastq.gz");
+    let input_path = directory.path().join("reads.fastq");
     let archive_path = directory.path().join("reads.seqarc");
     let decoded_path = directory.path().join("decoded.fastq");
 
@@ -220,7 +225,7 @@ fn single_end_cli_round_trip_and_validation() {
         "N".repeat(40),
         "#".repeat(40),
     );
-    write_gzip(&input_path, fastq.as_bytes());
+    std::fs::write(&input_path, fastq.as_bytes()).unwrap();
 
     Command::cargo_bin("seqarc")
         .unwrap()

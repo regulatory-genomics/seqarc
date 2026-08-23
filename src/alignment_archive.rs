@@ -3,7 +3,7 @@ use crate::minibwa::{Aligner, CigarKind, CigarOp, Index, Opts, Strand, ThreadBuf
 use crate::packed_sequence::PackedSequence;
 use crate::quality_blocks::{decode_stream_bytes, encode_stream_bytes};
 use crate::{
-    apply_quality, gzip_reader, AlignedCompressionProfile, AlignedDecompressionMetadata,
+    apply_quality, open_fastx_reader, AlignedCompressionProfile, AlignedDecompressionMetadata,
     AlignedRecordGroup, AlignedRecordSink, AlignmentLayout, ArchiveRecords, CompressionMetadata,
     DecompressionOptions, Error, FastxReader, Format, GenomeAlignment, PairedRecordSink,
     ReadRecord, Result,
@@ -13,7 +13,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
@@ -438,16 +438,10 @@ fn compress_with_index<I2: AsRef<Path>>(
     let result = std::thread::scope(|scope| -> Result<()> {
         let producer_tx = parse_tx.clone();
         let producer = scope.spawn(move || -> Result<()> {
-            let mut first = FastxReader::new(
-                BufReader::new(gzip_reader(File::open(input_1)?)),
-                Format::Fastq,
-            );
+            let mut first = FastxReader::new(open_fastx_reader(input_1)?, Format::Fastq);
             let mut pairs = Vec::with_capacity(PARSE_BATCH_PAIRS);
             if let Some(input_2) = input_2 {
-                let mut second = FastxReader::new(
-                    BufReader::new(gzip_reader(File::open(input_2)?)),
-                    Format::Fastq,
-                );
+                let mut second = FastxReader::new(open_fastx_reader(input_2)?, Format::Fastq);
                 loop {
                     match (first.next(), second.next()) {
                         (None, None) => break,

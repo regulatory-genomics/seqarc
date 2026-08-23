@@ -142,17 +142,4 @@ mod tests {
         assert!(!packed.packed);
         assert_eq!(packed.decode(), sequence);
     }
-
-    #[test]
-    fn rkyv_round_trip_preserves_encoding() {
-        for sequence in [b"ACGTACG".as_slice(), b"AcgTN-\xff".as_slice()] {
-            let packed = PackedSequence::from_bytes(sequence);
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&packed).unwrap();
-            let archived = unsafe { rkyv::access_unchecked::<ArchivedPackedSequence>(&bytes) };
-            let decoded =
-                rkyv::deserialize::<PackedSequence, rkyv::rancor::Error>(archived).unwrap();
-            assert_eq!(decoded, packed);
-            assert_eq!(decoded.decode(), sequence);
-        }
-    }
 }

@@ -633,7 +633,7 @@ fn compress_with_index<I2: AsRef<Path>>(
                 let mut chunk_index = 0usize;
                 for item in spool {
                     let item = item.map_err(|error| Error::InvalidFormat(error.to_string()))?;
-                    pairs.push(item.into_aligned_pair(&kept_runs)?);
+                    pairs.push(item.into_aligned_pair(&kept_runs, index.reference_len())?);
                     if pairs.len() == options.chunk_records.max(1) {
                         job_tx
                             .send(Ok((chunk_index, std::mem::take(&mut pairs))))
@@ -1045,16 +1045,22 @@ impl ReferenceMask {
         for op in &hit.cigar {
             let length = op.len as usize;
             match op.kind {
-                CigarKind::Match
-                | CigarKind::Eq
-                | CigarKind::Diff
-                | CigarKind::Del
-                | CigarKind::RefSkip => {
+                CigarKind::Match | CigarKind::Eq | CigarKind::Diff => {
                     let end = position.checked_add(length).ok_or_else(|| {
                         Error::InvalidInput("reference mask position overflow".into())
                     })?;
                     self.mark_range(position, end)?;
                     position = end;
+                }
+                CigarKind::Del | CigarKind::RefSkip => {
+                    position = position.checked_add(length).ok_or_else(|| {
+                        Error::InvalidInput("reference mask position overflow".into())
+                    })?;
+                    if position > self.length {
+                        return Err(Error::InvalidFormat(
+                            "reference mask range out of bounds".into(),
+                        ));
+                    }
                 }
                 CigarKind::Ins | CigarKind::SoftClip | CigarKind::HardClip | CigarKind::Pad => {}
             }
@@ -1109,14 +1115,19 @@ fn compact_reference<R: ReferenceBases + ?Sized>(
     Ok((compact, runs))
 }
 
-fn compact_position(runs: &[KeptRun], original: usize) -> Result<usize> {
+fn compact_boundary(runs: &[KeptRun], original: usize, reference_len: usize) -> Result<usize> {
+    if original > reference_len {
+        return Err(Error::InvalidFormat(
+            "alignment position exceeds reference".into(),
+        ));
+    }
     let index = runs.partition_point(|run| run.original_start <= original);
-    let run = index
+    Ok(index
         .checked_sub(1)
         .and_then(|index| runs.get(index))
-        .filter(|run| original < run.original_start + run.length)
-        .ok_or_else(|| Error::InvalidFormat("alignment starts in pruned reference".into()))?;
-    Ok(run.compact_start + (original - run.original_start))
+        .map_or(0, |run| {
+            run.compact_start + (original - run.original_start).min(run.length)
+        }))
 }
 
 impl SpoolPair {
@@ -1131,19 +1142,19 @@ impl SpoolPair {
         })
     }
 
-    fn into_aligned_pair(self, runs: &[KeptRun]) -> Result<AlignedPair> {
+    fn into_aligned_pair(self, runs: &[KeptRun], reference_len: usize) -> Result<AlignedPair> {
         Ok(AlignedPair {
             first: self.first.record()?,
             second: self.second.as_ref().map(SpoolRead::record).transpose()?,
             first_hit: self
                 .first
                 .alignment
-                .map(|hit| hit.into_genome(runs))
+                .map(|hit| hit.into_genome(runs, reference_len))
                 .transpose()?,
             second_hit: self
                 .second
                 .and_then(|read| read.alignment)
-                .map(|hit| hit.into_genome(runs))
+                .map(|hit| hit.into_genome(runs, reference_len))
                 .transpose()?,
             first_selection: AlignmentSelection::default(),
             second_selection: AlignmentSelection::default(),
@@ -1190,18 +1201,59 @@ impl SpoolAlignment {
         })
     }
 
-    fn into_genome(self, runs: &[KeptRun]) -> Result<GenomeAlignment> {
-        let start = compact_position(runs, nonnegative_usize(self.start, "alignment start")?)?;
-        let cigar = self
-            .cigar
-            .into_iter()
-            .map(|op| {
-                Ok(CigarOp {
-                    kind: cigar_kind(op.op)?,
-                    len: op.len,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+    fn into_genome(self, runs: &[KeptRun], reference_len: usize) -> Result<GenomeAlignment> {
+        let original_start = nonnegative_usize(self.start, "alignment start")?;
+        let start = compact_boundary(runs, original_start, reference_len)?;
+        let mut original_position = original_start;
+        let mut cigar: Vec<CigarOp> = Vec::with_capacity(self.cigar.len());
+        for op in self.cigar {
+            let kind = cigar_kind(op.op)?;
+            let len = match kind {
+                CigarKind::Match | CigarKind::Eq | CigarKind::Diff => {
+                    let end = original_position
+                        .checked_add(op.len as usize)
+                        .ok_or_else(|| Error::InvalidInput("alignment position overflow".into()))?;
+                    let compact_start = compact_boundary(runs, original_position, reference_len)?;
+                    let compact_end = compact_boundary(runs, end, reference_len)?;
+                    let compact_len = compact_end.checked_sub(compact_start).ok_or_else(|| {
+                        Error::InvalidFormat("compact alignment position underflow".into())
+                    })?;
+                    if compact_len != op.len as usize {
+                        return Err(Error::InvalidFormat(
+                            "aligned reference bases were pruned".into(),
+                        ));
+                    }
+                    original_position = end;
+                    op.len
+                }
+                CigarKind::Del | CigarKind::RefSkip => {
+                    let end = original_position
+                        .checked_add(op.len as usize)
+                        .ok_or_else(|| Error::InvalidInput("alignment position overflow".into()))?;
+                    let compact_start = compact_boundary(runs, original_position, reference_len)?;
+                    let compact_end = compact_boundary(runs, end, reference_len)?;
+                    original_position = end;
+                    u32::try_from(compact_end.checked_sub(compact_start).ok_or_else(|| {
+                        Error::InvalidFormat("compact alignment position underflow".into())
+                    })?)
+                    .map_err(|_| Error::InvalidInput("compact CIGAR length exceeds u32".into()))?
+                }
+                CigarKind::Ins | CigarKind::SoftClip | CigarKind::HardClip | CigarKind::Pad => {
+                    op.len
+                }
+            };
+            if len == 0 && matches!(kind, CigarKind::Del | CigarKind::RefSkip) {
+                continue;
+            }
+            if let Some(previous) = cigar.last_mut().filter(|previous| previous.kind == kind) {
+                previous.len = previous
+                    .len
+                    .checked_add(len)
+                    .ok_or_else(|| Error::InvalidInput("CIGAR length overflow".into()))?;
+            } else {
+                cigar.push(CigarOp { kind, len });
+            }
+        }
         Ok(GenomeAlignment {
             start: start as i64,
             query_start: self.query_start,
@@ -1773,7 +1825,33 @@ fn effective_cigar(hit: &GenomeAlignment, read_len: usize) -> Result<Vec<CigarOp
             len: suffix as u32,
         });
     }
-    Ok(cigar)
+    normalize_cigar(cigar)
+}
+
+fn normalize_cigar(cigar: impl IntoIterator<Item = CigarOp>) -> Result<Vec<CigarOp>> {
+    let mut normalized: Vec<CigarOp> = Vec::new();
+    for op in cigar {
+        let kind = match op.kind {
+            CigarKind::Eq | CigarKind::Diff => CigarKind::Match,
+            CigarKind::HardClip | CigarKind::Pad => continue,
+            kind => kind,
+        };
+        if op.len == 0 {
+            continue;
+        }
+        if let Some(previous) = normalized
+            .last_mut()
+            .filter(|previous| previous.kind == kind)
+        {
+            previous.len = previous
+                .len
+                .checked_add(op.len)
+                .ok_or_else(|| Error::InvalidInput("CIGAR length overflow".into()))?;
+        } else {
+            normalized.push(CigarOp { kind, len: op.len });
+        }
+    }
+    Ok(normalized)
 }
 
 fn encode_noise<R: ReferenceBases + ?Sized>(
@@ -2406,6 +2484,269 @@ mod tests {
         let encoded =
             encode_reference(reference, &crate::AlignmentCompressionOptions::default()).unwrap();
         assert_eq!(decode_reference(&encoded.block).unwrap(), reference);
+    }
+
+    #[test]
+    fn compact_boundaries_include_only_retained_bases() {
+        let runs = vec![
+            KeptRun {
+                original_start: 5,
+                compact_start: 0,
+                length: 3,
+            },
+            KeptRun {
+                original_start: 10,
+                compact_start: 3,
+                length: 2,
+            },
+        ];
+        for (original, compact) in [
+            (0, 0),
+            (5, 0),
+            (6, 1),
+            (8, 3),
+            (9, 3),
+            (10, 3),
+            (12, 5),
+            (20, 5),
+        ] {
+            assert_eq!(compact_boundary(&runs, original, 20).unwrap(), compact);
+        }
+        assert!(compact_boundary(&runs, 21, 20).is_err());
+    }
+
+    #[test]
+    fn effective_cigar_is_canonical() {
+        let hit = GenomeAlignment {
+            start: 0,
+            query_start: 2,
+            query_end: 8,
+            cigar: vec![
+                CigarOp {
+                    kind: CigarKind::SoftClip,
+                    len: 1,
+                },
+                CigarOp {
+                    kind: CigarKind::Eq,
+                    len: 2,
+                },
+                CigarOp {
+                    kind: CigarKind::Diff,
+                    len: 1,
+                },
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 2,
+                },
+                CigarOp {
+                    kind: CigarKind::HardClip,
+                    len: 4,
+                },
+                CigarOp {
+                    kind: CigarKind::Pad,
+                    len: 1,
+                },
+                CigarOp {
+                    kind: CigarKind::Del,
+                    len: 0,
+                },
+            ],
+            is_reverse: false,
+        };
+        assert_eq!(
+            effective_cigar(&hit, 10).unwrap(),
+            vec![
+                CigarOp {
+                    kind: CigarKind::SoftClip,
+                    len: 3,
+                },
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 5,
+                },
+                CigarOp {
+                    kind: CigarKind::SoftClip,
+                    len: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn uncovered_deletions_and_reference_skips_are_pruned() {
+        let reference = [b"AAA".as_slice(), &[b'C'; 10], b"GGG".as_slice()].concat();
+        for kind in [CigarKind::Del, CigarKind::RefSkip] {
+            for reverse in [false, true] {
+                let hit = GenomeAlignment {
+                    start: 0,
+                    query_start: 0,
+                    query_end: 6,
+                    cigar: vec![
+                        CigarOp {
+                            kind: CigarKind::Match,
+                            len: 3,
+                        },
+                        CigarOp { kind, len: 10 },
+                        CigarOp {
+                            kind: CigarKind::Match,
+                            len: 3,
+                        },
+                    ],
+                    is_reverse: reverse,
+                };
+                let mut mask = ReferenceMask::new(reference.len());
+                mask.mark_hit(&hit).unwrap();
+                let (compact, runs) = compact_reference(reference.as_slice(), &mask).unwrap();
+                assert_eq!(compact, b"AAAGGG");
+
+                let transformed = SpoolAlignment::from_genome(hit)
+                    .unwrap()
+                    .into_genome(&runs, reference.len())
+                    .unwrap();
+                assert_eq!(
+                    transformed.cigar,
+                    vec![CigarOp {
+                        kind: CigarKind::Match,
+                        len: 6,
+                    }]
+                );
+
+                let mut sequence = compact.clone();
+                if reverse {
+                    reverse_complement(&mut sequence);
+                }
+                let record = ReadRecord::new("read", sequence.clone(), None);
+                let mut encoded = Vec::new();
+                encode_record_body(&mut encoded, &record, &transformed, compact.as_slice())
+                    .unwrap();
+                let decoded = decode_mapped_body(
+                    &mut Cursor::new(encoded),
+                    &compact,
+                    transformed.start,
+                    reverse,
+                )
+                .unwrap();
+                assert_eq!(decoded, sequence);
+            }
+        }
+    }
+
+    #[test]
+    fn reference_skip_retains_bases_used_by_an_overlapping_alignment() {
+        let reference = [b"AAA".as_slice(), &[b'C'; 10], b"GGG".as_slice()].concat();
+        let skipped = GenomeAlignment {
+            start: 0,
+            query_start: 0,
+            query_end: 6,
+            cigar: vec![
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 3,
+                },
+                CigarOp {
+                    kind: CigarKind::RefSkip,
+                    len: 10,
+                },
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 3,
+                },
+            ],
+            is_reverse: false,
+        };
+        let overlapping = GenomeAlignment {
+            start: 6,
+            query_start: 0,
+            query_end: 4,
+            cigar: vec![CigarOp {
+                kind: CigarKind::Match,
+                len: 4,
+            }],
+            is_reverse: false,
+        };
+        let mut mask = ReferenceMask::new(reference.len());
+        mask.mark_hit(&skipped).unwrap();
+        mask.mark_hit(&overlapping).unwrap();
+        let (compact, runs) = compact_reference(reference.as_slice(), &mask).unwrap();
+        assert_eq!(compact, b"AAACCCCGGG");
+
+        let skipped = SpoolAlignment::from_genome(skipped)
+            .unwrap()
+            .into_genome(&runs, reference.len())
+            .unwrap();
+        assert_eq!(
+            skipped.cigar,
+            vec![
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 3,
+                },
+                CigarOp {
+                    kind: CigarKind::RefSkip,
+                    len: 4,
+                },
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 3,
+                },
+            ]
+        );
+        let overlapping = SpoolAlignment::from_genome(overlapping)
+            .unwrap()
+            .into_genome(&runs, reference.len())
+            .unwrap();
+        assert_eq!(overlapping.start, 3);
+
+        for (sequence, hit) in [(b"AAAGGG".as_slice(), skipped), (b"CCCC", overlapping)] {
+            let record = ReadRecord::new("read", sequence.to_vec(), None);
+            let mut encoded = Vec::new();
+            encode_record_body(&mut encoded, &record, &hit, compact.as_slice()).unwrap();
+            assert_eq!(
+                decode_mapped_body(&mut Cursor::new(encoded), &compact, hit.start, false).unwrap(),
+                sequence
+            );
+        }
+    }
+
+    #[test]
+    fn leading_and_trailing_skips_do_not_retain_reference() {
+        let reference = [b"CCCCC".as_slice(), b"AAA", b"GGGGG"].concat();
+        let hit = GenomeAlignment {
+            start: 0,
+            query_start: 0,
+            query_end: 3,
+            cigar: vec![
+                CigarOp {
+                    kind: CigarKind::Del,
+                    len: 5,
+                },
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 3,
+                },
+                CigarOp {
+                    kind: CigarKind::RefSkip,
+                    len: 5,
+                },
+            ],
+            is_reverse: false,
+        };
+        let mut mask = ReferenceMask::new(reference.len());
+        mask.mark_hit(&hit).unwrap();
+        let (compact, runs) = compact_reference(reference.as_slice(), &mask).unwrap();
+        assert_eq!(compact, b"AAA");
+        let transformed = SpoolAlignment::from_genome(hit)
+            .unwrap()
+            .into_genome(&runs, reference.len())
+            .unwrap();
+        assert_eq!(transformed.start, 0);
+        assert_eq!(
+            transformed.cigar,
+            vec![CigarOp {
+                kind: CigarKind::Match,
+                len: 3,
+            }]
+        );
     }
 
     #[test]

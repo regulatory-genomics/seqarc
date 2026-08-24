@@ -514,9 +514,25 @@ fn compress_with_index<I2: AsRef<Path>>(
     let map_started = std::time::Instant::now();
     let result = std::thread::scope(|scope| -> Result<()> {
         let producer_tx = parse_tx.clone();
+        let producer_progress = progress.clone();
         let producer = scope.spawn(move || -> Result<()> {
             let mut first = FastxReader::new(open_fastx_reader(input_1)?, Format::Fastq);
             let mut pairs = Vec::with_capacity(mapping_batch_records);
+            let mut preview_identifier = mapper_options.id_prefix_chars.is_some();
+            let mut prepare_identifier = |record: &mut ReadRecord| -> Result<()> {
+                let original = preview_identifier.then(|| record.id.clone());
+                apply_identifier_policy(record, preserve_ids, mapper_options.id_prefix_chars)?;
+                if let Some(original) = original {
+                    let old_header = format!("@{}", String::from_utf8_lossy(&original));
+                    let new_header = format!("@{}", String::from_utf8_lossy(&record.id));
+                    stage_log(
+                        &producer_progress,
+                        format!("[seqarc] id-prefix preview: {old_header:?} -> {new_header:?}"),
+                    );
+                    preview_identifier = false;
+                }
+                Ok(())
+            };
             if let Some(input_2) = input_2 {
                 let mut second = FastxReader::new(open_fastx_reader(input_2)?, Format::Fastq);
                 loop {
@@ -525,16 +541,8 @@ fn compress_with_index<I2: AsRef<Path>>(
                         (Some(Ok(mut first)), Some(Ok(mut second))) => {
                             first.validate(true)?;
                             second.validate(true)?;
-                            apply_identifier_policy(
-                                &mut first,
-                                preserve_ids,
-                                mapper_options.id_prefix_chars,
-                            )?;
-                            apply_identifier_policy(
-                                &mut second,
-                                preserve_ids,
-                                mapper_options.id_prefix_chars,
-                            )?;
+                            prepare_identifier(&mut first)?;
+                            prepare_identifier(&mut second)?;
                             if mapper_options.preserve_quality {
                                 apply_quality(&mut first, &mapper_options.quality_mode);
                                 apply_quality(&mut second, &mapper_options.quality_mode);
@@ -566,11 +574,7 @@ fn compress_with_index<I2: AsRef<Path>>(
                 for first in first {
                     let mut first = first?;
                     first.validate(true)?;
-                    apply_identifier_policy(
-                        &mut first,
-                        preserve_ids,
-                        mapper_options.id_prefix_chars,
-                    )?;
+                    prepare_identifier(&mut first)?;
                     if mapper_options.preserve_quality {
                         apply_quality(&mut first, &mapper_options.quality_mode);
                     }

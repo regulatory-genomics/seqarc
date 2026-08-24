@@ -152,10 +152,10 @@ struct ValidateArgs {
     /// Input aligned .seqarc archive.
     archive: PathBuf,
     /// Original plain, gzip, or zstd FASTQ; mate 1 for paired comparison.
-    #[arg(long)]
+    #[arg(short = '1', long)]
     mate_1: Option<PathBuf>,
     /// Original plain, gzip, or zstd mate-2 FASTQ for byte comparison.
-    #[arg(long, requires = "mate_1")]
+    #[arg(short = '2', long, requires = "mate_1")]
     mate_2: Option<PathBuf>,
     /// Apply the compression-time identifier prefix before comparison.
     #[arg(long, requires = "mate_1")]

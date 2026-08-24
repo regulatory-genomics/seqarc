@@ -5,8 +5,9 @@ use seqarc::{
     build_genome_index_with_options, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
     decompress_aligned_iter, open_fastx_reader, truncate_read_id, AlignedRecordGroup,
-    AlignedRecordSink, AlignmentCompressionOptions, DecompressionOptions, Error, FastxReader,
-    Format, GenomeIndexBuildOptions, QualityMode, ReadRecord, Result,
+    AlignedRecordSink, AlignmentCompressionOptions, DecompressionOptions, EmbeddedIndexMate,
+    EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode,
+    ReadRecord, Result,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -66,6 +67,9 @@ struct CompressArgs {
     /// Optional plain, gzip, or zstd mate-2 FASTQ. Omit for single-end input.
     #[arg(short = '2', long)]
     mate_2: Option<PathBuf>,
+    /// Extract an embedded index using one-based inclusive MATE:START:END coordinates.
+    #[arg(long = "index-range", value_parser = parse_index_range)]
+    index_ranges: Vec<EmbeddedIndexRange>,
     /// Output .seqarc archive.
     #[arg(short, long)]
     output: PathBuf,
@@ -176,6 +180,63 @@ fn parse_range(value: &str) -> std::result::Result<RangeInclusive<u64>, String> 
         return Err("range start must not exceed range end".into());
     }
     Ok(start..=end)
+}
+
+fn parse_index_range(value: &str) -> std::result::Result<EmbeddedIndexRange, String> {
+    let mut fields = value.split(':');
+    let mate = match fields.next().map(str::to_ascii_uppercase).as_deref() {
+        Some("R1") => EmbeddedIndexMate::R1,
+        Some("R2") => EmbeddedIndexMate::R2,
+        _ => return Err("index range mate must be R1 or R2".into()),
+    };
+    let start = fields
+        .next()
+        .ok_or_else(|| "index range must be MATE:START:END".to_owned())?
+        .parse::<usize>()
+        .map_err(|_| "invalid index range start".to_owned())?;
+    let end = fields
+        .next()
+        .ok_or_else(|| "index range must be MATE:START:END".to_owned())?
+        .parse::<usize>()
+        .map_err(|_| "invalid index range end".to_owned())?;
+    if fields.next().is_some() {
+        return Err("index range must be MATE:START:END".into());
+    }
+    if start == 0 || end < start {
+        return Err("index range uses one-based inclusive coordinates with START <= END".into());
+    }
+    Ok(EmbeddedIndexRange {
+        mate,
+        start: start - 1,
+        end,
+    })
+}
+
+fn validate_index_ranges(ranges: &[EmbeddedIndexRange], paired: bool) -> Result<()> {
+    if !paired
+        && ranges
+            .iter()
+            .any(|range| range.mate == EmbeddedIndexMate::R2)
+    {
+        return Err(Error::InvalidInput(
+            "R2 index range requires paired-end input".into(),
+        ));
+    }
+    for mate in [EmbeddedIndexMate::R1, EmbeddedIndexMate::R2] {
+        let mut ranges = ranges
+            .iter()
+            .filter(|range| range.mate == mate)
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start);
+        for pair in ranges.windows(2) {
+            if pair[1].start < pair[0].end {
+                return Err(Error::InvalidInput(format!(
+                    "overlapping index ranges for {mate:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 struct AtomicPath {
@@ -490,6 +551,7 @@ fn run(cli: Cli) -> Result<()> {
                     "--threads and --chunk-records must be nonzero".into(),
                 ));
             }
+            validate_index_ranges(&args.index_ranges, args.mate_2.is_some())?;
             let options = AlignmentCompressionOptions {
                 chunk_records: args.chunk_records,
                 threads: args.threads,
@@ -499,6 +561,7 @@ fn run(cli: Cli) -> Result<()> {
                 preserve_quality: !args.no_quality,
                 quality_mode: quality_mode(&args)?,
                 zstd_level: args.zstd_level,
+                embedded_index_ranges: args.index_ranges.clone(),
             };
             let output = AtomicPath::new(args.output, args.force)?;
             let (metadata, profile) = if let Some(mate_2) = args.mate_2 {
@@ -722,6 +785,42 @@ mod tests {
     fn parses_inclusive_range() {
         assert_eq!(parse_range("4:9").unwrap(), 4..=9);
         assert!(parse_range("9:4").is_err());
+    }
+
+    #[test]
+    fn parses_one_based_embedded_index_ranges() {
+        assert_eq!(
+            parse_index_range("R2:9:16").unwrap(),
+            EmbeddedIndexRange {
+                mate: EmbeddedIndexMate::R2,
+                start: 8,
+                end: 16,
+            }
+        );
+        assert!(parse_index_range("R1:0:8").is_err());
+        assert!(parse_index_range("R3:1:8").is_err());
+    }
+
+    #[test]
+    fn validates_embedded_index_range_layout() {
+        let range = |mate, start, end| EmbeddedIndexRange { mate, start, end };
+        assert!(validate_index_ranges(
+            &[
+                range(EmbeddedIndexMate::R1, 0, 4),
+                range(EmbeddedIndexMate::R1, 4, 8),
+            ],
+            false,
+        )
+        .is_ok());
+        assert!(validate_index_ranges(
+            &[
+                range(EmbeddedIndexMate::R1, 0, 4),
+                range(EmbeddedIndexMate::R1, 3, 8),
+            ],
+            false,
+        )
+        .is_err());
+        assert!(validate_index_ranges(&[range(EmbeddedIndexMate::R2, 0, 4)], false,).is_err());
     }
 
     #[test]

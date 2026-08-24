@@ -318,3 +318,85 @@ fn single_end_cli_round_trip_and_validation() {
 
     assert_eq!(std::fs::read_to_string(decoded_path).unwrap(), fastq);
 }
+
+#[test]
+fn embedded_index_ranges_round_trip_across_mates() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let second_path = directory.path().join("reads.2.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+    let decoded_first = directory.path().join("decoded.1.fastq");
+    let decoded_second = directory.path().join("decoded.2.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let first_fastq = b"@pair0/1\nAAAACCCCGGGGTTTTACGT\n+\nABCDEFGHIJKLMNOPQRST\n@pair1/1\nAAAACCCCGGAGTTTTACGT\n+\nTSRQPONMLKJIHGFEDCBA\n";
+    let second_fastq = b"@pair0/2\nTGCATTTTAAAACCCCGGTA\n+\nIIIIIIIIIIIIIIIIIIII\n@pair1/2\nTGCATTTGAAAACCCCGGTA\n+\nJJJJJJJJJJJJJJJJJJJJ\n";
+    std::fs::write(&first_path, first_fastq).unwrap();
+    std::fs::write(&second_path, second_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-range")
+        .arg("R1:9:12")
+        .arg("--index-range")
+        .arg("R2:5:8")
+        .arg("--index-range")
+        .arg("R1:1:4")
+        .arg("--chunk-records")
+        .arg("1")
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success();
+
+    let archive = std::fs::read(&archive_path).unwrap();
+    assert_eq!(u32::from_le_bytes(archive[9..13].try_into().unwrap()), 16);
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&decoded_first)
+        .arg("--mate-2")
+        .arg(&decoded_second)
+        .arg("--threads")
+        .arg("2")
+        .assert()
+        .success();
+
+    assert_eq!(std::fs::read(&decoded_first).unwrap(), first_fastq);
+    assert_eq!(std::fs::read(&decoded_second).unwrap(), second_fastq);
+}

@@ -33,13 +33,17 @@ impl fmt::Display for IndexReadError {
 
 impl std::error::Error for IndexReadError {}
 
-/// Predict a whitelist and encode all reads against it with up to two mismatches.
+/// Predict a whitelist and encode all reads against it with up to one mismatch.
 ///
 /// The returned byte string contains the predicted whitelist and can therefore be
 /// decoded without any external data. Reads that cannot be represented against a
 /// whitelist entry are stored raw. Input order is preserved.
 pub fn encode_index_reads<T: AsRef<[u8]>>(reads: &[T]) -> Result<Vec<u8>, IndexReadError> {
-    let whitelist = Whitelist::predict(reads)?;
+    let mut builder = WhitelistBuilder::new();
+    for read in reads {
+        builder.add(read)?;
+    }
+    let whitelist = builder.finish()?;
     encode_with_whitelist(reads, &whitelist)
 }
 
@@ -54,13 +58,139 @@ pub fn decode_index_reads(encoded: &[u8]) -> Result<Vec<Vec<u8>>, IndexReadError
     }
 
     let read_count = input.read_usize_varint("read count")?;
+    let whitelist = decode_whitelist_from_input(&mut input)?;
+    let reads = decode_records_from_input(&mut input, read_count, &whitelist)?;
+    if input.remaining() != 0 {
+        return Err(invalid_format("trailing bytes"));
+    }
+    Ok(reads)
+}
+
+/// Incrementally collect sequence counts used to predict a shared whitelist.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WhitelistBuilder {
+    counts_by_length: BTreeMap<usize, BTreeMap<Vec<u8>, usize>>,
+}
+
+impl WhitelistBuilder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn add<T: AsRef<[u8]>>(&mut self, read: T) -> Result<(), IndexReadError> {
+        let sequence = read.as_ref();
+        if sequence.len() <= 1 || !is_canonical(sequence) {
+            return Ok(());
+        }
+        let count = self
+            .counts_by_length
+            .entry(sequence.len())
+            .or_default()
+            .entry(sequence.to_vec())
+            .or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("sequence count overflow"))?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<Whitelist, IndexReadError> {
+        let mut entries = Vec::new();
+        for counts in self.counts_by_length.into_values() {
+            let threshold = ordmag_threshold(counts.values().copied());
+            let mut predicted = counts
+                .into_iter()
+                .filter(|(_, count)| *count >= threshold)
+                .map(|(sequence, count)| WhitelistEntry { sequence, count })
+                .collect::<Vec<_>>();
+            predicted.sort_by(|left, right| {
+                right
+                    .count
+                    .cmp(&left.count)
+                    .then_with(|| left.sequence.cmp(&right.sequence))
+            });
+            entries.extend(predicted);
+        }
+        entries.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
+
+        Whitelist::from_entries(entries)
+    }
+}
+
+/// A predicted whitelist that can be shared by multiple record chunks.
+#[derive(Clone, Debug)]
+pub(crate) struct Whitelist {
+    entries: Vec<WhitelistEntry>,
+    ordinals: BTreeMap<Vec<u8>, usize>,
+}
+
+/// Classification of an index read against local candidates and global ordinals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IndexReadEncoding {
+    Exact {
+        global_ordinal: usize,
+    },
+    OneMismatch {
+        global_ordinal: usize,
+        position: usize,
+        original: u8,
+    },
+    CanonicalRaw,
+    ExceptionalRaw,
+}
+
+/// Merge predicted local whitelists into a count-free global whitelist.
+pub(crate) fn merge_whitelists(whitelists: &[Whitelist]) -> Result<Whitelist, IndexReadError> {
+    let mut sequences = whitelists
+        .iter()
+        .flat_map(|whitelist| whitelist.entries.iter())
+        .map(|entry| entry.sequence.clone())
+        .collect::<Vec<_>>();
+    sequences.sort();
+    sequences.dedup();
+
+    Whitelist::from_entries(
+        sequences
+            .into_iter()
+            .map(|sequence| WhitelistEntry { sequence, count: 0 })
+            .collect(),
+    )
+}
+
+/// Serialize a whitelist without its prediction counts.
+pub(crate) fn encode_whitelist(whitelist: &Whitelist) -> Result<Vec<u8>, IndexReadError> {
+    let mut output = Vec::new();
+    write_usize_varint(&mut output, whitelist.entries.len())?;
+    for entry in &whitelist.entries {
+        write_usize_varint(&mut output, entry.sequence.len())?;
+        output.extend(&entry.sequence);
+    }
+    Ok(output)
+}
+
+/// Decode a complete count-prefixed whitelist payload.
+pub(crate) fn decode_whitelist(encoded: &[u8]) -> Result<Whitelist, IndexReadError> {
+    let mut input = Input::new(encoded);
+    let whitelist = decode_whitelist_from_input(&mut input)?;
+    if input.remaining() != 0 {
+        return Err(invalid_format("trailing bytes after whitelist"));
+    }
+    Ok(whitelist)
+}
+
+fn decode_whitelist_from_input(input: &mut Input<'_>) -> Result<Whitelist, IndexReadError> {
     let whitelist_count = input.read_usize_varint("whitelist count")?;
     if whitelist_count > input.remaining() {
         return Err(invalid_format("whitelist count exceeds remaining data"));
     }
 
     let mut entries = Vec::with_capacity(whitelist_count);
-    let mut seen = BTreeMap::new();
+    let mut ordinals = BTreeMap::new();
     for ordinal in 0..whitelist_count {
         let length = input.read_usize_varint("whitelist sequence length")?;
         let sequence = input.read_exact(length)?.to_vec();
@@ -69,17 +199,110 @@ pub fn decode_index_reads(encoded: &[u8]) -> Result<Vec<Vec<u8>>, IndexReadError
                 "whitelist entries must be canonical sequences longer than one base",
             ));
         }
-        if seen.insert(sequence.clone(), ordinal).is_some() {
+        if ordinals.insert(sequence.clone(), ordinal).is_some() {
             return Err(invalid_format("duplicate whitelist entry"));
         }
         entries.push(WhitelistEntry { sequence, count: 0 });
     }
+    Ok(Whitelist { entries, ordinals })
+}
 
-    if read_count > input.remaining() {
+/// Encode only record data, without a magic header, count, or whitelist.
+pub(crate) fn encode_records<T: AsRef<[u8]>>(
+    reads: &[T],
+    whitelist: &Whitelist,
+) -> Result<Vec<u8>, IndexReadError> {
+    encode_records_with_global(reads, whitelist, whitelist)
+}
+
+/// Encode records using local candidate selection and global serialized ordinals.
+pub(crate) fn encode_records_with_global<T: AsRef<[u8]>>(
+    reads: &[T],
+    local_whitelist: &Whitelist,
+    global_whitelist: &Whitelist,
+) -> Result<Vec<u8>, IndexReadError> {
+    let mut output = Vec::new();
+    for read in reads {
+        let sequence = read.as_ref();
+        match classify_with_global(sequence, local_whitelist, global_whitelist)? {
+            IndexReadEncoding::Exact { global_ordinal } => {
+                output.push(MODE_EXACT);
+                write_usize_varint(&mut output, global_ordinal)?;
+            }
+            IndexReadEncoding::OneMismatch {
+                global_ordinal,
+                position,
+                original,
+            } => {
+                output.push(MODE_ONE_MISMATCH);
+                write_usize_varint(&mut output, global_ordinal)?;
+                write_usize_varint(&mut output, position)?;
+                output.push(original);
+            }
+            IndexReadEncoding::CanonicalRaw | IndexReadEncoding::ExceptionalRaw => {
+                output.push(MODE_RAW);
+                write_usize_varint(&mut output, sequence.len())?;
+                output.extend(sequence);
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Classify a read using local counts while reporting its global ordinal.
+pub(crate) fn classify_with_global(
+    read: &[u8],
+    local_whitelist: &Whitelist,
+    global_whitelist: &Whitelist,
+) -> Result<IndexReadEncoding, IndexReadError> {
+    if !is_canonical(read) {
+        return Ok(IndexReadEncoding::ExceptionalRaw);
+    }
+
+    let Some(candidate) = local_whitelist.candidate(read) else {
+        return Ok(IndexReadEncoding::CanonicalRaw);
+    };
+    let selected_sequence = &local_whitelist.entries[candidate.ordinal].sequence;
+    let global_ordinal = global_whitelist
+        .ordinals
+        .get(selected_sequence)
+        .copied()
+        .ok_or_else(|| invalid_input("selected local whitelist entry is missing globally"))?;
+
+    Ok(match candidate.mismatch {
+        None => IndexReadEncoding::Exact { global_ordinal },
+        Some((position, original)) => IndexReadEncoding::OneMismatch {
+            global_ordinal,
+            position,
+            original,
+        },
+    })
+}
+
+/// Decode a complete record payload containing exactly `expected_count` reads.
+pub(crate) fn decode_records(
+    payload: &[u8],
+    expected_count: usize,
+    whitelist: &Whitelist,
+) -> Result<Vec<Vec<u8>>, IndexReadError> {
+    let mut input = Input::new(payload);
+    let reads = decode_records_from_input(&mut input, expected_count, whitelist)?;
+    if input.remaining() != 0 {
+        return Err(invalid_format("trailing bytes after records"));
+    }
+    Ok(reads)
+}
+
+fn decode_records_from_input(
+    input: &mut Input<'_>,
+    expected_count: usize,
+    whitelist: &Whitelist,
+) -> Result<Vec<Vec<u8>>, IndexReadError> {
+    if expected_count > input.remaining() {
         return Err(invalid_format("read count exceeds remaining data"));
     }
-    let mut reads = Vec::with_capacity(read_count);
-    for _ in 0..read_count {
+    let mut reads = Vec::with_capacity(expected_count);
+    for _ in 0..expected_count {
         let mode = input.read_byte()?;
         if mode == MODE_RAW {
             let length = input.read_usize_varint("raw sequence length")?;
@@ -88,7 +311,8 @@ pub fn decode_index_reads(encoded: &[u8]) -> Result<Vec<Vec<u8>>, IndexReadError
         }
 
         let ordinal = input.read_usize_varint("whitelist ordinal")?;
-        let entry = entries
+        let entry = whitelist
+            .entries
             .get(ordinal)
             .ok_or_else(|| invalid_format("whitelist ordinal is out of bounds"))?;
         let mismatch_count = match mode {
@@ -120,10 +344,6 @@ pub fn decode_index_reads(encoded: &[u8]) -> Result<Vec<Vec<u8>>, IndexReadError
         }
         reads.push(sequence);
     }
-
-    if input.remaining() != 0 {
-        return Err(invalid_format("trailing bytes"));
-    }
     Ok(reads)
 }
 
@@ -133,54 +353,23 @@ struct WhitelistEntry {
     count: usize,
 }
 
-#[derive(Clone, Debug)]
-struct Whitelist {
-    entries: Vec<WhitelistEntry>,
-    ordinals: BTreeMap<Vec<u8>, usize>,
-}
-
 impl Whitelist {
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn sequence(&self, ordinal: usize) -> Option<&[u8]> {
+        self.entries
+            .get(ordinal)
+            .map(|entry| entry.sequence.as_slice())
+    }
+
     fn predict<T: AsRef<[u8]>>(reads: &[T]) -> Result<Self, IndexReadError> {
-        let mut counts_by_length: BTreeMap<usize, BTreeMap<Vec<u8>, usize>> = BTreeMap::new();
+        let mut builder = WhitelistBuilder::new();
         for read in reads {
-            let sequence = read.as_ref();
-            if sequence.len() <= 1 || !is_canonical(sequence) {
-                continue;
-            }
-            let count = counts_by_length
-                .entry(sequence.len())
-                .or_default()
-                .entry(sequence.to_vec())
-                .or_default();
-            *count = count
-                .checked_add(1)
-                .ok_or_else(|| invalid_input("sequence count overflow"))?;
+            builder.add(read)?;
         }
-
-        let mut entries = Vec::new();
-        for counts in counts_by_length.into_values() {
-            let threshold = ordmag_threshold(counts.values().copied());
-            let mut predicted = counts
-                .into_iter()
-                .filter(|(_, count)| *count >= threshold)
-                .map(|(sequence, count)| WhitelistEntry { sequence, count })
-                .collect::<Vec<_>>();
-            predicted.sort_by(|left, right| {
-                right
-                    .count
-                    .cmp(&left.count)
-                    .then_with(|| left.sequence.cmp(&right.sequence))
-            });
-            entries.extend(predicted);
-        }
-        entries.sort_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then_with(|| left.sequence.cmp(&right.sequence))
-        });
-
-        Self::from_entries(entries)
+        builder.finish()
     }
 
     fn from_entries(entries: Vec<WhitelistEntry>) -> Result<Self, IndexReadError> {
@@ -205,7 +394,7 @@ impl Whitelist {
         if let Some(&ordinal) = self.ordinals.get(sequence) {
             return Some(Candidate {
                 ordinal,
-                mismatches: Vec::new(),
+                mismatch: None,
             });
         }
 
@@ -223,33 +412,10 @@ impl Whitelist {
                         &mut best,
                         Candidate {
                             ordinal,
-                            mismatches: vec![(first_position, first_original)],
+                            mismatch: Some((first_position, first_original)),
                         },
                         &self.entries,
                     );
-                }
-                for second_position in (first_position + 1)..mutated.len() {
-                    let second_original = mutated[second_position];
-                    for second_base in BASES {
-                        if second_base == second_original {
-                            continue;
-                        }
-                        mutated[second_position] = second_base;
-                        if let Some(&ordinal) = self.ordinals.get(&mutated) {
-                            update_candidate(
-                                &mut best,
-                                Candidate {
-                                    ordinal,
-                                    mismatches: vec![
-                                        (first_position, first_original),
-                                        (second_position, second_original),
-                                    ],
-                                },
-                                &self.entries,
-                            );
-                        }
-                    }
-                    mutated[second_position] = second_original;
                 }
             }
             mutated[first_position] = first_original;
@@ -261,7 +427,7 @@ impl Whitelist {
 #[derive(Clone, Debug)]
 struct Candidate {
     ordinal: usize,
-    mismatches: Vec<(usize, u8)>,
+    mismatch: Option<(usize, u8)>,
 }
 
 fn update_candidate(
@@ -272,11 +438,9 @@ fn update_candidate(
     let replace = best.as_ref().is_none_or(|current| {
         let candidate_entry = &entries[candidate.ordinal];
         let current_entry = &entries[current.ordinal];
-        candidate
-            .mismatches
-            .len()
-            .cmp(&current.mismatches.len())
-            .then_with(|| current_entry.count.cmp(&candidate_entry.count))
+        current_entry
+            .count
+            .cmp(&candidate_entry.count)
             .then_with(|| candidate_entry.sequence.cmp(&current_entry.sequence))
             .is_lt()
     });
@@ -293,32 +457,8 @@ fn encode_with_whitelist<T: AsRef<[u8]>>(
     output.extend(MAGIC);
     output.push(VERSION);
     write_usize_varint(&mut output, reads.len())?;
-    write_usize_varint(&mut output, whitelist.entries.len())?;
-    for entry in &whitelist.entries {
-        write_usize_varint(&mut output, entry.sequence.len())?;
-        output.extend(&entry.sequence);
-    }
-
-    for read in reads {
-        let sequence = read.as_ref();
-        if let Some(candidate) = whitelist.candidate(sequence) {
-            output.push(match candidate.mismatches.len() {
-                0 => MODE_EXACT,
-                1 => MODE_ONE_MISMATCH,
-                2 => MODE_TWO_MISMATCHES,
-                _ => unreachable!(),
-            });
-            write_usize_varint(&mut output, candidate.ordinal)?;
-            for (position, original) in candidate.mismatches {
-                write_usize_varint(&mut output, position)?;
-                output.push(original);
-            }
-        } else {
-            output.push(MODE_RAW);
-            write_usize_varint(&mut output, sequence.len())?;
-            output.extend(sequence);
-        }
-    }
+    output.extend(encode_whitelist(whitelist)?);
+    output.extend(encode_records(reads, whitelist)?);
     Ok(output)
 }
 
@@ -498,10 +638,16 @@ mod tests {
     }
 
     #[test]
-    fn two_mismatches_are_stored_losslessly() {
+    fn two_mismatches_fall_back_to_raw_losslessly() {
         let reads = [b"AAGT".as_slice()];
-        let encoded = encode_with_whitelist(&reads, &whitelist(&[(b"CCGT", 10)])).unwrap();
-        assert_eq!(decode_index_reads(&encoded).unwrap(), reads);
+        let whitelist = whitelist(&[(b"CCGT", 10)]);
+        let payload = encode_records(&reads, &whitelist).unwrap();
+
+        assert_eq!(payload[0], MODE_RAW);
+        assert_eq!(
+            decode_records(&payload, reads.len(), &whitelist).unwrap(),
+            reads
+        );
     }
 
     #[test]
@@ -532,7 +678,171 @@ mod tests {
     }
 
     #[test]
-    fn candidate_prefers_fewer_mismatches() {
+    fn global_whitelist_serialization_omits_counts_and_is_strict() {
+        let first = whitelist(&[(b"ACGT", 100), (b"TGCA", 2)]);
+        let second = whitelist(&[(b"ACGT", 1), (b"TGCA", 999)]);
+        let encoded = encode_whitelist(&first).unwrap();
+        assert_eq!(encoded, encode_whitelist(&second).unwrap());
+
+        let decoded = decode_whitelist(&encoded).unwrap();
+        assert_eq!(decoded.entries[0].sequence, b"ACGT");
+        assert_eq!(decoded.entries[1].sequence, b"TGCA");
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_whitelist(&trailing).is_err());
+    }
+
+    #[test]
+    fn merged_whitelist_deduplicates_sorts_and_drops_counts() {
+        let first = whitelist(&[(b"TGCA", 100), (b"ACGT", 1)]);
+        let second = whitelist(&[(b"CCCC", 999), (b"TGCA", 2)]);
+
+        let merged = merge_whitelists(&[first, second]).unwrap();
+
+        assert_eq!(
+            merged
+                .entries
+                .iter()
+                .map(|entry| (entry.sequence.as_slice(), entry.count))
+                .collect::<Vec<_>>(),
+            vec![
+                (b"ACGT".as_slice(), 0),
+                (b"CCCC".as_slice(), 0),
+                (b"TGCA".as_slice(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn whitelist_accessors_expose_sequences_by_ordinal() {
+        let whitelist = whitelist(&[(b"ACGT", 10), (b"TGCA", 5)]);
+
+        assert_eq!(whitelist.len(), 2);
+        assert_eq!(whitelist.sequence(0), Some(b"ACGT".as_slice()));
+        assert_eq!(whitelist.sequence(1), Some(b"TGCA".as_slice()));
+        assert_eq!(whitelist.sequence(2), None);
+    }
+
+    #[test]
+    fn typed_classification_reports_exact_and_one_mismatch() {
+        let local = whitelist(&[(b"CAAA", 100), (b"AAAT", 1)]);
+        let global = merge_whitelists(&[local.clone()]).unwrap();
+
+        assert_eq!(
+            classify_with_global(b"AAAT", &local, &global).unwrap(),
+            IndexReadEncoding::Exact { global_ordinal: 0 }
+        );
+        assert_eq!(
+            classify_with_global(b"AAAA", &local, &global).unwrap(),
+            IndexReadEncoding::OneMismatch {
+                global_ordinal: 1,
+                position: 0,
+                original: b'A',
+            }
+        );
+    }
+
+    #[test]
+    fn typed_classification_distinguishes_raw_classes() {
+        let local = whitelist(&[(b"CCGT", 10)]);
+        let global = merge_whitelists(&[local.clone()]).unwrap();
+
+        assert_eq!(
+            classify_with_global(b"AAGT", &local, &global).unwrap(),
+            IndexReadEncoding::CanonicalRaw
+        );
+        assert_eq!(
+            classify_with_global(b"ACNT", &local, &global).unwrap(),
+            IndexReadEncoding::ExceptionalRaw
+        );
+    }
+
+    #[test]
+    fn global_only_candidate_is_encoded_raw() {
+        let local = whitelist(&[]);
+        let global = whitelist(&[(b"ACGT", 0)]);
+        let reads = [b"ACGT".as_slice()];
+
+        let payload = encode_records_with_global(&reads, &local, &global).unwrap();
+
+        assert_eq!(payload[0], MODE_RAW);
+        assert_eq!(
+            decode_records(&payload, reads.len(), &global).unwrap(),
+            reads
+        );
+    }
+
+    #[test]
+    fn local_candidate_uses_its_global_ordinal() {
+        let local = whitelist(&[(b"CAAA", 100), (b"AAAT", 1)]);
+        let global = merge_whitelists(&[local.clone()]).unwrap();
+        let reads = [b"AAAA".as_slice()];
+
+        let payload = encode_records_with_global(&reads, &local, &global).unwrap();
+
+        assert_eq!(local.entries[0].sequence, b"CAAA");
+        assert_eq!(global.entries[1].sequence, b"CAAA");
+        assert_eq!(payload[0], MODE_ONE_MISMATCH);
+        assert_eq!(payload[1], 1);
+        assert_eq!(
+            decode_records(&payload, reads.len(), &global).unwrap(),
+            reads
+        );
+    }
+
+    #[test]
+    fn missing_local_entry_in_global_whitelist_is_invalid_input() {
+        let local = whitelist(&[(b"ACGT", 10)]);
+        let global = whitelist(&[(b"TGCA", 0)]);
+
+        assert!(matches!(
+            encode_records_with_global(&[b"ACGT"], &local, &global),
+            Err(IndexReadError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_two_mismatch_mode_still_decodes() {
+        let whitelist = whitelist(&[(b"CCGT", 10)]);
+        let payload = [MODE_TWO_MISMATCHES, 0, 0, b'A', 1, b'A'];
+
+        assert_eq!(
+            decode_records(&payload, 1, &whitelist).unwrap(),
+            [b"AAGT".to_vec()]
+        );
+    }
+
+    #[test]
+    fn separate_record_chunks_share_a_global_whitelist() {
+        let mut builder = WhitelistBuilder::new();
+        for read in [b"ACGT".as_slice(), b"TGCA", b"ACGT", b"TGCA"] {
+            builder.add(read).unwrap();
+        }
+        let whitelist = builder.finish().unwrap();
+        let decoded_whitelist = decode_whitelist(&encode_whitelist(&whitelist).unwrap()).unwrap();
+
+        let first = [b"ACGT".as_slice(), b"ACGA", b"NNNN"];
+        let second = [b"TGCA".as_slice(), b"TTCA", b"A"];
+        let first_payload = encode_records(&first, &whitelist).unwrap();
+        let second_payload = encode_records(&second, &whitelist).unwrap();
+
+        assert_eq!(
+            decode_records(&first_payload, first.len(), &decoded_whitelist).unwrap(),
+            first
+        );
+        assert_eq!(
+            decode_records(&second_payload, second.len(), &decoded_whitelist).unwrap(),
+            second
+        );
+
+        let mut trailing = first_payload;
+        trailing.push(0);
+        assert!(decode_records(&trailing, first.len(), &decoded_whitelist).is_err());
+    }
+
+    #[test]
+    fn candidate_does_not_consider_two_mismatches() {
         let whitelist = whitelist(&[(b"AAAT", 1), (b"AACC", 100)]);
         let candidate = whitelist.candidate(b"AAAA").unwrap();
         assert_eq!(whitelist.entries[candidate.ordinal].sequence, b"AAAT");

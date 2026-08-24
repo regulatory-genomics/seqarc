@@ -5,6 +5,8 @@
 
 mod alignment_archive;
 mod fastx;
+#[allow(dead_code)]
+mod index_read;
 pub mod minibwa;
 mod packed_sequence;
 #[allow(dead_code)]
@@ -169,6 +171,7 @@ pub struct AlignmentCompressionOptions {
     pub preserve_quality: bool,
     pub quality_mode: QualityMode,
     pub zstd_level: i32,
+    pub embedded_index_ranges: Vec<EmbeddedIndexRange>,
 }
 
 impl Default for AlignmentCompressionOptions {
@@ -182,6 +185,7 @@ impl Default for AlignmentCompressionOptions {
             preserve_quality: true,
             quality_mode: QualityMode::Lossless,
             zstd_level: 19,
+            embedded_index_ranges: Vec::new(),
         }
     }
 }
@@ -265,6 +269,39 @@ pub trait PairedRecordSink {
 pub enum AlignmentLayout {
     SingleEnd,
     PairedEnd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedIndexMate {
+    R1,
+    R2,
+}
+
+impl EmbeddedIndexMate {
+    pub(crate) fn stream(self) -> usize {
+        match self {
+            Self::R1 => 0,
+            Self::R2 => 1,
+        }
+    }
+}
+
+/// A zero-based, half-open range extracted from a biological read before mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedIndexRange {
+    pub mate: EmbeddedIndexMate,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl EmbeddedIndexRange {
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
 }
 
 impl AlignmentLayout {
@@ -364,6 +401,8 @@ pub struct AlignedCompressionProfile {
     pub ids_compressed_bytes: u64,
     pub qualities_compressed_bytes: u64,
     pub records_compressed_bytes: u64,
+    pub indexes_raw_bytes: u64,
+    pub indexes_compressed_bytes: u64,
     pub chunks_compressed_bytes: u64,
     pub archive_bytes: u64,
 }
@@ -1149,7 +1188,8 @@ mod tests {
         assert!(profile.reference_compressed_bytes > 0);
         assert_eq!(
             profile.archive_bytes,
-            31 + profile.reference_compressed_bytes
+            39 + profile.reference_compressed_bytes
+                + 17
                 + 44 * profile.chunk_count
                 + profile.chunks_compressed_bytes
         );

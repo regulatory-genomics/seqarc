@@ -9,8 +9,7 @@ mod fastx;
 mod index_read;
 pub mod minibwa;
 mod packed_sequence;
-#[allow(dead_code)]
-mod quality_blocks;
+mod quality;
 mod reference_free;
 
 use std::collections::BTreeMap;

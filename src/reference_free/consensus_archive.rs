@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-RS";
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 const LONG_DISTANCE_WINDOW_LOG: u32 = 27;
 const ORDER_ENTRY_SIZE: usize = 9;
 const MAX_OVERLAP_MISMATCHES: usize = 4;
@@ -367,16 +367,18 @@ fn decode_payload_records<
             })?;
         }
         if has_quality {
-            let mut blocks = crate::quality_blocks::QualityBlockReader::new(&mut payload)?;
+            let expected_records = usize_from(records, "quality stream")?;
+            let mut quality_reader =
+                crate::quality::QualityStreamReader::new(&mut payload, expected_records);
             let mut quality_records = 0u64;
-            while let Some(block) = blocks.next()? {
-                for quality in block {
+            while let Some(run) = quality_reader.next()? {
+                for quality in run {
                     let original_id = quality_records;
                     visit_quality(stream_index, original_id, quality)?;
                     quality_records += 1;
                 }
             }
-            blocks.finish()?;
+            quality_reader.finish()?;
             if quality_records != records {
                 return Err(Error::InvalidFormat(
                     "RS4 quality stream record count mismatch".into(),
@@ -499,7 +501,7 @@ fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>
     }
     if ids_enabled {
         return Err(Error::InvalidFormat(
-            "inline RS4 IDs are not supported in v8".into(),
+            "inline RS4 IDs are not supported in v9".into(),
         ));
     }
     let ids = vec![Vec::new(); usize_from(group_records, "group")?];
@@ -1669,8 +1671,6 @@ pub(crate) fn write_streamed_profiled<W: Write + Seek>(
 }
 
 fn write_quality_stream<W: Write>(output: &mut W, quality: &PreparedQuality) -> Result<()> {
-    output.write_all(&(PreparedQualityWriter::BLOCK_RECORDS as u32).to_le_bytes())?;
-    output.write_all(&quality.block_count.to_le_bytes())?;
     copy_external_bytes(&quality.path, output)?;
     Ok(())
 }
@@ -3649,13 +3649,7 @@ fn read_group_metadata<R: Read>(
         let encoded_length = usize_from(reader.varint()?, "quality metadata")?;
         let mut encoded = vec![0; encoded_length];
         reader.read_exact(&mut encoded)?;
-        let values = crate::quality_blocks::QualityBlocks::decode(&encoded)?;
-        if values.len() != count {
-            return Err(Error::InvalidFormat(
-                "RS4 quality block record count mismatch".into(),
-            ));
-        }
-        return Ok(values);
+        return crate::quality::decode_stream_bytes(&encoded, count);
     }
     let mode = reader.u8()?;
     let mut lengths = match mode {
@@ -3890,7 +3884,6 @@ struct PreparedQualityWriter {
     output: Lz4ByteWriter,
     values: Vec<Vec<u8>>,
     width: Option<usize>,
-    block_count: u32,
     encoded_len: u64,
 }
 
@@ -3898,7 +3891,6 @@ struct PreparedQualityWriter {
 #[allow(dead_code)]
 struct PreparedQuality {
     path: std::path::PathBuf,
-    block_count: u32,
     encoded_len: u64,
 }
 
@@ -3919,57 +3911,51 @@ impl PreparedColumnBuilder {
 }
 
 impl PreparedQualityWriter {
-    const BLOCK_RECORDS: usize = 65_536;
+    const RUN_RECORDS: usize = 65_536;
 
     fn create(temp_dir: &Path, mate: usize) -> Result<Self> {
         Ok(Self {
             output: Lz4ByteWriter::create(
-                temp_dir.join(format!("records.{mate}.quality-blocks.lz4")),
+                temp_dir.join(format!("records.{mate}.quality-runs.lz4")),
                 1,
             )?,
-            values: Vec::with_capacity(Self::BLOCK_RECORDS),
+            values: Vec::with_capacity(Self::RUN_RECORDS),
             width: None,
-            block_count: 0,
             encoded_len: 0,
         })
     }
 
     fn push(&mut self, quality: &[u8]) -> Result<()> {
         if !self.values.is_empty()
-            && (self.values.len() == Self::BLOCK_RECORDS
+            && (self.values.len() == Self::RUN_RECORDS
                 || self.width.is_some_and(|width| width != quality.len()))
         {
-            self.flush_block()?;
+            self.flush_run()?;
         }
         self.values.push(quality.to_vec());
         self.width = Some(quality.len());
         Ok(())
     }
 
-    fn flush_block(&mut self) -> Result<()> {
+    fn flush_run(&mut self) -> Result<()> {
         if self.values.is_empty() {
             return Ok(());
         }
-        let bytes = crate::quality_blocks::encode_block_bytes(&self.values)?;
+        let bytes = crate::quality::encode_run_bytes(&self.values)?;
         self.encoded_len = self
             .encoded_len
             .checked_add(bytes.len() as u64)
-            .ok_or_else(|| Error::InvalidInput("quality blocks too large".into()))?;
+            .ok_or_else(|| Error::InvalidInput("quality stream too large".into()))?;
         self.output.write_all(&bytes)?;
-        self.block_count = self
-            .block_count
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidInput("too many quality blocks".into()))?;
         self.values.clear();
         self.width = None;
         Ok(())
     }
 
     fn finish(mut self) -> Result<PreparedQuality> {
-        self.flush_block()?;
+        self.flush_run()?;
         Ok(PreparedQuality {
             path: self.output.finish()?,
-            block_count: self.block_count,
             encoded_len: self.encoded_len,
         })
     }
@@ -4252,7 +4238,7 @@ fn write_store_record_columns<W: Write + Seek>(
     count: u64,
     ids: bool,
     quality: bool,
-    quality_blocks_records: usize,
+    quality_run_records: usize,
 ) -> Result<()> {
     let count =
         u32::try_from(count).map_err(|_| Error::InvalidInput("too many records for RS3".into()))?;
@@ -4265,12 +4251,9 @@ fn write_store_record_columns<W: Write + Seek>(
     let quality_length_position = payload.stream_position()?;
     put_u64_writer(payload, 0)?;
     let quality_start = payload.stream_position()?;
-    let mut blocks =
-        crate::quality_blocks::QualityBlockWriter::new(&mut *payload, quality_blocks_records)?;
     if quality {
-        qualities.write_quality_blocks(&mut blocks, count as usize, quality_blocks_records)?;
+        qualities.write_quality_runs(payload, count as usize, quality_run_records)?;
     }
-    blocks.finish()?;
     let quality_end = payload.stream_position()?;
     let quality_len = quality_end
         .checked_sub(quality_start)
@@ -4293,23 +4276,12 @@ fn write_prepared_record_columns<W: Write>(
         u32::try_from(count).map_err(|_| Error::InvalidInput("too many records for RS3".into()))?;
     put_u32_writer(payload, count)?;
     columns.ids.write_to(payload, ids, count as usize)?;
-    let quality_len = 8u64
-        .checked_add(if quality {
-            columns.qualities.encoded_len
-        } else {
-            0
-        })
-        .ok_or_else(|| Error::InvalidInput("quality section too large".into()))?;
+    let quality_len = if quality {
+        columns.qualities.encoded_len
+    } else {
+        0
+    };
     put_u64_writer(payload, quality_len)?;
-    payload.write_all(&(PreparedQualityWriter::BLOCK_RECORDS as u32).to_le_bytes())?;
-    payload.write_all(
-        &if quality {
-            columns.qualities.block_count
-        } else {
-            0
-        }
-        .to_le_bytes(),
-    )?;
     if quality {
         copy_external_bytes(&columns.qualities.path, payload)?;
     }
@@ -4400,13 +4372,13 @@ impl StoredColumn {
     }
 
     #[cfg(test)]
-    fn write_quality_blocks<W: Write + Seek>(
+    fn write_quality_runs<W: Write>(
         mut self,
-        blocks: &mut crate::quality_blocks::QualityBlockWriter<W>,
+        output: &mut W,
         count: usize,
-        block_records: usize,
+        run_records: usize,
     ) -> Result<()> {
-        let block_records = block_records.max(1);
+        let run_records = run_records.max(1);
         self.lengths.flush()?;
         self.data.flush()?;
         self.lengths.get_mut().seek(SeekFrom::Start(0))?;
@@ -4414,16 +4386,16 @@ impl StoredColumn {
         if self.offsets_len() != count {
             return Err(Error::InvalidInput("record column length mismatch".into()));
         }
-        let mut values = Vec::with_capacity(block_records.min(count));
+        let mut values = Vec::with_capacity(run_records.min(count));
         let mut width = None;
         for _ in 0..count {
             let mut length = [0u8; 4];
             self.lengths.get_mut().read_exact(&mut length)?;
             let length = u32::from_le_bytes(length) as usize;
             if !values.is_empty()
-                && (values.len() == block_records || width.is_some_and(|width| width != length))
+                && (values.len() == run_records || width.is_some_and(|width| width != length))
             {
-                blocks.push(&values)?;
+                output.write_all(&crate::quality::encode_run_bytes(&values)?)?;
                 values.clear();
             }
             let mut value = vec![0; length];
@@ -4432,7 +4404,7 @@ impl StoredColumn {
             width = Some(length);
         }
         if !values.is_empty() {
-            blocks.push(&values)?;
+            output.write_all(&crate::quality::encode_run_bytes(&values)?)?;
         }
         Ok(())
     }
@@ -4952,14 +4924,10 @@ impl<'a> Cursor<'a> {
     fn record_metadata_v8(&mut self, ids: bool, quality: bool) -> Result<Vec<ReadRecord>> {
         let count = self.u32()? as usize;
         let id_values = self.column(count, ids, "ID")?;
-        let quality_len = usize_from(self.u64()?, "quality blocks")?;
+        let quality_len = usize_from(self.u64()?, "quality stream")?;
         let quality_bytes = self.take(quality_len)?;
-        let quality_values = crate::quality_blocks::QualityBlocks::decode(quality_bytes)?;
-        if quality_values.len() != if quality { count } else { 0 } {
-            return Err(Error::InvalidFormat(
-                "RS3 quality block record count mismatch".into(),
-            ));
-        }
+        let quality_values =
+            crate::quality::decode_stream_bytes(quality_bytes, if quality { count } else { 0 })?;
         let quality_values = if quality {
             quality_values
         } else {
@@ -5163,6 +5131,45 @@ mod tests {
             ),
             Err(Error::InvalidFormat(message)) if message == "bad SeqArc archive magic"
         ));
+    }
+
+    #[test]
+    fn accepts_only_archive_version_9() {
+        for version in [8u32, 10] {
+            let mut archive = MAGIC.to_vec();
+            archive.extend(version.to_le_bytes());
+            assert!(matches!(
+                read_reordered(
+                    std::io::Cursor::new(archive),
+                    &crate::DecompressionOptions::default()
+                ),
+                Err(Error::InvalidFormat(message))
+                    if message == "unsupported SeqArc archive version"
+            ));
+        }
+        assert_eq!(VERSION, 9);
+    }
+
+    #[test]
+    fn prepared_quality_stream_contains_only_raw_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let rows = [b"AA".as_slice(), b"BB", b"C", b""];
+        let mut writer = PreparedQualityWriter::create(directory.path(), 0).unwrap();
+        for row in rows {
+            writer.push(row).unwrap();
+        }
+        let quality = writer.finish().unwrap();
+        let mut encoded = Vec::new();
+        write_quality_stream(&mut encoded, &quality).unwrap();
+
+        let expected = crate::quality::encode_stream_bytes(&rows).unwrap();
+        assert_eq!(quality.encoded_len, expected.len() as u64);
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            crate::quality::decode_stream_bytes(&encoded, rows.len()).unwrap(),
+            rows
+        );
+        std::fs::remove_file(quality.path).unwrap();
     }
 
     #[test]

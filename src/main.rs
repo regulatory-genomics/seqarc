@@ -431,6 +431,38 @@ impl ComparisonSink {
         }
         Ok(record)
     }
+
+    fn compare(
+        actual: &ReadRecord,
+        expected: ReadRecord,
+        label: &str,
+        original_id: u64,
+    ) -> Result<()> {
+        if actual.id != expected.id {
+            return Err(Error::InvalidInput(format!(
+                "mismatch at {label} {original_id}: identifier differs"
+            )));
+        }
+        if actual.sequence != expected.sequence {
+            let first_difference = actual
+                .sequence
+                .iter()
+                .zip(&expected.sequence)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(actual.sequence.len().min(expected.sequence.len()));
+            return Err(Error::InvalidInput(format!(
+                "mismatch at {label} {original_id}: sequence differs at position {first_difference} (decoded length {}, original length {})",
+                actual.sequence.len(),
+                expected.sequence.len()
+            )));
+        }
+        if actual.quality != expected.quality {
+            return Err(Error::InvalidInput(format!(
+                "mismatch at {label} {original_id}: quality differs"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl AlignedRecordSink for ComparisonSink {
@@ -442,26 +474,29 @@ impl AlignedRecordSink for ComparisonSink {
                         "single-end archive received two original files".into(),
                     ));
                 }
-                if record != Self::expected(&mut self.first, self.id_prefix_chars)? {
-                    return Err(Error::InvalidInput(format!(
-                        "mismatch at record {original_id}"
-                    )));
-                }
+                Self::compare(
+                    &record,
+                    Self::expected(&mut self.first, self.id_prefix_chars)?,
+                    "record",
+                    original_id,
+                )?;
             }
             AlignedRecordGroup::Paired(first, second) => {
                 let second_reader = self.second.as_mut().ok_or_else(|| {
                     Error::InvalidInput("paired archive requires two original files".into())
                 })?;
-                if first != Self::expected(&mut self.first, self.id_prefix_chars)? {
-                    return Err(Error::InvalidInput(format!(
-                        "mismatch at pair {original_id}, mate 1"
-                    )));
-                }
-                if second != Self::expected(second_reader, self.id_prefix_chars)? {
-                    return Err(Error::InvalidInput(format!(
-                        "mismatch at pair {original_id}, mate 2"
-                    )));
-                }
+                Self::compare(
+                    &first,
+                    Self::expected(&mut self.first, self.id_prefix_chars)?,
+                    "pair mate 1",
+                    original_id,
+                )?;
+                Self::compare(
+                    &second,
+                    Self::expected(second_reader, self.id_prefix_chars)?,
+                    "pair mate 2",
+                    original_id,
+                )?;
             }
         }
         self.records += 1;

@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
-const VERSION: u32 = 20;
+const VERSION: u32 = 21;
 const MAP_TASK_READS: usize = 256;
 const MAP_TASKS_PER_WORKER: usize = 4;
 const MAX_MAPPING_BATCH_RECORDS: usize = 131_072;
@@ -218,6 +218,7 @@ enum ArchiveOp {
     Whitelist = 3,
 }
 
+#[cfg(test)]
 impl ArchiveOp {
     fn from_code(code: u8) -> Result<Self> {
         match code {
@@ -258,6 +259,22 @@ struct ArchiveHeader {
     indexes: Vec<IndexDescriptor>,
     global_whitelist: Whitelist,
 }
+
+#[derive(Clone, Debug)]
+struct V21NoiseEvent {
+    delta: u16,
+    symbol: u8,
+    skip: u64,
+}
+
+struct V21AlignedFields {
+    start: u64,
+    reverse: bool,
+    events: Vec<V21NoiseEvent>,
+    emits: Vec<Vec<u8>>,
+}
+
+const V21_MATE_SECTION_COUNT: usize = 8;
 
 pub struct AlignedRecordIter<R: Read> {
     input: R,
@@ -1637,7 +1654,7 @@ fn decode_archive_chunk(
         preserve_quality,
         layout,
     )?;
-    let sequences = decode_records(
+    let sequences = decode_v21_records(
         &raw[qualities_end..records_end],
         encoded.record_count,
         reference,
@@ -2047,12 +2064,13 @@ fn encode_chunk(
     write_id_stream(&mut ids, pairs, id_mode, layout)?;
     let mut qualities = Vec::new();
     write_quality_stream(&mut qualities, pairs, index_descriptors, options, layout)?;
-    let records = write_record_stream(
+    let records = write_v21_record_stream(
         reference,
         pairs,
         layout,
         index_descriptors,
         global_whitelist,
+        options.zstd_level,
     )?;
     let ids_compressed = zstd::stream::encode_all(Cursor::new(&ids), options.zstd_level)?;
     let qualities_compressed =
@@ -2221,6 +2239,304 @@ fn reconstruct_quality_row(
     Ok(output)
 }
 
+fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
+    reference: &R,
+    pairs: &[AlignedPair],
+    layout: AlignmentLayout,
+    descriptors: &[IndexEncodingDescriptor],
+    _global_whitelist: &Whitelist,
+    zstd_level: i32,
+) -> Result<Vec<u8>> {
+    let mut flags = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        flags.push(match layout {
+            AlignmentLayout::SingleEnd => {
+                if pair.first_hit.is_some() {
+                    0
+                } else {
+                    3
+                }
+            }
+            AlignmentLayout::PairedEnd => {
+                match (pair.first_hit.is_some(), pair.second_hit.is_some()) {
+                    (true, true) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (false, false) => 3,
+                }
+            }
+        });
+    }
+    let mut sections =
+        Vec::with_capacity(1 + layout.streams() * V21_MATE_SECTION_COUNT + descriptors.len());
+    sections.push(flags.clone());
+    for mate in 0..layout.streams() {
+        let mut lengths = Vec::with_capacity(pairs.len() * 2);
+        let mut positions = Vec::new();
+        let mut noise_positions = Vec::new();
+        let mut noise = Vec::new();
+        let mut skips = Vec::new();
+        let mut emits = Vec::new();
+        let mut reverses = Vec::new();
+        let mut unaligned = Vec::new();
+        for (pair, &flag) in pairs.iter().zip(&flags) {
+            let hit = pair.hit(mate);
+            let aligned = matches!((flag, mate), (0, _) | (1, 0) | (2, 1));
+            if aligned != hit.is_some() {
+                return Err(Error::InvalidInput(
+                    "alignment flag does not match mate state".into(),
+                ));
+            }
+            let record = pair.record(mate);
+            write_u16(
+                &mut lengths,
+                u16::try_from(record.sequence.len())
+                    .map_err(|_| Error::InvalidInput("read length exceeds u16 capacity".into()))?,
+            )?;
+            if let Some(hit) = hit {
+                let fields = collect_v21_aligned_fields(reference, record, hit)?;
+                if mate == 1 && flag == 0 {
+                    let first = pair.first_hit.as_ref().ok_or_else(|| {
+                        Error::InvalidInput("paired R2 alignment is missing R1 alignment".into())
+                    })?;
+                    let first_start = i64::try_from(first.start).map_err(|_| {
+                        Error::InvalidInput("R1 alignment position exceeds signed range".into())
+                    })?;
+                    let second_start = i64::try_from(hit.start).map_err(|_| {
+                        Error::InvalidInput("R2 alignment position exceeds signed range".into())
+                    })?;
+                    let delta = second_start.checked_sub(first_start).ok_or_else(|| {
+                        Error::InvalidInput("R2 relative alignment position overflow".into())
+                    })?;
+                    write_u64(&mut positions, zigzag_encode(delta))?;
+                    write_u8(&mut reverses, u8::from(fields.reverse == first.is_reverse))?;
+                } else {
+                    write_u64(&mut positions, fields.start)?;
+                    write_u8(&mut reverses, u8::from(fields.reverse))?;
+                }
+                for event in fields.events {
+                    write_u16(&mut noise_positions, event.delta)?;
+                    noise.push(b'0' + event.symbol);
+                    if event.symbol == 4 {
+                        write_u64(&mut skips, event.skip)?;
+                    }
+                }
+                noise.push(b'\n');
+                for emit in fields.emits {
+                    if emit.contains(&b'\n') {
+                        return Err(Error::InvalidInput("emit sequence contains newline".into()));
+                    }
+                    emits.extend(emit);
+                    emits.push(b'\n');
+                }
+            } else {
+                unaligned.extend_from_slice(&record.sequence);
+            }
+        }
+        sections.extend([
+            lengths,
+            positions,
+            noise_positions,
+            noise,
+            skips,
+            emits,
+            reverses,
+            unaligned,
+        ]);
+    }
+    for (descriptor_index, descriptor) in descriptors.iter().enumerate() {
+        let mut section = Vec::new();
+        for pair in pairs {
+            let index = pair
+                .indexes
+                .get(descriptor_index)
+                .ok_or_else(|| Error::InvalidInput("embedded index fragment is missing".into()))?;
+            if index.sequence.len() != descriptor.range.len() {
+                return Err(Error::InvalidInput("index read length mismatch".into()));
+            }
+            section.extend_from_slice(&index.sequence);
+        }
+        sections.push(section);
+    }
+
+    let mut output = Vec::new();
+    write_u32(
+        &mut output,
+        u32::try_from(sections.len())
+            .map_err(|_| Error::InvalidInput("too many record sections".into()))?,
+    )?;
+    for section in sections {
+        let compressed = zstd::stream::encode_all(Cursor::new(&section), zstd_level)?;
+        write_u64(&mut output, compressed.len() as u64)?;
+        write_u64(&mut output, section.len() as u64)?;
+        output.extend(compressed);
+    }
+    Ok(output)
+}
+
+fn collect_v21_aligned_fields<R: ReferenceBases + ?Sized>(
+    reference: &R,
+    record: &ReadRecord,
+    hit: &GenomeAlignment,
+) -> Result<V21AlignedFields> {
+    let start = nonnegative_usize(hit.start, "alignment start")?;
+    let mut oriented = record.sequence.clone();
+    if hit.is_reverse {
+        reverse_complement(&mut oriented);
+    }
+    let cigar = effective_cigar(hit, record.sequence.len())?;
+    let mut events = Vec::new();
+    let mut emit_payloads = Vec::new();
+    let mut ref_pos = start;
+    let mut query_pos = 0usize;
+    let mut event_cursor = 0usize;
+    for op in cigar {
+        let length = op.len as usize;
+        match op.kind {
+            CigarKind::Match | CigarKind::Eq | CigarKind::Diff => {
+                let ref_end = ref_pos
+                    .checked_add(length)
+                    .ok_or_else(|| Error::InvalidInput("reference position overflow".into()))?;
+                let query_end = query_pos
+                    .checked_add(length)
+                    .ok_or_else(|| Error::InvalidInput("query position overflow".into()))?;
+                if ref_end > reference.len() || query_end > oriented.len() {
+                    return Err(Error::InvalidFormat(
+                        "aligned operation exceeds bounds".into(),
+                    ));
+                }
+                for offset in 0..length {
+                    let actual = oriented[query_pos + offset];
+                    let expected = reference.base(ref_pos + offset);
+                    if actual != expected {
+                        events.push(V21NoiseEvent {
+                            delta: event_delta(query_pos + offset, event_cursor)?,
+                            symbol: substitution_symbol(expected, actual)?,
+                            skip: 0,
+                        });
+                        event_cursor = query_pos + offset + 1;
+                    }
+                }
+                ref_pos = ref_end;
+                query_pos = query_end;
+            }
+            CigarKind::Ins | CigarKind::SoftClip => {
+                let end = query_pos
+                    .checked_add(length)
+                    .ok_or_else(|| Error::InvalidInput("query position overflow".into()))?;
+                if end > oriented.len() {
+                    return Err(Error::InvalidFormat(
+                        "literal operation exceeds query".into(),
+                    ));
+                }
+                events.push(V21NoiseEvent {
+                    delta: event_delta(query_pos, event_cursor)?,
+                    symbol: 5,
+                    skip: 0,
+                });
+                emit_payloads.push(oriented[query_pos..end].to_vec());
+                query_pos = end;
+                event_cursor = end;
+            }
+            CigarKind::Del | CigarKind::RefSkip => {
+                ref_pos = ref_pos
+                    .checked_add(length)
+                    .ok_or_else(|| Error::InvalidInput("reference position overflow".into()))?;
+                if ref_pos > reference.len() {
+                    return Err(Error::InvalidFormat(
+                        "reference skip exceeds reference".into(),
+                    ));
+                }
+                events.push(V21NoiseEvent {
+                    delta: event_delta(query_pos, event_cursor)?,
+                    symbol: 4,
+                    skip: length as u64,
+                });
+                event_cursor = query_pos;
+            }
+            CigarKind::HardClip | CigarKind::Pad => {}
+        }
+    }
+    if query_pos != oriented.len() {
+        return Err(Error::InvalidFormat(
+            "alignment does not consume read".into(),
+        ));
+    }
+    Ok(V21AlignedFields {
+        start: start as u64,
+        reverse: hit.is_reverse,
+        events,
+        emits: emit_payloads,
+    })
+}
+
+#[cfg(test)]
+fn encode_v21_aligned_read<R: ReferenceBases + ?Sized>(
+    reference: &R,
+    record: &ReadRecord,
+    hit: &GenomeAlignment,
+) -> Result<Vec<u8>> {
+    let fields = collect_v21_aligned_fields(reference, record, hit)?;
+    let mut body = Vec::new();
+    write_u64(&mut body, fields.start)?;
+    write_u8(&mut body, u8::from(fields.reverse))?;
+    write_u32(&mut body, fields.events.len() as u32)?;
+    for event in fields.events {
+        write_u16(&mut body, event.delta)?;
+        write_u8(&mut body, event.symbol)?;
+        if event.symbol == 4 {
+            write_u64(&mut body, event.skip)?;
+        }
+    }
+    let emit_payload = fields.emits.join(&b'\n');
+    write_u32(&mut body, emit_payload.len() as u32)?;
+    body.extend(emit_payload);
+    Ok(body)
+}
+
+fn event_delta(position: usize, cursor: usize) -> Result<u16> {
+    let delta = position
+        .checked_sub(cursor)
+        .ok_or_else(|| Error::InvalidInput("noise events are out of order".into()))?;
+    u16::try_from(delta)
+        .map_err(|_| Error::InvalidInput("noise position delta exceeds u16 capacity".into()))
+}
+
+fn substitution_symbol(reference: u8, actual: u8) -> Result<u8> {
+    let alternatives = [b'A', b'C', b'G', b'T', b'N'];
+    let reference_index = alternatives
+        .iter()
+        .position(|&base| base == reference)
+        .ok_or_else(|| Error::InvalidInput("noncanonical reference base".into()))?;
+    let actual_index = alternatives
+        .iter()
+        .position(|&base| base == actual)
+        .ok_or_else(|| Error::InvalidInput("noncanonical aligned read base".into()))?;
+    if reference_index == actual_index {
+        return Err(Error::InvalidInput(
+            "substitution symbol matches reference".into(),
+        ));
+    }
+    Ok((0..alternatives.len())
+        .filter(|&index| index != reference_index)
+        .position(|index| index == actual_index)
+        .unwrap() as u8)
+}
+
+fn substitution_base(reference: u8, symbol: u8) -> Result<u8> {
+    let alternatives = [b'A', b'C', b'G', b'T', b'N'];
+    if !alternatives.contains(&reference) {
+        return Err(Error::InvalidFormat("noncanonical reference base".into()));
+    }
+    alternatives
+        .iter()
+        .copied()
+        .filter(|&base| base != reference)
+        .nth(symbol as usize)
+        .ok_or_else(|| Error::InvalidFormat("invalid substitution symbol".into()))
+}
+
+#[cfg(test)]
 fn write_record_stream<R: ReferenceBases + ?Sized>(
     reference: &R,
     pairs: &[AlignedPair],
@@ -2745,11 +3061,13 @@ fn encode_record_body<R: ReferenceBases + ?Sized>(
     )
 }
 
+#[cfg(test)]
 enum WhitelistFragment {
     Raw(usize),
     Bases(Vec<u8>),
 }
 
+#[cfg(test)]
 struct RecordProgram {
     runs: Vec<ArchiveRun>,
     matched: Vec<Option<Vec<u8>>>,
@@ -2761,6 +3079,7 @@ struct RecordProgram {
     fragments: Vec<(usize, WhitelistFragment)>,
 }
 
+#[cfg(test)]
 fn decode_record_program(
     input: &mut Cursor<Vec<u8>>,
     mapped: Option<(&[u8], usize, bool)>,
@@ -2878,6 +3197,7 @@ fn decode_record_program(
     })
 }
 
+#[cfg(test)]
 fn expected_whitelist_groups(
     reduced_len: usize,
     descriptors: &[IndexDescriptor],
@@ -2925,6 +3245,7 @@ fn expected_whitelist_groups(
     Ok(groups)
 }
 
+#[cfg(test)]
 fn decode_record_literals(program: &RecordProgram, input: &mut Cursor<Vec<u8>>) -> Result<Vec<u8>> {
     enum Piece {
         Bases(Vec<u8>),
@@ -3010,6 +3331,462 @@ fn decode_record_literals(program: &RecordProgram, input: &mut Cursor<Vec<u8>>) 
     Ok(sequence)
 }
 
+fn decode_v21_records(
+    input: &[u8],
+    count: usize,
+    reference: &[u8],
+    layout: AlignmentLayout,
+    descriptors: &[IndexDescriptor],
+    _global_whitelist: &Whitelist,
+) -> Result<Vec<Vec<Vec<u8>>>> {
+    let mut cursor = Cursor::new(input.to_vec());
+    let section_count = read_u32(&mut cursor)? as usize;
+    let expected_sections = layout
+        .streams()
+        .checked_mul(V21_MATE_SECTION_COUNT)
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(descriptors.len()))
+        .ok_or_else(|| Error::InvalidFormat("record section count overflow".into()))?;
+    if section_count != expected_sections {
+        return Err(Error::InvalidFormat("record section count mismatch".into()));
+    }
+    let mut sections = Vec::with_capacity(section_count);
+    for _ in 0..section_count {
+        let compressed_len = usize_from(read_u64(&mut cursor)?, "record subsection")?;
+        let raw_len = usize_from(read_u64(&mut cursor)?, "record subsection")?;
+        let mut compressed = vec![0; compressed_len];
+        cursor.read_exact(&mut compressed)?;
+        let raw = zstd::stream::decode_all(Cursor::new(compressed))?;
+        if raw.len() != raw_len {
+            return Err(Error::InvalidFormat(
+                "record subsection length mismatch".into(),
+            ));
+        }
+        sections.push(raw);
+    }
+    if cursor.position() != cursor.get_ref().len() as u64 {
+        return Err(Error::InvalidFormat(
+            "trailing record section directory bytes".into(),
+        ));
+    }
+
+    let flags = &sections[0];
+    if flags.len() != count
+        || flags.iter().any(|&flag| {
+            flag > 3 || (layout == AlignmentLayout::SingleEnd && flag != 0 && flag != 3)
+        })
+    {
+        return Err(Error::InvalidFormat(
+            "invalid alignment flag section".into(),
+        ));
+    }
+    let mut all = Vec::with_capacity(layout.streams());
+    let mut first_alignment = None;
+    for mate in 0..layout.streams() {
+        let start = 1 + mate * V21_MATE_SECTION_COUNT;
+        let (sequences, alignments) = decode_v21_mate_sections(
+            &sections[start..start + V21_MATE_SECTION_COUNT],
+            flags,
+            mate,
+            reference,
+            first_alignment.as_deref(),
+        )?;
+        if mate == 0 {
+            first_alignment = Some(alignments);
+        }
+        all.push(sequences);
+    }
+
+    let mut index_sections = Vec::with_capacity(descriptors.len());
+    for (descriptor_index, descriptor) in descriptors.iter().enumerate() {
+        let section = &sections[1 + layout.streams() * V21_MATE_SECTION_COUNT + descriptor_index];
+        let expected_len = descriptor
+            .range
+            .len()
+            .checked_mul(count)
+            .ok_or_else(|| Error::InvalidFormat("index subsection length overflow".into()))?;
+        if section.len() != expected_len {
+            return Err(Error::InvalidFormat(
+                "index subsection length mismatch".into(),
+            ));
+        }
+        let indexes = section
+            .chunks_exact(descriptor.range.len())
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        index_sections.push(indexes);
+    }
+    for mate in 0..layout.streams() {
+        let mut selected = descriptors
+            .iter()
+            .enumerate()
+            .filter(|(_, descriptor)| descriptor.range.mate.stream() == mate)
+            .collect::<Vec<_>>();
+        selected.sort_by_key(|(_, descriptor)| descriptor.range.start);
+        for record in 0..count {
+            let biological = &all[mate][record];
+            let mut rebuilt = Vec::with_capacity(biological.len());
+            let mut biological_start = 0usize;
+            let mut removed = 0usize;
+            for (descriptor_index, descriptor) in &selected {
+                let boundary = descriptor
+                    .range
+                    .start
+                    .checked_sub(removed)
+                    .ok_or_else(|| Error::InvalidFormat("index insertion underflow".into()))?;
+                if boundary < biological_start || boundary > biological.len() {
+                    return Err(Error::InvalidFormat("index insertion exceeds read".into()));
+                }
+                let index = &index_sections[*descriptor_index][record];
+                if index.len() != descriptor.range.len() {
+                    return Err(Error::InvalidFormat("index read length mismatch".into()));
+                }
+                rebuilt.extend_from_slice(&biological[biological_start..boundary]);
+                rebuilt.extend_from_slice(index);
+                biological_start = boundary;
+                removed = removed
+                    .checked_add(descriptor.range.len())
+                    .ok_or_else(|| Error::InvalidFormat("index length overflow".into()))?;
+            }
+            rebuilt.extend_from_slice(&biological[biological_start..]);
+            all[mate][record] = rebuilt;
+        }
+    }
+    Ok(all)
+}
+
+fn decode_v21_mate_sections(
+    sections: &[Vec<u8>],
+    flags: &[u8],
+    mate: usize,
+    reference: &[u8],
+    first_alignment: Option<&[Option<(usize, bool)>]>,
+) -> Result<(Vec<Vec<u8>>, Vec<Option<(usize, bool)>>)> {
+    if sections.len() != V21_MATE_SECTION_COUNT || sections[0].len() != flags.len() * 2 {
+        return Err(Error::InvalidFormat("read length section mismatch".into()));
+    }
+    let aligned_count = flags
+        .iter()
+        .filter(|&&flag| matches!((flag, mate), (0, _) | (1, 0) | (2, 1)))
+        .count();
+    if sections[1].len() != aligned_count * 8 || sections[6].len() != aligned_count {
+        return Err(Error::InvalidFormat(
+            "aligned metadata section mismatch".into(),
+        ));
+    }
+    let noise_rows = newline_rows(&sections[3], aligned_count, true, "noise")?;
+    let emit_count = noise_rows
+        .iter()
+        .map(|row| row.iter().filter(|&&symbol| symbol == b'5').count())
+        .sum();
+    let emit_rows = newline_rows(&sections[5], emit_count, false, "emit")?;
+    let event_count = noise_rows.iter().map(|row| row.len()).sum::<usize>();
+    if sections[2].len() != event_count * 2 {
+        return Err(Error::InvalidFormat(
+            "noise position section mismatch".into(),
+        ));
+    }
+    let skip_count = noise_rows
+        .iter()
+        .map(|row| row.iter().filter(|&&symbol| symbol == b'4').count())
+        .sum::<usize>();
+    if sections[4].len() != skip_count * 8 {
+        return Err(Error::InvalidFormat(
+            "reference skip section mismatch".into(),
+        ));
+    }
+    let mut lengths = Cursor::new(sections[0].clone());
+    let mut positions = Cursor::new(sections[1].clone());
+    let mut noise_positions = Cursor::new(sections[2].clone());
+    let mut skips = Cursor::new(sections[4].clone());
+    let mut reverses = Cursor::new(sections[6].clone());
+    let mut unaligned = Cursor::new(sections[7].clone());
+    let mut noise_row = 0usize;
+    let mut emit_row = 0usize;
+    let mut sequences = Vec::with_capacity(flags.len());
+    let mut alignments = vec![None; flags.len()];
+    for (record_index, &flag) in flags.iter().enumerate() {
+        let length = read_u16(&mut lengths)? as usize;
+        let aligned = matches!((flag, mate), (0, _) | (1, 0) | (2, 1));
+        if aligned {
+            let encoded_position = read_u64(&mut positions)?;
+            let start = if mate == 1 && flag == 0 {
+                let first = first_alignment
+                    .and_then(|alignments| alignments.get(record_index))
+                    .and_then(|alignment| *alignment)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("paired R2 alignment is missing R1 alignment".into())
+                    })?;
+                let delta = zigzag_decode(encoded_position)?;
+                let first_start = i64::try_from(first.0).map_err(|_| {
+                    Error::InvalidFormat("R1 alignment position exceeds signed range".into())
+                })?;
+                let second_start = first_start.checked_add(delta).ok_or_else(|| {
+                    Error::InvalidFormat("R2 relative alignment position overflow".into())
+                })?;
+                nonnegative_usize(second_start, "R2 alignment position")?
+            } else {
+                usize_from(encoded_position, "alignment position")?
+            };
+            let encoded_reverse = read_u8(&mut reverses)?;
+            if encoded_reverse > 1 {
+                return Err(Error::InvalidFormat(
+                    "invalid reverse-complement flag".into(),
+                ));
+            }
+            let reverse = if mate == 1 && flag == 0 {
+                let first_reverse = first_alignment
+                    .and_then(|alignments| alignments.get(record_index))
+                    .and_then(|alignment| *alignment)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat(
+                            "paired R2 orientation is missing R1 orientation".into(),
+                        )
+                    })?
+                    .1;
+                if encoded_reverse == 1 {
+                    first_reverse
+                } else {
+                    !first_reverse
+                }
+            } else {
+                encoded_reverse != 0
+            };
+            let mut events = Vec::with_capacity(noise_rows[noise_row].len());
+            let mut emits = Vec::new();
+            for &encoded_symbol in noise_rows[noise_row] {
+                if !(b'0'..=b'5').contains(&encoded_symbol) {
+                    return Err(Error::InvalidFormat("unknown noise symbol".into()));
+                }
+                let symbol = encoded_symbol - b'0';
+                let delta = read_u16(&mut noise_positions)?;
+                let skip = if symbol == 4 {
+                    read_u64(&mut skips)?
+                } else {
+                    0
+                };
+                if symbol == 5 {
+                    emits.push(emit_rows[emit_row].to_vec());
+                    emit_row += 1;
+                }
+                events.push(V21NoiseEvent {
+                    delta,
+                    symbol,
+                    skip,
+                });
+            }
+            noise_row += 1;
+            sequences.push(reconstruct_v21_aligned_read(
+                reference, length, start, reverse, &events, &emits,
+            )?);
+            alignments[record_index] = Some((start, reverse));
+        } else {
+            let mut sequence = vec![0; length];
+            unaligned.read_exact(&mut sequence)?;
+            sequences.push(sequence);
+        }
+    }
+    if lengths.position() != lengths.get_ref().len() as u64
+        || positions.position() != positions.get_ref().len() as u64
+        || noise_positions.position() != noise_positions.get_ref().len() as u64
+        || skips.position() != skips.get_ref().len() as u64
+        || reverses.position() != reverses.get_ref().len() as u64
+        || unaligned.position() != unaligned.get_ref().len() as u64
+        || noise_row != noise_rows.len()
+        || emit_row != emit_rows.len()
+    {
+        return Err(Error::InvalidFormat(
+            "trailing read subsection bytes".into(),
+        ));
+    }
+    Ok((sequences, alignments))
+}
+
+fn newline_rows<'a>(
+    input: &'a [u8],
+    expected: usize,
+    allow_empty: bool,
+    name: &str,
+) -> Result<Vec<&'a [u8]>> {
+    if expected == 0 {
+        return if input.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(Error::InvalidFormat(format!("unexpected {name} rows")))
+        };
+    }
+    if input.last() != Some(&b'\n') {
+        return Err(Error::InvalidFormat(format!("unterminated {name} rows")));
+    }
+    let rows = input[..input.len() - 1]
+        .split(|&byte| byte == b'\n')
+        .collect::<Vec<_>>();
+    if rows.len() != expected || (!allow_empty && rows.iter().any(|row| row.is_empty())) {
+        return Err(Error::InvalidFormat(format!("{name} row count mismatch")));
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
+fn decode_v21_aligned_read(reference: &[u8], length: usize, input: &[u8]) -> Result<Vec<u8>> {
+    let mut cursor = Cursor::new(input.to_vec());
+    let start = usize_from(read_u64(&mut cursor)?, "alignment position")?;
+    let reverse = read_u8(&mut cursor)?;
+    if reverse > 1 {
+        return Err(Error::InvalidFormat(
+            "invalid reverse-complement flag".into(),
+        ));
+    }
+    let event_count = usize_from(read_u32(&mut cursor)? as u64, "noise event count")?;
+    let mut events = Vec::with_capacity(event_count);
+    let mut emit_count = 0usize;
+    for _ in 0..event_count {
+        let delta = read_u16(&mut cursor)?;
+        let symbol = read_u8(&mut cursor)?;
+        let skip = if symbol == 4 {
+            read_u64(&mut cursor)?
+        } else {
+            0
+        };
+        if symbol == 5 {
+            emit_count = emit_count
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidFormat("emit count overflow".into()))?;
+        } else if symbol > 4 {
+            return Err(Error::InvalidFormat("unknown noise symbol".into()));
+        }
+        events.push(V21NoiseEvent {
+            delta,
+            symbol,
+            skip,
+        });
+    }
+    let emit_len = usize_from(read_u32(&mut cursor)? as u64, "emit payload")?;
+    let mut emit_payload = vec![0; emit_len];
+    cursor.read_exact(&mut emit_payload)?;
+    if cursor.position() != cursor.get_ref().len() as u64 {
+        return Err(Error::InvalidFormat(
+            "trailing aligned read body bytes".into(),
+        ));
+    }
+    let emits = if emit_count == 0 {
+        if !emit_payload.is_empty() {
+            return Err(Error::InvalidFormat("unexpected emit payload".into()));
+        }
+        Vec::new()
+    } else {
+        let values = emit_payload
+            .split(|&byte| byte == b'\n')
+            .collect::<Vec<_>>();
+        if values.len() != emit_count || values.iter().any(|value| value.is_empty()) {
+            return Err(Error::InvalidFormat(
+                "emit count does not match noise symbols".into(),
+            ));
+        }
+        values
+    };
+    reconstruct_v21_aligned_read(
+        reference,
+        length,
+        start,
+        reverse != 0,
+        &events,
+        &emits.iter().map(|emit| emit.to_vec()).collect::<Vec<_>>(),
+    )
+}
+
+fn reconstruct_v21_aligned_read(
+    reference: &[u8],
+    length: usize,
+    start: usize,
+    reverse: bool,
+    events: &[V21NoiseEvent],
+    emits: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let mut sequence = vec![0; length];
+    let mut ref_pos = start;
+    let mut query_pos = 0usize;
+    let mut emit_index = 0usize;
+    for event in events {
+        let target = query_pos
+            .checked_add(event.delta as usize)
+            .ok_or_else(|| Error::InvalidFormat("noise position overflow".into()))?;
+        let reference_end = ref_pos
+            .checked_add(event.delta as usize)
+            .ok_or_else(|| Error::InvalidFormat("reference position overflow".into()))?;
+        if target > length || reference_end > reference.len() {
+            return Err(Error::InvalidFormat(format!(
+                "aligned read event exceeds bounds: query={query_pos} delta={} target={target} length={length} reference={ref_pos} reference_target={reference_end} reference_length={} symbol={}",
+                event.delta,
+                reference.len(),
+                event.symbol
+            )));
+        }
+        for position in query_pos..target {
+            sequence[position] = reference[ref_pos + position - query_pos];
+        }
+        query_pos = target;
+        ref_pos = reference_end;
+        match event.symbol {
+            0..=3 => {
+                if query_pos >= length || ref_pos >= reference.len() {
+                    return Err(Error::InvalidFormat("substitution exceeds bounds".into()));
+                }
+                sequence[query_pos] = substitution_base(reference[ref_pos], event.symbol)?;
+                query_pos += 1;
+                ref_pos += 1;
+            }
+            4 => {
+                ref_pos = ref_pos
+                    .checked_add(event.skip as usize)
+                    .ok_or_else(|| Error::InvalidFormat("reference skip overflow".into()))?;
+                if ref_pos > reference.len() {
+                    return Err(Error::InvalidFormat(
+                        "reference skip exceeds reference".into(),
+                    ));
+                }
+            }
+            5 => {
+                let emit = &emits[emit_index];
+                emit_index += 1;
+                let end = query_pos
+                    .checked_add(emit.len())
+                    .ok_or_else(|| Error::InvalidFormat("emit sequence overflow".into()))?;
+                if end > length {
+                    return Err(Error::InvalidFormat(
+                        "emit sequence exceeds read length".into(),
+                    ));
+                }
+                sequence[query_pos..end].copy_from_slice(emit);
+                query_pos = end;
+            }
+            _ => unreachable!(),
+        }
+    }
+    if query_pos < length {
+        let end = ref_pos
+            .checked_add(length - query_pos)
+            .ok_or_else(|| Error::InvalidFormat("final reference span overflow".into()))?;
+        if end > reference.len() {
+            return Err(Error::InvalidFormat(
+                "final reference span exceeds reference".into(),
+            ));
+        }
+        for position in query_pos..length {
+            sequence[position] = reference[ref_pos + position - query_pos];
+        }
+        query_pos = length;
+    }
+    if query_pos != length || emit_index != emits.len() {
+        return Err(Error::InvalidFormat("aligned read length mismatch".into()));
+    }
+    if reverse {
+        reverse_complement(&mut sequence);
+    }
+    Ok(sequence)
+}
+
+#[cfg(test)]
 fn decode_records(
     input: &[u8],
     count: usize,
@@ -3443,6 +4220,7 @@ fn archive_normalize(cigar: impl IntoIterator<Item = CigarOp>) -> Result<Vec<Arc
     Ok(runs)
 }
 
+#[cfg(test)]
 fn descriptor_boundaries(
     descriptors: &[IndexEncodingDescriptor],
     mate: usize,
@@ -3490,6 +4268,7 @@ fn descriptor_boundaries(
     Ok(boundaries)
 }
 
+#[cfg(test)]
 fn insert_whitelist_runs(
     core: Vec<ArchiveRun>,
     boundaries: Vec<(Vec<usize>, usize)>,
@@ -4138,6 +4917,7 @@ fn canonical_bits(base: u8) -> Result<u8> {
     }
 }
 
+#[cfg(test)]
 fn bits_to_base(bits: u8) -> u8 {
     b"ACGT"[bits as usize]
 }
@@ -4166,21 +4946,25 @@ impl BitWriter {
         Ok(())
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.bits
     }
 
+    #[cfg(test)]
     fn finish(self) -> Vec<u8> {
         self.bytes
     }
 }
 
+#[cfg(test)]
 struct BitReader<'a> {
     bytes: &'a [u8],
     bits: usize,
     position: usize,
 }
 
+#[cfg(test)]
 impl<'a> BitReader<'a> {
     fn new(bytes: &'a [u8], bits: usize) -> Result<Self> {
         if bytes.len() != bits.div_ceil(8) {
@@ -4573,6 +5357,7 @@ fn read_packed(input: &mut Cursor<Vec<u8>>) -> Result<PackedSequence> {
     }
 }
 
+#[cfg(test)]
 fn take_literal_bytes(input: &mut Cursor<Vec<u8>>, length: usize) -> Result<Vec<u8>> {
     let start = usize::try_from(input.position())
         .map_err(|_| Error::InvalidFormat("record literal offset is too large".into()))?;
@@ -5385,7 +6170,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_v20_header_layout() {
+    fn reads_v21_header_layout() {
         let options = crate::AlignmentCompressionOptions::default();
         let reference = encode_reference(b"ACGT", &options).unwrap().block;
         let range = EmbeddedIndexRange {
@@ -6963,7 +7748,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_v20_archives() {
+    fn rejects_non_v21_archives() {
         for version in [
             0,
             7,
@@ -6979,7 +7764,8 @@ mod tests {
             17,
             18,
             19,
-            21,
+            20,
+            22,
             u32::MAX,
         ] {
             let mut header = Vec::new();
@@ -7001,6 +7787,261 @@ mod tests {
             read_header(&mut Cursor::new(header)),
             Err(Error::InvalidFormat(message)) if message == "bad alignment archive magic"
         ));
+    }
+
+    #[test]
+    fn v21_aligned_read_round_trips_noise_skips_emits_and_reverse() {
+        let reference = b"AACCGGTTAACCGGTT";
+        for reverse in [false, true] {
+            let mut oriented = b"AATCGAACT".to_vec();
+            let hit = GenomeAlignment {
+                start: 0,
+                query_start: 0,
+                query_end: oriented.len() as i32,
+                is_reverse: reverse,
+                cigar: vec![
+                    CigarOp {
+                        kind: CigarKind::Match,
+                        len: 3,
+                    },
+                    CigarOp {
+                        kind: CigarKind::Del,
+                        len: 2,
+                    },
+                    CigarOp {
+                        kind: CigarKind::Match,
+                        len: 2,
+                    },
+                    CigarOp {
+                        kind: CigarKind::Ins,
+                        len: 2,
+                    },
+                    CigarOp {
+                        kind: CigarKind::Match,
+                        len: 2,
+                    },
+                ],
+            };
+            if reverse {
+                reverse_complement(&mut oriented);
+            }
+            let record = ReadRecord::new("read", oriented.clone(), None);
+            let body = encode_v21_aligned_read(reference.as_slice(), &record, &hit).unwrap();
+            assert_eq!(
+                decode_v21_aligned_read(reference, record.sequence.len(), &body).unwrap(),
+                record.sequence
+            );
+        }
+    }
+
+    #[test]
+    fn v21_noise_deltas_keep_trailing_emit_after_match() {
+        let reference = vec![b'C'; 57];
+        let sequence = [reference.as_slice(), &[b'A'; 43]].concat();
+        let record = ReadRecord::new("read", sequence.clone(), None);
+        let hit = GenomeAlignment {
+            start: 0,
+            query_start: 0,
+            query_end: 57,
+            is_reverse: false,
+            cigar: vec![CigarOp {
+                kind: CigarKind::Match,
+                len: 57,
+            }],
+        };
+        let encoded = encode_v21_aligned_read(reference.as_slice(), &record, &hit).unwrap();
+        assert_eq!(
+            decode_v21_aligned_read(reference.as_slice(), sequence.len(), &encoded).unwrap(),
+            sequence
+        );
+    }
+
+    #[test]
+    fn v21_noise_deltas_do_not_repeat_prefix_after_reference_skip() {
+        let reference = vec![b'C'; 12];
+        let sequence = b"CCCCCACC".to_vec();
+        let record = ReadRecord::new("read", sequence.clone(), None);
+        let hit = GenomeAlignment {
+            start: 0,
+            query_start: 0,
+            query_end: sequence.len() as i32,
+            is_reverse: false,
+            cigar: vec![
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 3,
+                },
+                CigarOp {
+                    kind: CigarKind::Del,
+                    len: 1,
+                },
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 2,
+                },
+                CigarOp {
+                    kind: CigarKind::Ins,
+                    len: 1,
+                },
+                CigarOp {
+                    kind: CigarKind::Match,
+                    len: 2,
+                },
+            ],
+        };
+        let encoded = encode_v21_aligned_read(reference.as_slice(), &record, &hit).unwrap();
+        assert_eq!(
+            decode_v21_aligned_read(reference.as_slice(), sequence.len(), &encoded).unwrap(),
+            sequence
+        );
+    }
+
+    #[test]
+    fn v21_record_sections_are_independent_zstd_frames_and_cover_partial_pairs() {
+        let reference = b"AACCGGTT";
+        let hit = |start| GenomeAlignment {
+            start,
+            query_start: 0,
+            query_end: 4,
+            is_reverse: false,
+            cigar: vec![CigarOp {
+                kind: CigarKind::Match,
+                len: 4,
+            }],
+        };
+        let pairs = vec![
+            AlignedPair {
+                first: ReadRecord::new("a/1", b"AACC".to_vec(), None),
+                second: Some(ReadRecord::new("a/2", b"NNNN".to_vec(), None)),
+                first_hit: Some(hit(0)),
+                second_hit: None,
+                first_selection: AlignmentSelection::default(),
+                second_selection: AlignmentSelection::default(),
+                indexes: Vec::new(),
+            },
+            AlignedPair {
+                first: ReadRecord::new("b/1", b"NNNN".to_vec(), None),
+                second: Some(ReadRecord::new("b/2", b"GGTT".to_vec(), None)),
+                first_hit: None,
+                second_hit: Some(hit(4)),
+                first_selection: AlignmentSelection::default(),
+                second_selection: AlignmentSelection::default(),
+                indexes: Vec::new(),
+            },
+        ];
+        let whitelist = index_read::merge_whitelists(&[]).unwrap();
+        let encoded = write_v21_record_stream(
+            reference.as_slice(),
+            &pairs,
+            AlignmentLayout::PairedEnd,
+            &[],
+            &whitelist,
+            1,
+        )
+        .unwrap();
+        let mut cursor = Cursor::new(encoded.clone());
+        let section_count = 1 + 2 * V21_MATE_SECTION_COUNT;
+        assert_eq!(read_u32(&mut cursor).unwrap(), section_count as u32);
+        for _ in 0..section_count {
+            let compressed = read_u64(&mut cursor).unwrap() as usize;
+            let raw = read_u64(&mut cursor).unwrap() as usize;
+            let mut frame = vec![0; compressed];
+            cursor.read_exact(&mut frame).unwrap();
+            assert_eq!(
+                zstd::stream::decode_all(Cursor::new(frame)).unwrap().len(),
+                raw
+            );
+        }
+        assert_eq!(cursor.position(), encoded.len() as u64);
+        let decoded = decode_v21_records(
+            &encoded,
+            pairs.len(),
+            reference,
+            AlignmentLayout::PairedEnd,
+            &[],
+            &whitelist,
+        )
+        .unwrap();
+        assert_eq!(decoded[0][0], b"AACC");
+        assert_eq!(decoded[1][0], b"NNNN");
+        assert_eq!(decoded[0][1], b"NNNN");
+        assert_eq!(decoded[1][1], b"GGTT");
+    }
+
+    #[test]
+    fn v21_paired_r2_position_and_reverse_flag_are_relative_to_r1() {
+        let reference = b"AACCGGTT";
+        let hit = |start, is_reverse| GenomeAlignment {
+            start,
+            query_start: 0,
+            query_end: 4,
+            is_reverse,
+            cigar: vec![CigarOp {
+                kind: CigarKind::Match,
+                len: 4,
+            }],
+        };
+        let pairs = vec![
+            AlignedPair {
+                first: ReadRecord::new("a/1", b"CCAA".to_vec(), None),
+                second: Some(ReadRecord::new("a/2", b"AACC".to_vec(), None)),
+                first_hit: Some(hit(4, true)),
+                second_hit: Some(hit(0, false)),
+                first_selection: AlignmentSelection::default(),
+                second_selection: AlignmentSelection::default(),
+                indexes: Vec::new(),
+            },
+            AlignedPair {
+                first: ReadRecord::new("b/1", b"CCAA".to_vec(), None),
+                second: Some(ReadRecord::new("b/2", b"GGTT".to_vec(), None)),
+                first_hit: Some(hit(4, true)),
+                second_hit: Some(hit(0, true)),
+                first_selection: AlignmentSelection::default(),
+                second_selection: AlignmentSelection::default(),
+                indexes: Vec::new(),
+            },
+        ];
+        let whitelist = index_read::merge_whitelists(&[]).unwrap();
+        let encoded = write_v21_record_stream(
+            reference.as_slice(),
+            &pairs,
+            AlignmentLayout::PairedEnd,
+            &[],
+            &whitelist,
+            1,
+        )
+        .unwrap();
+        let mut cursor = Cursor::new(encoded.clone());
+        let section_count = read_u32(&mut cursor).unwrap() as usize;
+        let mut sections = Vec::with_capacity(section_count);
+        for _ in 0..section_count {
+            let compressed_len = read_u64(&mut cursor).unwrap() as usize;
+            let raw_len = read_u64(&mut cursor).unwrap() as usize;
+            let mut compressed = vec![0; compressed_len];
+            cursor.read_exact(&mut compressed).unwrap();
+            let raw = zstd::stream::decode_all(Cursor::new(compressed)).unwrap();
+            assert_eq!(raw.len(), raw_len);
+            sections.push(raw);
+        }
+        assert_eq!(
+            sections[10],
+            [7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(sections[15], [0, 1]);
+
+        let decoded = decode_v21_records(
+            &encoded,
+            pairs.len(),
+            reference,
+            AlignmentLayout::PairedEnd,
+            &[],
+            &whitelist,
+        )
+        .unwrap();
+        assert_eq!(decoded[0][0], b"CCAA");
+        assert_eq!(decoded[1][0], b"AACC");
+        assert_eq!(decoded[0][1], b"CCAA");
+        assert_eq!(decoded[1][1], b"GGTT");
     }
 
     #[test]

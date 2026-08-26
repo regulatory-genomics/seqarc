@@ -371,7 +371,7 @@ fn embedded_index_ranges_round_trip_across_mates() {
         .success();
 
     let archive = std::fs::read(&archive_path).unwrap();
-    assert_eq!(u32::from_le_bytes(archive[9..13].try_into().unwrap()), 20);
+    assert_eq!(u32::from_le_bytes(archive[9..13].try_into().unwrap()), 21);
 
     Command::cargo_bin("seqarc")
         .unwrap()

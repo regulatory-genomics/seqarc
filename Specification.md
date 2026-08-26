@@ -9,17 +9,11 @@ the aligned single-end and paired-end compression APIs.
   ordinals refer to logical records: one read for single-end archives and one
   read pair for paired-end archives.
 - All fixed-width integers are unsigned little-endian unless explicitly stated.
-- Signed coordinate differences are encoded with ZigZag followed by an unsigned
-  varint.
-- ZigZag maps signed value `x` to `((x << 1) XOR (x >> 63))` interpreted as
-  `u64`.
 - Varints use unsigned LEB128: seven payload bits per byte, least-significant
   group first, with bit 7 set when another byte follows.
-- Bitmap record `i` is stored in bit `i % 8` of byte `i / 8`; the first record
-  uses the least-significant bit.
 - Zstandard frames use the compression level selected by the encoder. The level
   is not stored in the archive and is not needed for decompression.
-- Version 20 is the only supported aligned archive version.
+- Version 21 is the only supported aligned archive version.
 
 ## Top-Level Layout
 
@@ -40,7 +34,7 @@ The global header is exactly 39 bytes.
 | Offset | Size | Type | Field |
 |---:|---:|---|---|
 | 0 | 9 | bytes | Magic: `SEQARC-AL` |
-| 9 | 4 | `u32` | Version: `20` |
+| 9 | 4 | `u32` | Version: `21` |
 | 13 | 2 | `u16` | Flags |
 | 15 | 8 | `u64` | Reference block length |
 | 23 | 8 | `u64` | Index metadata block length |
@@ -283,202 +277,92 @@ rows. There is no separate index-quality stream.
 
 ## Record Section
 
-The record section stores one section per stream. For paired archives all
-stream-0 records are followed by all stream-1 records. Each stream section has
-the following layout:
+The record section is itself a directory of independently compressed Zstandard
+frames. This nested framing is inside the existing outer record-section frame.
 
 ```text
-u8  mapped_bitmap[ceil(record_count / 8)]
-u8  reverse_bitmap[ceil(record_count / 8)]
-u64 positions_length
-u8  positions[positions_length]
-record_column_directory
-u8  programs[programs_length]
-u8  raw_bitmap[raw_bitmap_byte_length]
-u8  mismatch_bitmap[mismatch_bitmap_byte_length]
-u8  ordinals[ordinal_byte_length]
-u8  mismatch_details[mismatch_detail_byte_length]
-u8  literals[literals_length]
+u32 subsection_count
+repeat subsection_count times:
+    u64 compressed_length
+    u64 raw_length
+    u8  zstd_frame[compressed_length]
 ```
 
-There is one body for every logical-record ordinal in the stream. Whether a body
-is mapped or unmapped is selected by the mapped bitmap. Position varints exist
-only for mapped records.
-
-### Position Prediction
-
-Position values are signed deltas encoded as ZigZag varints.
-
-For stream 0, including every single-end archive:
-
-- The predictor is the previous mapped mate-1 start in the chunk.
-- The initial predictor is zero.
-
-For paired stream 1:
-
-- If mate 1 of the same pair is mapped, the predictor is that mate-1 start.
-- Otherwise, the predictor is the previous mapped mate-2 start in the chunk.
-- The previous mate-2 start is updated for every mapped mate-2 record.
-
-The positions substream must be consumed exactly after all mapped records for
-the mate are decoded.
-
-### Strand Prediction
-
-For stream 0, a set reverse bit means reverse strand.
-
-For paired stream 1:
-
-- If mate 1 of the same pair is mapped, the stored bit is
-  `mate_2_reverse XOR mate_1_reverse`.
-- Otherwise, the stored bit is the absolute mate-2 reverse value.
-
-### Record Column Directory
+The subsection count is:
 
 ```text
-u64 programs_length
-u64 raw_bitmap_bit_count
-u64 raw_bitmap_byte_length
-u64 mismatch_bitmap_bit_count
-u64 mismatch_bitmap_byte_length
-u64 ordinal_byte_length
-u64 mismatch_detail_byte_length
-u64 literals_length
+1 + 8 * biological_stream_count + embedded_index_range_count
 ```
 
-For the raw and mismatch bitmap columns, byte length must equal
-`ceil(bit_count / 8)`, and unused low bits in the final byte must be zero. The
-directory and all six columns are stored once per mate, not once per record.
+Subsections occur in this order:
 
-### Program Column
+1. Alignment flags.
+2. Eight R1 subsections.
+3. Eight R2 subsections for paired archives.
+4. One raw subsection for each embedded index range in declaration order.
 
-The program column concatenates exactly `record_count` programs in logical-record
-order. Each program is parsed from its operation count and operation-derived
-payload lengths:
+Every frame must decode to its declared raw length, and every subsection must be
+consumed exactly.
 
-```text
-varint operation_count
-u8     packed_operation_codes[ceil(operation_count / 4)]
-varint lengths[non_whitelist_operation_count]
-payload match_payloads
-```
+### Alignment Flags
 
-Archive operation codes are two-bit values. The first operation occupies bits
-7-6, and four operations are stored per byte. Unused low bits in the final byte
-must be zero.
+The flag subsection contains one byte per logical record:
 
-| Code | Operation | Meaning |
-|---:|---|---|
-| 0 | `M` Match | Copy reference bases and apply mismatch noise |
-| 1 | `L` Literal | Emit adaptive packed/raw/sparse query bases |
-| 2 | `R` Reference advance | Advance reference without emitting query bases |
-| 3 | `W` Whitelist | Emit one grouped embedded-index boundary |
-
-The mapper's aligned-region CIGAR does not include unaligned query prefixes or
-suffixes. SeqArc inserts synthetic soft-clip operations so the effective CIGAR
-consumes the complete reduced read. Archive normalization maps `M`, `=`, and `X`
-to `M`; maps `I` and `S` to `L`; maps `D` and `N` to `R`; removes `H`, `P`, and
-zero-length operations; and merges adjacent operations of the same kind.
-
-Whitelist operations are inserted at the reduced-query boundaries represented
-by global index descriptors. A `W` operation has no stored length, consumes
-neither reduced query nor reference, and emits one or more descriptor fragments.
-Descriptors sharing the same reduced-query boundary are grouped into one `W`
-operation, with one token per descriptor. Core `M` or `L` operations are split
-when a whitelist boundary falls inside them. Each descriptor owned by the mate
-must be represented exactly once, and each unique boundary must have exactly one
-`W` operation.
-
-Mapped bodies may contain `M`, `L`, `R`, and `W`. Unmapped bodies use the same
-format but may contain only `L` and `W`.
-
-### Operation Payloads
-
-#### Match
-
-The aligned query is compared against the compact reference:
-
-```text
-varint mismatch_count
-repeat mismatch_count times:
-    varint position_delta
-    u8     replacement_base
-```
-
-Mismatch positions are offsets within the current `M` operation. The first
-position is relative to zero; subsequent positions are relative to the previous
-mismatch position.
-
-#### Literal And Raw Whitelist Sources
-
-The literal column contains only concatenated sequence bytes. It has no per-run
-mode, length, packing, or sparse-exception framing. After whitelist columns are
-decoded, the encoder and decoder derive maximal literal runs from consecutive
-output sources:
-
-- ordinary `L` operation bases;
-- raw descriptors within a grouped `W` operation;
-- sources separated only by `R`, which emits no output.
-
-An `M` operation or an exact/one-mismatch whitelist descriptor ends the current
-literal run. The literal column stores each run's oriented bytes directly in
-derived order. No literal-run count, separator, or length is stored because all
-boundaries are derived from operation lengths, descriptor lengths, and the raw
-bitmap. The outer record-section Zstandard frame compresses these byte-aligned
-DNA symbols.
-
-#### Reference Advance
-
-No payload is stored; only the reference position advances.
-
-#### Whitelist
-
-Whitelist columns follow descriptor occurrences in record and operation order.
-Within a grouped `W`, descriptor occurrences follow original-coordinate order for
-forward/unmapped reads and reverse original-coordinate order for reverse mapped
-reads.
-
-| Raw bit | Meaning |
+| Value | Meaning |
 |---:|---|
-| 0 | Descriptor is encoded from the global whitelist |
-| 1 | Descriptor sequence is supplied by a shared literal run |
+| `0` | All biological reads are aligned |
+| `1` | Only R1 is aligned |
+| `2` | Only R2 is aligned |
+| `3` | No biological read is aligned |
 
-The raw bitmap column contains exactly one bit per descriptor occurrence across
-all records in record order and grouped-W descriptor order.
+Single-end archives permit only `0` and `3`.
 
-After raw membership is known, the mismatch bitmap column contains exactly one
-mode bit per non-raw descriptor:
+### Biological Subsections
 
-| Mode bit | Encoding |
+Each biological stream has eight independently compressed subsections:
+
+1. Read lengths: one little-endian `u16` per logical record.
+2. Positions: one compact-reference position per aligned read. R1 positions and
+   R2-only positions are absolute `u64` values. R2 positions for records with
+   both mates aligned are signed R2-minus-R1 deltas encoded with ZigZag as
+   `u64`.
+3. Noise positions: one little-endian `u16` position delta per noise symbol.
+4. Noise symbols: one ASCII row per aligned read, terminated by newline.
+5. Reference skips: one little-endian `u64` for every `4` noise symbol.
+6. Emitted sequences: one nonempty raw sequence per `5` symbol, terminated by newline.
+7. Reverse flags: one byte, `0` or `1`, per aligned read. R1 and R2-only flags
+   are absolute orientation values. For a record with both mates aligned, the
+   R2 flag is `1` when R2 has the same orientation as R1 and `0` otherwise.
+8. Unaligned sequences: concatenated raw bytes; read lengths determine boundaries.
+
+Noise-position deltas are measured from the query cursor after the preceding
+event. Exact reference bases between events are copied implicitly. For paired
+records with both mates aligned, R2 position and orientation are decoded
+relative to R1 as described above. Symbols are:
+
+| Symbol | Meaning |
 |---:|---|
-| 0 | Exact global-whitelist ordinal |
-| 1 | Global ordinal, one mismatch position, and original base |
+| `0`-`3` | Substitute one base using its ordinal among the four bases other than the reference base |
+| `4` | Advance the reference by the next value from the reference-skip subsection |
+| `5` | Emit the next newline-delimited sequence without advancing the reference |
 
-Raw descriptors store no mismatch bit, ordinal, or mismatch details.
+The substitution alphabet is A/C/G/T/N. Removing the current reference base
+from that ordered alphabet leaves exactly four replacement choices represented
+by `0` through `3`.
 
-The global whitelist may contain at most 65,536 entries. The ordinal column
-stores one little-endian `u16` ordinal for every non-raw descriptor. Byte
-alignment preserves repeated ordinal symbols for the outer Zstandard codec.
+The mapper CIGAR is made query-complete by synthetic soft clips. `M`, `=`, and
+`X` produce exact copies and substitution events; `D` and `N` produce `4`
+events; `I` and `S` produce `5` events; `H`, `P`, and zero-length operations are
+discarded. Reverse reads are encoded in alignment orientation and reverse
+complemented after reconstruction.
 
-The mismatch-detail column stores one byte for every set mismatch bit:
+### Embedded Index Subsections
 
-```text
-bits 7-2  mismatch position, 0..63
-bits 1-0  original A/C/G/T base
-```
-
-One-mismatch candidates for descriptors longer than 64 bases are encoded as raw
-literal sources. Reads requiring two or more whitelist mismatches, and
-noncanonical reads, also set their raw bitmap bit and use the literal column.
-
-Candidate selection uses only the descriptor's local predicted whitelist, while
-the selected sequence is represented by its archive-global ordinal. This
-prevents another descriptor's entries from affecting correction.
-
-For reverse mapped reads, boundary groups and descriptors within each group occur
-in descending original-coordinate order. Decoded whitelist fragments are
-reverse-complemented while constructing the oriented read, and the complete
-reconstructed read is reverse-complemented back to FASTQ orientation.
+Each configured index range has one independently compressed raw-byte frame.
+Sequences occur in logical-record order and have the fixed length declared by
+the metadata descriptor, so no per-record delimiter is stored. Decoders reinsert
+the ranges into R1 or R2 in original-coordinate order. Index-range qualities
+remain part of the ordinary complete quality rows.
 
 ## Integrity and Validation
 
@@ -490,9 +374,9 @@ The aligned format has no archive-level checksum. Decoders rely on:
 - Zstandard frame decoding;
 - exact section and substream consumption;
 - end-of-file immediately after the declared final chunk;
-- bounds checks for coordinates, archive operations, whitelist fields, mismatch
-  positions, sparse exceptions, reference payload lengths, and packed-reference
-  padding.
+- bounds checks for coordinates, read lengths, noise deltas and symbols,
+  reference skips, emitted-sequence counts, index ranges, reference payload
+  lengths, and packed-reference padding.
 
 Writers should reject values that cannot fit their specified integer widths.
 Readers must use checked arithmetic when combining stored lengths and offsets.
@@ -503,11 +387,11 @@ An aligned archive preserves logical-record order and its single/paired
 cardinality. Depending on encoder options it can also preserve identifiers and
 qualities. Sequence reconstruction is lossless:
 
-- mapped reads are rebuilt from the embedded compact reference, archive
-  operations, strand, and noise;
-- unmapped reads are rebuilt from literal and whitelist operations;
-- embedded indexes are emitted inline from the global whitelist or lossless raw
-  fallbacks at their original R1 or R2 coordinates.
+- mapped reads are rebuilt from the embedded compact reference, strand, noise,
+  reference skips, and emitted sequences;
+- unmapped reads are rebuilt from their raw sequence subsections;
+- embedded indexes are read from independent raw frames and reinserted at their
+  original R1 or R2 coordinates.
 
 If a lossy quality preprocessing mode was selected, the stored quality bytes
 are reproduced exactly, but they are not the original input qualities.

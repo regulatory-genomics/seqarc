@@ -5,6 +5,10 @@ edition = "2021"
 description = "Rust-native library for archiving compressed sequencing reads"
 license = "MIT"
 
+[features]
+default = []
+rustar = ["dep:memmap2", "dep:noodles", "dep:rustar-aligner"]
+
 [dependencies]
 crossbeam-channel = "0.5"
 bed-utils = "0.11"
@@ -12,8 +16,11 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 indicatif = "0.17"
 minibwa-rs = { git = "https://github.com/henriksson-lab/minibwa-rs" }
+memmap2 = { version = "0.9", optional = true }
+noodles = { version = "0.113", features = ["sam"], optional = true }
 rayon = "1"
 rkyv = { version = "0.8", features = ["bytecheck"] }
+rustar-aligner = { git = "https://github.com/scverse/rustar-aligner", rev = "207773b11df5fb9c229bbbcf5385f6daa7f2fe7c", optional = true }
 tempfile = "3"
 zstd = "0.13"
 

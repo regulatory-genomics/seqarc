@@ -2,12 +2,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::write::GzEncoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use seqarc::{
-    build_genome_index_with_options, compress_aligned_paired_fastq_files_with_index_profiled,
+    build_alignment_index, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
     decompress_aligned_iter, open_fastx_reader, truncate_read_id, AlignedRecordGroup,
-    AlignedRecordSink, AlignmentCompressionOptions, DecompressionOptions, EmbeddedIndexMate,
-    EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode,
-    ReadRecord, Result,
+    AlignedRecordSink, AlignerKind, AlignmentCompressionOptions, DecompressionOptions,
+    EmbeddedIndexMate, EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions,
+    QualityMode, ReadRecord, Result,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -47,6 +47,42 @@ struct IndexArgs {
     /// Directory in which to create temporary index-build files.
     #[arg(long)]
     temp_dir: Option<PathBuf>,
+    /// Alignment backend used by this index.
+    #[arg(long, value_enum, default_value_t = AlignerChoice::Minibwa)]
+    aligner: AlignerChoice,
+    /// GTF annotation used to insert known splice junctions into a rustar index.
+    #[arg(long)]
+    gtf: Option<PathBuf>,
+    /// Splice-junction overhang stored in a rustar index.
+    #[arg(long, default_value_t = 100)]
+    sjdb_overhang: u32,
+    /// Rustar suffix-array sparsity. Larger values reduce index memory.
+    #[arg(long, default_value_t = 1)]
+    sa_sparse_d: u32,
+    /// Rustar suffix-array prefix length.
+    #[arg(long, default_value_t = 14)]
+    sa_index_nbases: u32,
+    /// Rustar chromosome-bin size as a base-2 exponent.
+    #[arg(long, default_value_t = 18)]
+    chr_bin_nbits: u32,
+    /// Number of index construction threads.
+    #[arg(long, default_value_t = 4)]
+    threads: usize,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AlignerChoice {
+    Minibwa,
+    Rustar,
+}
+
+impl From<AlignerChoice> for AlignerKind {
+    fn from(value: AlignerChoice) -> Self {
+        match value {
+            AlignerChoice::Minibwa => AlignerKind::Minibwa,
+            AlignerChoice::Rustar => AlignerKind::Rustar,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -570,12 +606,29 @@ fn percentage(count: u64, total: u64) -> f64 {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Index(args) => {
+            if args.threads == 0 || args.sa_sparse_d == 0 {
+                return Err(Error::InvalidInput(
+                    "--threads and --sa-sparse-d must be nonzero".into(),
+                ));
+            }
+            if matches!(args.aligner, AlignerChoice::Minibwa) && args.gtf.is_some() {
+                return Err(Error::InvalidInput(
+                    "--gtf is only supported with --aligner rustar".into(),
+                ));
+            }
             let output = AtomicPath::new(args.output, args.force)?;
-            build_genome_index_with_options(
+            build_alignment_index(
                 args.reference,
                 output.partial(),
                 &GenomeIndexBuildOptions {
                     temp_dir: args.temp_dir,
+                    aligner: args.aligner.into(),
+                    threads: args.threads,
+                    rustar_gtf: args.gtf,
+                    rustar_sjdb_overhang: args.sjdb_overhang,
+                    rustar_sa_sparse_d: args.sa_sparse_d,
+                    rustar_sa_index_nbases: args.sa_index_nbases,
+                    rustar_chr_bin_nbits: args.chr_bin_nbits,
                 },
             )?;
             output.commit()
@@ -597,6 +650,7 @@ fn run(cli: Cli) -> Result<()> {
                 quality_mode: quality_mode(&args)?,
                 zstd_level: args.zstd_level,
                 embedded_index_ranges: args.index_ranges.clone(),
+                ..AlignmentCompressionOptions::default()
             };
             let output = AtomicPath::new(args.output, args.force)?;
             let (metadata, profile) = if let Some(mate_2) = args.mate_2 {

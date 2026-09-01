@@ -3,6 +3,7 @@
 //! SeqArc archives are self-describing and support range decoding
 //! without a command-line interface.
 
+mod aligners;
 mod alignment_archive;
 mod fastx;
 #[allow(dead_code)]
@@ -11,6 +12,8 @@ pub mod minibwa;
 mod packed_sequence;
 mod quality;
 mod reference_free;
+#[cfg(feature = "rustar")]
+mod rustar_index;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -20,6 +23,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+pub use aligners::{
+    align_dna_batch, build_alignment_index, build_genome_index, build_genome_index_with_options,
+    AlignerKind, GenomeAlignment, GenomeIndexBuildOptions,
+};
 pub use alignment_archive::AlignedRecordIter;
 pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
 pub use reference_free::record_store::{PairStore, StoreStats};
@@ -162,6 +169,7 @@ pub struct CompressionOptions {
 
 #[derive(Clone, Debug)]
 pub struct AlignmentCompressionOptions {
+    pub aligner: AlignerKind,
     pub chunk_records: usize,
     pub threads: usize,
     pub temp_dir: Option<std::path::PathBuf>,
@@ -171,11 +179,17 @@ pub struct AlignmentCompressionOptions {
     pub quality_mode: QualityMode,
     pub zstd_level: i32,
     pub embedded_index_ranges: Vec<EmbeddedIndexRange>,
+    pub rustar_gtf: Option<std::path::PathBuf>,
+    pub rustar_sjdb_overhang: u32,
+    pub rustar_sa_sparse_d: u32,
+    pub rustar_sa_index_nbases: u32,
+    pub rustar_chr_bin_nbits: u32,
 }
 
 impl Default for AlignmentCompressionOptions {
     fn default() -> Self {
         Self {
+            aligner: AlignerKind::Minibwa,
             chunk_records: 250_000,
             threads: 16,
             temp_dir: None,
@@ -185,13 +199,13 @@ impl Default for AlignmentCompressionOptions {
             quality_mode: QualityMode::Lossless,
             zstd_level: 19,
             embedded_index_ranges: Vec::new(),
+            rustar_gtf: None,
+            rustar_sjdb_overhang: 100,
+            rustar_sa_sparse_d: 1,
+            rustar_sa_index_nbases: 14,
+            rustar_chr_bin_nbits: 18,
         }
     }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct GenomeIndexBuildOptions {
-    pub temp_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -620,7 +634,7 @@ pub fn compress_reordered_paired_fastq_files_profiled(
 /// Compress paired plain, gzip, or zstd FASTQ files against a genome reference.
 ///
 /// Mapped reads store their reference offset, strand, CIGAR, and sequence noise.
-/// Reads without a minibwa alignment are stored using the packed/raw fallback.
+/// Reads without a selected alignment are stored using the packed/raw fallback.
 pub fn compress_aligned_paired_fastq_files(
     genome_fasta: impl AsRef<Path>,
     input_1: impl AsRef<Path>,
@@ -657,7 +671,7 @@ pub fn compress_aligned_paired_fastq_files_with_index(
     .map(|(metadata, _)| metadata)
 }
 
-/// Compress using an existing minibwa index and report archive size details.
+/// Compress using an existing SeqArc alignment index and report archive size details.
 pub fn compress_aligned_paired_fastq_files_with_index_profiled(
     index_file: impl AsRef<Path>,
     input_1: impl AsRef<Path>,
@@ -872,122 +886,6 @@ pub fn write_fastx<W: Write>(records: &[ReadRecord], output: W, format: Format) 
     writer.finish()
 }
 
-/// Build a minibwa index from a genome FASTA by concatenating all chromosomes
-/// into one synthetic contig.
-pub fn build_genome_index(
-    genome_fasta: impl AsRef<Path>,
-    index_file: impl AsRef<Path>,
-) -> Result<minibwa::Index> {
-    build_genome_index_with_options(
-        genome_fasta,
-        index_file,
-        &GenomeIndexBuildOptions::default(),
-    )
-}
-
-pub fn build_genome_index_with_options(
-    genome_fasta: impl AsRef<Path>,
-    index_file: impl AsRef<Path>,
-    options: &GenomeIndexBuildOptions,
-) -> Result<minibwa::Index> {
-    let workspace = temporary_directory(options.temp_dir.as_deref(), "seqarc-index-")?;
-    let genome_fasta = genome_fasta.as_ref();
-    let reader = open_fastx_reader(genome_fasta)?;
-    let mut fasta = tempfile::NamedTempFile::new_in(workspace.path())?;
-    {
-        let mut writer = std::io::BufWriter::new(fasta.as_file_mut());
-        writer.write_all(b">genome\n")?;
-        let mut output = Vec::with_capacity(1 << 20);
-        let mut line_length = 0usize;
-        let mut reference_length = 0u64;
-        for record in FastxReader::new(reader, Format::Fasta) {
-            for base in record?.sequence {
-                let base = base.to_ascii_uppercase();
-                if !matches!(base, b'A' | b'C' | b'G' | b'T') {
-                    continue;
-                }
-                output.push(base);
-                reference_length += 1;
-                line_length += 1;
-                if line_length == 80 {
-                    output.push(b'\n');
-                    line_length = 0;
-                }
-                if output.len() >= 1 << 20 {
-                    writer.write_all(&output)?;
-                    output.clear();
-                }
-            }
-        }
-        if reference_length == 0 {
-            return Err(Error::InvalidInput(
-                "genome FASTA does not contain any ACGT bases".into(),
-            ));
-        }
-        if line_length != 0 {
-            output.push(b'\n');
-        }
-        writer.write_all(&output)?;
-        writer.flush()?;
-    }
-    fasta.as_file_mut().sync_all()?;
-
-    let index_file = index_file.as_ref();
-    minibwa::Index::build_from_fasta_in(fasta.path(), index_file, false, 4, workspace.path())
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
-    let index = minibwa::Index::load(index_file, false)
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
-    if index.reference_len() == 0 {
-        return Err(Error::InvalidInput(
-            "built genome index has an empty reference".into(),
-        ));
-    }
-    Ok(index)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GenomeAlignment {
-    pub start: i64,
-    pub query_start: i32,
-    pub query_end: i32,
-    pub cigar: Vec<minibwa::CigarOp>,
-    pub is_reverse: bool,
-}
-
-/// Align a batch of raw DNA sequences against a minibwa index.
-///
-/// The returned entries preserve input order. `None` indicates that a sequence
-/// could not be mapped. When minibwa reports multiple hits, only its first hit
-/// is returned.
-pub fn align_dna_batch(
-    index: &minibwa::Index,
-    sequences: &[impl AsRef<[u8]>],
-) -> Result<Vec<Option<GenomeAlignment>>> {
-    let names: Vec<String> = (0..sequences.len())
-        .map(|index| format!("read-{index}"))
-        .collect();
-    let sequences = sequences.iter().map(AsRef::as_ref).collect::<Vec<&[u8]>>();
-    let options = minibwa::Opts::new().set_paired(false);
-    let aligner = minibwa::Aligner::new(index, &options);
-    let mut buffer = minibwa::ThreadBuf::new();
-    let hits = aligner
-        .map_many(&mut buffer, &names, &sequences)
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
-
-    Ok(hits
-        .into_iter()
-        .map(|hits| {
-            hits.into_iter().next().map(|hit| GenomeAlignment {
-                start: hit.ref_start,
-                query_start: hit.query_start,
-                query_end: hit.query_end,
-                cigar: hit.cigar,
-                is_reverse: hit.strand == minibwa::Strand::Reverse,
-            })
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,65 +955,6 @@ mod tests {
             .unwrap();
         assert_eq!(records[0].sequence, b"ACGT");
         assert_eq!(records[1].quality, None);
-    }
-
-    #[test]
-    fn genome_index_concatenates_chromosomes() {
-        let directory = tempfile::tempdir().unwrap();
-        let genome = directory.path().join("genome.fa");
-        std::fs::write(&genome, b">chr1\nacnGT\n>chr2\ntgcaRY\n").unwrap();
-        let index_file = directory.path().join("genome.seqarc-index");
-
-        let index = build_genome_index(&genome, &index_file).unwrap();
-
-        assert!(index_file.exists());
-        assert_eq!(index.reference_len(), 8);
-        assert_eq!(
-            (0..index.reference_len())
-                .map(|position| index.reference_base(position).unwrap())
-                .collect::<Vec<_>>(),
-            b"ACGTTGCA"
-        );
-    }
-
-    #[test]
-    fn dna_batch_alignment_returns_first_hit_and_strand() {
-        let directory = tempfile::tempdir().unwrap();
-        let genome = directory.path().join("genome.fa");
-        let prefix = directory.path().join("genome.seqarc-index");
-        let reference =
-            b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
-        std::fs::write(&genome, [b">chr1\n".as_slice(), reference, b"\n"].concat()).unwrap();
-        let index = build_genome_index(&genome, &prefix).unwrap();
-
-        let forward = reference[20..60].to_vec();
-        let reverse = forward
-            .iter()
-            .rev()
-            .map(|base| match base {
-                b'A' => b'T',
-                b'C' => b'G',
-                b'G' => b'C',
-                b'T' => b'A',
-                _ => *base,
-            })
-            .collect::<Vec<_>>();
-        let alignments = align_dna_batch(
-            &index,
-            &[
-                forward,
-                reverse,
-                b"NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN".to_vec(),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(alignments.len(), 3);
-        assert_eq!(alignments[0].as_ref().unwrap().start, 20);
-        assert!(!alignments[0].as_ref().unwrap().is_reverse);
-        assert!(!alignments[0].as_ref().unwrap().cigar.is_empty());
-        assert!(alignments[1].as_ref().unwrap().is_reverse);
-        assert!(alignments[2].is_none());
     }
 
     #[test]

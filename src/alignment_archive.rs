@@ -1,6 +1,14 @@
+#[cfg(test)]
+use crate::aligners::SelectedAlignment;
+use crate::aligners::{
+    self, compact_boundary, compact_reference, effective_cigar, reverse_complement, AlignmentIndex,
+    AlignmentSelection, KeptRun, MappingProgressStats, ReferenceBases, ReferenceMask,
+    MAP_TASK_READS,
+};
 use crate::index_read::{self, IndexReadEncoding, IndexReadError, Whitelist, WhitelistBuilder};
-use crate::minibwa;
-use crate::minibwa::{Aligner, CigarKind, CigarOp, Index, Opts, Strand, ThreadBuf};
+#[cfg(test)]
+use crate::minibwa::{self, Strand};
+use crate::minibwa::{CigarKind, CigarOp};
 #[cfg(test)]
 use crate::packed_sequence::PackedSequence;
 use crate::quality::{decode_stream_bytes, encode_stream_bytes};
@@ -23,7 +31,6 @@ use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
 const VERSION: u32 = 21;
-const MAP_TASK_READS: usize = 256;
 const MAP_TASKS_PER_WORKER: usize = 4;
 const MAX_MAPPING_BATCH_RECORDS: usize = 131_072;
 const PIPELINE_BATCHES: usize = 2;
@@ -61,65 +68,6 @@ impl AlignedPair {
             0 => self.first_hit.as_ref(),
             1 => self.second_hit.as_ref(),
             _ => unreachable!(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct AlignmentSelection {
-    candidate_hits: u32,
-    selected_non_first: bool,
-    rejected_alignment: bool,
-}
-
-struct SelectedAlignment {
-    hit: Option<GenomeAlignment>,
-    selection: AlignmentSelection,
-}
-
-struct MappingProgressStats {
-    layout: AlignmentLayout,
-    processed: [u64; 2],
-    aligned: [u64; 2],
-}
-
-impl MappingProgressStats {
-    fn new(layout: AlignmentLayout) -> Self {
-        Self {
-            layout,
-            processed: [0; 2],
-            aligned: [0; 2],
-        }
-    }
-
-    fn observe(&mut self, mate: usize, selected: &[SelectedAlignment], progress: &ProgressBar) {
-        self.processed[mate] = self.processed[mate].saturating_add(selected.len() as u64);
-        self.aligned[mate] = self.aligned[mate].saturating_add(
-            selected
-                .iter()
-                .filter(|selected| selected.selection.candidate_hits != 0)
-                .count() as u64,
-        );
-        progress.set_message(self.message());
-        progress.inc(selected.len() as u64);
-    }
-
-    fn message(&self) -> String {
-        let percent = |mate: usize| {
-            if self.processed[mate] == 0 {
-                0.0
-            } else {
-                self.aligned[mate] as f64 * 100.0 / self.processed[mate] as f64
-            }
-        };
-        if self.layout == AlignmentLayout::PairedEnd {
-            format!(
-                "R1 aligned {:.2}% | R2 aligned {:.2}%",
-                percent(0),
-                percent(1)
-            )
-        } else {
-            format!("R1 aligned {:.2}%", percent(0))
         }
     }
 }
@@ -169,18 +117,6 @@ struct SpoolAlignment {
 struct SpoolCigarOp {
     op: u8,
     len: u32,
-}
-
-struct ReferenceMask {
-    bits: Vec<u64>,
-    length: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct KeptRun {
-    original_start: usize,
-    compact_start: usize,
-    length: usize,
 }
 
 struct EncodedChunk {
@@ -304,33 +240,6 @@ pub struct AlignedRecordIter<R: Read> {
     done: bool,
 }
 
-trait ReferenceBases: Sync {
-    fn len(&self) -> usize;
-    fn base(&self, position: usize) -> u8;
-}
-
-impl ReferenceBases for Index {
-    fn len(&self) -> usize {
-        self.reference_len()
-    }
-
-    #[inline(always)]
-    fn base(&self, position: usize) -> u8 {
-        self.reference_base_at(position)
-    }
-}
-
-impl ReferenceBases for [u8] {
-    fn len(&self) -> usize {
-        <[u8]>::len(self)
-    }
-
-    #[inline(always)]
-    fn base(&self, position: usize) -> u8 {
-        self[position]
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IdMode {
     None = 0,
@@ -407,6 +316,22 @@ impl IdModeDetector {
     }
 }
 
+fn index_build_options(
+    options: &crate::AlignmentCompressionOptions,
+    workspace: &Path,
+) -> crate::GenomeIndexBuildOptions {
+    crate::GenomeIndexBuildOptions {
+        temp_dir: Some(workspace.to_path_buf()),
+        aligner: options.aligner,
+        threads: options.threads,
+        rustar_gtf: options.rustar_gtf.clone(),
+        rustar_sjdb_overhang: options.rustar_sjdb_overhang,
+        rustar_sa_sparse_d: options.rustar_sa_sparse_d,
+        rustar_sa_index_nbases: options.rustar_sa_index_nbases,
+        rustar_chr_bin_nbits: options.rustar_chr_bin_nbits,
+    }
+}
+
 pub(crate) fn compress_paired_fastq_files(
     genome_fasta: impl AsRef<Path>,
     input_1: impl AsRef<Path>,
@@ -422,13 +347,13 @@ pub(crate) fn compress_paired_fastq_files(
         genome_fasta.as_ref().display()
     );
     let index_started = std::time::Instant::now();
-    let index = crate::build_genome_index_with_options(
+    let index_path = workspace.path().join("index.seqarc-index");
+    crate::build_alignment_index(
         genome_fasta,
-        workspace.path().join("index.seqarc-index"),
-        &crate::GenomeIndexBuildOptions {
-            temp_dir: Some(workspace.path().to_path_buf()),
-        },
+        &index_path,
+        &index_build_options(options, workspace.path()),
     )?;
+    let index = AlignmentIndex::load(&index_path)?;
     let index_elapsed = index_started.elapsed();
     eprintln!(
         "[seqarc] stage=index_build done elapsed={} reference_bases={}",
@@ -466,8 +391,7 @@ pub(crate) fn compress_paired_fastq_files_with_index(
         index_file.display()
     );
     let index_started = std::time::Instant::now();
-    let index =
-        Index::load(index_file, false).map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let index = AlignmentIndex::load(index_file)?;
     let index_elapsed = index_started.elapsed();
     eprintln!(
         "[seqarc] stage=index_load done elapsed={} reference_bases={}",
@@ -505,13 +429,13 @@ pub(crate) fn compress_single_fastq_file(
         genome_fasta.as_ref().display()
     );
     let index_started = std::time::Instant::now();
-    let index = crate::build_genome_index_with_options(
+    let index_path = workspace.path().join("index.seqarc-index");
+    crate::build_alignment_index(
         genome_fasta,
-        workspace.path().join("index.seqarc-index"),
-        &crate::GenomeIndexBuildOptions {
-            temp_dir: Some(workspace.path().to_path_buf()),
-        },
+        &index_path,
+        &index_build_options(options, workspace.path()),
     )?;
+    let index = AlignmentIndex::load(&index_path)?;
     let index_elapsed = index_started.elapsed();
     eprintln!(
         "[seqarc] stage=index_build done elapsed={} reference_bases={}",
@@ -548,8 +472,7 @@ pub(crate) fn compress_single_fastq_file_with_index(
         index_file.display()
     );
     let index_started = std::time::Instant::now();
-    let index =
-        Index::load(index_file, false).map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let index = AlignmentIndex::load(index_file)?;
     let index_elapsed = index_started.elapsed();
     eprintln!(
         "[seqarc] stage=index_load done elapsed={} reference_bases={}",
@@ -729,7 +652,7 @@ fn split_pair_indexes(
 }
 
 fn compress_with_index<I2: AsRef<Path>>(
-    index: &Index,
+    index: &AlignmentIndex,
     input_1: impl AsRef<Path>,
     input_2: Option<I2>,
     output: impl AsRef<Path>,
@@ -1723,20 +1646,32 @@ fn decode_chunk_sections(
 }
 
 fn map_pairs(
-    index: &Index,
+    index: &AlignmentIndex,
     pairs: &mut [AlignedPair],
     mapping_pool: &rayon::ThreadPool,
     progress: &ProgressBar,
     progress_stats: &mut MappingProgressStats,
 ) -> Result<()> {
-    let first_hits = map_mate(index, pairs, 0, mapping_pool)?;
+    let first_records = pairs.iter().map(|pair| pair.record(0)).collect::<Vec<_>>();
+    let first_hits = aligners::map_records(
+        index,
+        &first_records,
+        mapping_pool,
+        &alignment_candidate_cost,
+    )?;
     progress_stats.observe(0, &first_hits, progress);
     for (pair, first) in pairs.iter_mut().zip(first_hits) {
         pair.first_hit = first.hit;
         pair.first_selection = first.selection;
     }
     if pairs.first().is_some_and(|pair| pair.second.is_some()) {
-        let second_hits = map_mate(index, pairs, 1, mapping_pool)?;
+        let second_records = pairs.iter().map(|pair| pair.record(1)).collect::<Vec<_>>();
+        let second_hits = aligners::map_records(
+            index,
+            &second_records,
+            mapping_pool,
+            &alignment_candidate_cost,
+        )?;
         progress_stats.observe(1, &second_hits, progress);
         for (pair, second) in pairs.iter_mut().zip(second_hits) {
             pair.second_hit = second.hit;
@@ -1789,130 +1724,6 @@ fn spool_mapped_pairs(
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
     }
     Ok(())
-}
-
-fn map_mate(
-    index: &Index,
-    pairs: &[AlignedPair],
-    mate: usize,
-    mapping_pool: &rayon::ThreadPool,
-) -> Result<Vec<SelectedAlignment>> {
-    let opts = Opts::new().set_paired(false);
-    let aligner = Aligner::new(index, &opts);
-    mapping_pool.install(|| {
-        use rayon::prelude::*;
-        pairs
-            .par_chunks(MAP_TASK_READS)
-            .map_init(ThreadBuf::new, |buffer, batch| {
-                let records = batch.iter().map(|pair| pair.record(mate));
-                align_batch(&aligner, buffer, index, records)
-            })
-            .collect::<Result<Vec<_>>>()
-            .map(|batches| batches.into_iter().flatten().collect())
-    })
-}
-
-impl ReferenceMask {
-    fn new(length: usize) -> Self {
-        Self {
-            bits: vec![0; length.div_ceil(64)],
-            length,
-        }
-    }
-
-    fn mark_hit(&mut self, hit: &GenomeAlignment) -> Result<()> {
-        let mut position = nonnegative_usize(hit.start, "alignment start")?;
-        for op in &hit.cigar {
-            let length = op.len as usize;
-            match op.kind {
-                CigarKind::Match | CigarKind::Eq | CigarKind::Diff => {
-                    let end = position.checked_add(length).ok_or_else(|| {
-                        Error::InvalidInput("reference mask position overflow".into())
-                    })?;
-                    self.mark_range(position, end)?;
-                    position = end;
-                }
-                CigarKind::Del | CigarKind::RefSkip => {
-                    position = position.checked_add(length).ok_or_else(|| {
-                        Error::InvalidInput("reference mask position overflow".into())
-                    })?;
-                    if position > self.length {
-                        return Err(Error::InvalidFormat(
-                            "reference mask range out of bounds".into(),
-                        ));
-                    }
-                }
-                CigarKind::Ins | CigarKind::SoftClip | CigarKind::HardClip | CigarKind::Pad => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn mark_range(&mut self, start: usize, end: usize) -> Result<()> {
-        if start > end || end > self.length {
-            return Err(Error::InvalidFormat(
-                "reference mask range out of bounds".into(),
-            ));
-        }
-        for position in start..end {
-            self.bits[position / 64] |= 1u64 << (position % 64);
-        }
-        Ok(())
-    }
-
-    fn contains(&self, position: usize) -> bool {
-        position < self.length && (self.bits[position / 64] & (1u64 << (position % 64))) != 0
-    }
-}
-
-fn compact_reference<R: ReferenceBases + ?Sized>(
-    reference: &R,
-    mask: &ReferenceMask,
-) -> Result<(Vec<u8>, Vec<KeptRun>)> {
-    let mut compact = Vec::new();
-    let mut runs: Vec<KeptRun> = Vec::new();
-    for position in 0..reference.len() {
-        if !mask.contains(position) {
-            continue;
-        }
-        let base = reference.base(position);
-        if !matches!(base, b'A' | b'C' | b'G' | b'T') {
-            return Err(Error::InvalidInput(
-                "reference contains a noncanonical base".into(),
-            ));
-        }
-        let compact_position = compact.len();
-        compact.push(base);
-        if let Some(run) = runs.last_mut() {
-            if run.original_start + run.length == position
-                && run.compact_start + run.length == compact_position
-            {
-                run.length += 1;
-                continue;
-            }
-        }
-        runs.push(KeptRun {
-            original_start: position,
-            compact_start: compact_position,
-            length: 1,
-        });
-    }
-    Ok((compact, runs))
-}
-
-fn compact_boundary(runs: &[KeptRun], original: usize, reference_len: usize) -> Result<usize> {
-    if original > reference_len {
-        return Err(Error::InvalidFormat(
-            "alignment position exceeds reference".into(),
-        ));
-    }
-    let index = runs.partition_point(|run| run.original_start <= original);
-    Ok(index
-        .checked_sub(1)
-        .and_then(|index| runs.get(index))
-        .map_or(0, |run| {
-            run.compact_start + (original - run.original_start).min(run.length)
-        }))
 }
 
 impl SpoolPair {
@@ -2946,99 +2757,34 @@ fn alignment_candidate_core_cost<R: ReferenceBases + ?Sized>(
     Ok(programs.len() + literals.len())
 }
 
-fn align_batch<'a, I, R>(
-    aligner: &Aligner<'_>,
-    buffer: &mut ThreadBuf,
+fn alignment_candidate_cost<R: ReferenceBases + ?Sized>(
+    record: &ReadRecord,
+    alignment: Option<&GenomeAlignment>,
     reference: &R,
-    records: I,
-) -> Result<Vec<SelectedAlignment>>
-where
-    I: IntoIterator<Item = &'a ReadRecord>,
-    R: ReferenceBases + ?Sized,
-{
-    let records = records.into_iter().collect::<Vec<_>>();
-    let names = (0..records.len())
-        .map(|index| format!("read-{index}"))
-        .collect::<Vec<_>>();
-    let sequences = records
-        .iter()
-        .map(|record| record.sequence.as_slice())
-        .collect::<Vec<_>>();
-    aligner
-        .map_many(buffer, &names, &sequences)
-        .map_err(|error| Error::InvalidInput(error.to_string()))
-        .and_then(|hits| {
-            records
-                .into_iter()
-                .zip(hits)
-                .map(|(record, hits)| select_alignment(record, hits, reference))
-                .collect()
-        })
+) -> Result<usize> {
+    let runs = if let Some(alignment) = alignment {
+        archive_normalize(effective_cigar(alignment, record.sequence.len())?)?
+    } else {
+        vec![ArchiveRun {
+            op: ArchiveOp::Literal,
+            len: record.sequence.len(),
+            descriptors: Vec::new(),
+        }]
+    };
+    alignment_candidate_core_cost(
+        &record.sequence,
+        alignment.map(|alignment| (alignment, reference)),
+        &runs,
+    )
 }
 
+#[cfg(test)]
 fn select_alignment<R: ReferenceBases + ?Sized>(
     record: &ReadRecord,
     hits: Vec<minibwa::Hit>,
     reference: &R,
 ) -> Result<SelectedAlignment> {
-    let raw_cost = alignment_candidate_core_cost(
-        &record.sequence,
-        None::<(&GenomeAlignment, &R)>,
-        &[ArchiveRun {
-            op: ArchiveOp::Literal,
-            len: record.sequence.len(),
-            descriptors: Vec::new(),
-        }],
-    )?;
-    let candidate_hits = u32::try_from(hits.len()).unwrap_or(u32::MAX);
-    let mut best: Option<(usize, i32, usize, GenomeAlignment)> = None;
-    for (index, hit) in hits.into_iter().enumerate() {
-        let alignment = GenomeAlignment {
-            start: hit.ref_start,
-            query_start: hit.query_start,
-            query_end: hit.query_end,
-            cigar: hit.cigar,
-            is_reverse: hit.strand == Strand::Reverse,
-        };
-        let encoded_result = effective_cigar(&alignment, record.sequence.len())
-            .and_then(archive_normalize)
-            .and_then(|runs| {
-                alignment_candidate_core_cost(
-                    &record.sequence,
-                    Some((&alignment, reference)),
-                    &runs,
-                )
-            });
-        if encoded_result.is_err() {
-            continue;
-        }
-        let candidate = (encoded_result.unwrap(), hit.score, index, alignment);
-        if best.as_ref().is_none_or(|current| {
-            candidate.0 < current.0
-                || (candidate.0 == current.0 && candidate.1 > current.1)
-                || (candidate.0 == current.0 && candidate.1 == current.1 && candidate.2 < current.2)
-        }) {
-            best = Some(candidate);
-        }
-    }
-    let use_alignment = best
-        .as_ref()
-        .is_some_and(|candidate| candidate.0 < raw_cost);
-    let selected_non_first =
-        use_alignment && best.as_ref().is_some_and(|candidate| candidate.2 != 0);
-    let rejected_alignment = candidate_hits != 0 && !use_alignment;
-    Ok(SelectedAlignment {
-        hit: if use_alignment {
-            best.map(|candidate| candidate.3)
-        } else {
-            None
-        },
-        selection: AlignmentSelection {
-            candidate_hits,
-            selected_non_first,
-            rejected_alignment,
-        },
-    })
+    aligners::select_minibwa_alignment(record, hits, reference, &alignment_candidate_cost)
 }
 
 #[cfg(test)]
@@ -5020,64 +4766,6 @@ fn decode_mapped_body(
     )
 }
 
-fn effective_cigar(hit: &GenomeAlignment, read_len: usize) -> Result<Vec<CigarOp>> {
-    let query_start = usize::try_from(hit.query_start)
-        .map_err(|_| Error::InvalidFormat("negative query start".into()))?;
-    let query_end = usize::try_from(hit.query_end)
-        .map_err(|_| Error::InvalidFormat("negative query end".into()))?;
-    if query_start > query_end || query_end > read_len {
-        return Err(Error::InvalidFormat(
-            "query alignment range out of bounds".into(),
-        ));
-    }
-    let (prefix, suffix) = if hit.is_reverse {
-        (read_len - query_end, query_start)
-    } else {
-        (query_start, read_len - query_end)
-    };
-    let mut cigar = Vec::with_capacity(hit.cigar.len() + 2);
-    if prefix != 0 {
-        cigar.push(CigarOp {
-            kind: CigarKind::SoftClip,
-            len: prefix as u32,
-        });
-    }
-    cigar.extend_from_slice(&hit.cigar);
-    if suffix != 0 {
-        cigar.push(CigarOp {
-            kind: CigarKind::SoftClip,
-            len: suffix as u32,
-        });
-    }
-    normalize_cigar(cigar)
-}
-
-fn normalize_cigar(cigar: impl IntoIterator<Item = CigarOp>) -> Result<Vec<CigarOp>> {
-    let mut normalized: Vec<CigarOp> = Vec::new();
-    for op in cigar {
-        let kind = match op.kind {
-            CigarKind::Eq | CigarKind::Diff => CigarKind::Match,
-            CigarKind::HardClip | CigarKind::Pad => continue,
-            kind => kind,
-        };
-        if op.len == 0 {
-            continue;
-        }
-        if let Some(previous) = normalized
-            .last_mut()
-            .filter(|previous| previous.kind == kind)
-        {
-            previous.len = previous
-                .len
-                .checked_add(op.len)
-                .ok_or_else(|| Error::InvalidInput("CIGAR length overflow".into()))?;
-        } else {
-            normalized.push(CigarOp { kind, len: op.len });
-        }
-    }
-    Ok(normalized)
-}
-
 fn encode_index_metadata(
     descriptors: &[IndexEncodingDescriptor],
     global_whitelist: &Whitelist,
@@ -5434,18 +5122,6 @@ fn decode_sparse_body(length: usize, body: &[u8]) -> Result<Vec<u8>> {
         ));
     }
     Ok(sequence)
-}
-fn reverse_complement(sequence: &mut [u8]) {
-    sequence.reverse();
-    for base in sequence {
-        *base = match *base {
-            b'A' => b'T',
-            b'C' => b'G',
-            b'G' => b'C',
-            b'T' => b'A',
-            _ => *base,
-        };
-    }
 }
 fn cigar_code(op: CigarKind) -> Result<u8> {
     Ok(match op {

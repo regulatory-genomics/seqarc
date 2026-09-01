@@ -21,6 +21,19 @@ fn assert_directory_empty(path: &std::path::Path) {
     assert!(std::fs::read_dir(path).unwrap().next().is_none());
 }
 
+#[cfg(feature = "rustar")]
+fn pseudo_random_dna(length: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9u32;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b"ACGT"[(state & 3) as usize]
+        })
+        .collect()
+}
+
 #[test]
 fn help_lists_aligned_workflow_commands() {
     Command::cargo_bin("seqarc")
@@ -32,6 +45,91 @@ fn help_lists_aligned_workflow_commands() {
         .stdout(predicate::str::contains("compress"))
         .stdout(predicate::str::contains("decompress"))
         .stdout(predicate::str::contains("validate"));
+}
+
+#[cfg(feature = "rustar")]
+#[test]
+fn rustar_cli_builds_single_file_index_and_compresses_spliced_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let gtf_path = directory.path().join("genes.gtf");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+    let decoded_path = directory.path().join("decoded.fastq");
+    let exon_1 = pseudo_random_dna(60);
+    let exon_2 = pseudo_random_dna(60);
+    let reference = [
+        exon_1.as_slice(),
+        b"GT",
+        pseudo_random_dna(100).as_slice(),
+        b"AG",
+        exon_2.as_slice(),
+    ]
+    .concat();
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference.as_slice(), b"\n"].concat(),
+    )
+    .unwrap();
+    std::fs::write(
+        &gtf_path,
+        b"chr1\ttest\texon\t1\t60\t.\t+\t.\tgene_id \"g1\"; transcript_id \"t1\";\n\
+chr1\ttest\texon\t165\t224\t.\t+\t.\tgene_id \"g1\"; transcript_id \"t1\";\n",
+    )
+    .unwrap();
+    let read = [&exon_1[30..], &exon_2[..30]].concat();
+    let fastq = format!(
+        "@spliced\n{}\n+\n{}\n",
+        String::from_utf8_lossy(&read),
+        "I".repeat(read.len())
+    );
+    std::fs::write(&input_path, &fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("index")
+        .arg(&reference_path)
+        .args(["--aligner", "rustar", "--gtf"])
+        .arg(&gtf_path)
+        .args([
+            "--sjdb-overhang",
+            "30",
+            "--sa-index-nbases",
+            "3",
+            "--chr-bin-nbits",
+            "8",
+            "--threads",
+            "1",
+            "--output",
+        ])
+        .arg(&index_path)
+        .assert()
+        .success();
+    assert_eq!(&std::fs::read(&index_path).unwrap()[..8], b"SRSTAR01");
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("compress")
+        .args(["--index"])
+        .arg(&index_path)
+        .args(["--mate-1"])
+        .arg(&input_path)
+        .args(["--threads", "1", "--chunk-records", "1", "--output"])
+        .arg(&archive_path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("100.00% aligned"));
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .args(["--mate-1"])
+        .arg(&decoded_path)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read_to_string(decoded_path).unwrap(), fastq);
 }
 
 #[test]

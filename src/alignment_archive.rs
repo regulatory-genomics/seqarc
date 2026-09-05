@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
-const VERSION: u32 = 21;
+const VERSION: u32 = 22;
 const MAP_TASKS_PER_WORKER: usize = 4;
 const MAX_MAPPING_BATCH_RECORDS: usize = 131_072;
 const PIPELINE_BATCHES: usize = 2;
@@ -194,6 +194,64 @@ struct ArchiveHeader {
     reference: Vec<u8>,
     indexes: Vec<IndexDescriptor>,
     global_whitelist: Whitelist,
+    absolute_position_width: usize,
+    delta_position_width: usize,
+}
+
+fn position_width(reference_len: usize) -> usize {
+    let max = reference_len.saturating_sub(1);
+    if max <= u8::MAX as usize {
+        1
+    } else if max <= u16::MAX as usize {
+        2
+    } else if max <= 0x00ff_ffff {
+        3
+    } else if max <= u32::MAX as usize {
+        4
+    } else {
+        8
+    }
+}
+
+fn delta_width(reference_len: usize) -> usize {
+    let max_delta = reference_len.saturating_sub(1) as u64;
+    let max_encoded = max_delta.saturating_mul(2);
+    if max_encoded <= u8::MAX as u64 {
+        1
+    } else if max_encoded <= u16::MAX as u64 {
+        2
+    } else if max_encoded <= 0x00ff_ffff {
+        3
+    } else if max_encoded <= u32::MAX as u64 {
+        4
+    } else {
+        8
+    }
+}
+
+fn write_position(output: &mut Vec<u8>, value: u64, width: usize) -> Result<()> {
+    let max = if width == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 8)) - 1
+    };
+    if value > max {
+        return Err(Error::InvalidInput(
+            "position exceeds selected width".into(),
+        ));
+    }
+    for byte in 0..width {
+        output.push((value >> (byte * 8)) as u8);
+    }
+    Ok(())
+}
+
+fn read_position(input: &mut Cursor<Vec<u8>>, width: usize) -> Result<u64> {
+    let mut value = 0u64;
+    for byte in 0..width {
+        value |= u64::from(read_u8(input)?) << (byte * 8);
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +281,8 @@ pub struct AlignedRecordIter<R: Read> {
     preserve_quality: bool,
     indexes: Arc<Vec<IndexDescriptor>>,
     global_whitelist: Arc<Whitelist>,
+    absolute_position_width: usize,
+    delta_position_width: usize,
     original_range: Option<RangeInclusive<u64>>,
     total_chunks: u64,
     decoded_chunks: u64,
@@ -902,6 +962,8 @@ fn compress_with_index<I2: AsRef<Path>>(
     let reference_started = std::time::Instant::now();
     let (compact_reference, kept_runs) = compact_reference(index, &mask)?;
     let id_mode = id_detector.finish();
+    let absolute_position_width = position_width(compact_reference.len());
+    let delta_position_width = delta_width(compact_reference.len());
     let reference_block = encode_reference(&compact_reference, options)?;
     profile.reference_bases = compact_reference.len() as u64;
     profile.reference_raw_bytes = reference_block.raw_len;
@@ -919,7 +981,7 @@ fn compress_with_index<I2: AsRef<Path>>(
     progress.finish_and_clear();
     let index_metadata = encode_index_metadata(&index_descriptors, &global_whitelist)?;
     let mut archive = File::create(output)?;
-    let header_size = 9 + 4 + 2 + 8 * 3;
+    let header_size = 9 + 4 + 2 + 2 + 8 * 3;
     archive.write_all(MAGIC)?;
     write_u32(&mut archive, VERSION)?;
     let mut flags = 0u16;
@@ -934,6 +996,7 @@ fn compress_with_index<I2: AsRef<Path>>(
     }
     flags |= (id_mode as u16) << 3;
     write_u16(&mut archive, flags)?;
+    archive.write_all(&[absolute_position_width as u8, delta_position_width as u8])?;
     write_u64(&mut archive, reference_block.block.len() as u64)?;
     write_u64(&mut archive, index_metadata.len() as u64)?;
     let chunk_count_pos = archive.stream_position()?;
@@ -1003,6 +1066,8 @@ fn compress_with_index<I2: AsRef<Path>>(
                         encode_chunk(
                             reference_for_workers,
                             &pairs,
+                            absolute_position_width,
+                            delta_position_width,
                             options,
                             id_mode,
                             layout,
@@ -1231,6 +1296,8 @@ pub(crate) fn decompress_iter<R: Read>(
         preserve_quality: header.flags & 2 != 0,
         indexes: Arc::new(header.indexes),
         global_whitelist: Arc::new(header.global_whitelist),
+        absolute_position_width: header.absolute_position_width,
+        delta_position_width: header.delta_position_width,
         original_range: options.original_range.clone(),
         total_chunks: header.chunk_count,
         decoded_chunks: 0,
@@ -1339,6 +1406,8 @@ impl<R: Read> AlignedRecordIter<R> {
                 let preserve_quality = self.preserve_quality;
                 let indexes = Arc::clone(&self.indexes);
                 let global_whitelist = Arc::clone(&self.global_whitelist);
+                let absolute_position_width = self.absolute_position_width;
+                let delta_position_width = self.delta_position_width;
                 pool.spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         decode_archive_chunk(
@@ -1349,6 +1418,8 @@ impl<R: Read> AlignedRecordIter<R> {
                             &reference,
                             &indexes,
                             &global_whitelist,
+                            absolute_position_width,
+                            delta_position_width,
                         )
                     }))
                     .unwrap_or_else(|_| Err(Error::InvalidInput("chunk decoder panicked".into())));
@@ -1363,6 +1434,8 @@ impl<R: Read> AlignedRecordIter<R> {
                     &self.reference,
                     &self.indexes,
                     &self.global_whitelist,
+                    self.absolute_position_width,
+                    self.delta_position_width,
                 );
                 if result.is_ok() {
                     self.decoded_chunks += 1;
@@ -1551,6 +1624,8 @@ fn decode_archive_chunk(
     reference: &[u8],
     index_descriptors: &[IndexDescriptor],
     global_whitelist: &Whitelist,
+    absolute_position_width: usize,
+    delta_position_width: usize,
 ) -> Result<DecodedArchiveChunk> {
     let raw = decode_chunk_sections(
         &encoded.compressed,
@@ -1584,6 +1659,8 @@ fn decode_archive_chunk(
         layout,
         index_descriptors,
         global_whitelist,
+        absolute_position_width,
+        delta_position_width,
     )?;
     for mate in 0..layout.streams() {
         for record in 0..encoded.record_count {
@@ -1865,6 +1942,8 @@ impl SpoolAlignment {
 fn encode_chunk(
     reference: &[u8],
     pairs: &[AlignedPair],
+    absolute_position_width: usize,
+    delta_position_width: usize,
     options: &crate::AlignmentCompressionOptions,
     id_mode: IdMode,
     layout: AlignmentLayout,
@@ -1878,6 +1957,8 @@ fn encode_chunk(
     let records = write_v21_record_stream(
         reference,
         pairs,
+        absolute_position_width,
+        delta_position_width,
         layout,
         index_descriptors,
         global_whitelist,
@@ -2053,6 +2134,8 @@ fn reconstruct_quality_row(
 fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
     reference: &R,
     pairs: &[AlignedPair],
+    absolute_position_width: usize,
+    delta_position_width: usize,
     layout: AlignmentLayout,
     descriptors: &[IndexEncodingDescriptor],
     _global_whitelist: &Whitelist,
@@ -2119,10 +2202,11 @@ fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
                     let delta = second_start.checked_sub(first_start).ok_or_else(|| {
                         Error::InvalidInput("R2 relative alignment position overflow".into())
                     })?;
-                    write_u64(&mut positions, zigzag_encode(delta))?;
+                    let encoded = zigzag_encode(delta);
+                    write_position(&mut positions, encoded, delta_position_width)?;
                     write_u8(&mut reverses, u8::from(fields.reverse == first.is_reverse))?;
                 } else {
-                    write_u64(&mut positions, fields.start)?;
+                    write_position(&mut positions, fields.start, absolute_position_width)?;
                     write_u8(&mut reverses, u8::from(fields.reverse))?;
                 }
                 for event in fields.events {
@@ -3084,6 +3168,8 @@ fn decode_v21_records(
     layout: AlignmentLayout,
     descriptors: &[IndexDescriptor],
     _global_whitelist: &Whitelist,
+    absolute_position_width: usize,
+    delta_position_width: usize,
 ) -> Result<Vec<Vec<Vec<u8>>>> {
     let mut cursor = Cursor::new(input.to_vec());
     let section_count = read_u32(&mut cursor)? as usize;
@@ -3136,6 +3222,8 @@ fn decode_v21_records(
             mate,
             reference,
             first_alignment.as_deref(),
+            absolute_position_width,
+            delta_position_width,
         )?;
         if mate == 0 {
             first_alignment = Some(alignments);
@@ -3207,6 +3295,8 @@ fn decode_v21_mate_sections(
     mate: usize,
     reference: &[u8],
     first_alignment: Option<&[Option<(usize, bool)>]>,
+    absolute_position_width: usize,
+    delta_position_width: usize,
 ) -> Result<(Vec<Vec<u8>>, Vec<Option<(usize, bool)>>)> {
     if sections.len() != V21_MATE_SECTION_COUNT || sections[0].len() != flags.len() * 2 {
         return Err(Error::InvalidFormat("read length section mismatch".into()));
@@ -3215,7 +3305,14 @@ fn decode_v21_mate_sections(
         .iter()
         .filter(|&&flag| matches!((flag, mate), (0, _) | (1, 0) | (2, 1)))
         .count();
-    if sections[1].len() != aligned_count * 8 || sections[6].len() != aligned_count {
+    let delta_count = if mate == 1 {
+        flags.iter().filter(|&&flag| flag == 0).count()
+    } else {
+        0
+    };
+    let expected_position_bytes = (aligned_count - delta_count) * absolute_position_width
+        + delta_count * delta_position_width;
+    if sections[1].len() != expected_position_bytes || sections[6].len() != aligned_count {
         return Err(Error::InvalidFormat(
             "aligned metadata section mismatch".into(),
         ));
@@ -3255,7 +3352,14 @@ fn decode_v21_mate_sections(
         let length = read_u16(&mut lengths)? as usize;
         let aligned = matches!((flag, mate), (0, _) | (1, 0) | (2, 1));
         if aligned {
-            let encoded_position = read_u64(&mut positions)?;
+            let encoded_position = read_position(
+                &mut positions,
+                if mate == 1 && flag == 0 {
+                    delta_position_width
+                } else {
+                    absolute_position_width
+                },
+            )?;
             let start = if mate == 1 && flag == 0 {
                 let first = first_alignment
                     .and_then(|alignments| alignments.get(record_index))
@@ -4875,6 +4979,13 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
             "unknown alignment archive flags".into(),
         ));
     }
+    let absolute_position_width = usize::from(read_u8(input)?);
+    let delta_position_width = usize::from(read_u8(input)?);
+    if !matches!(absolute_position_width, 1 | 2 | 3 | 4 | 8)
+        || !matches!(delta_position_width, 1 | 2 | 3 | 4 | 8)
+    {
+        return Err(Error::InvalidFormat("invalid position width".into()));
+    }
     let id_mode = IdMode::from_flags(flags)?;
     let layout = if flags & 4 != 0 {
         AlignmentLayout::SingleEnd
@@ -4909,6 +5020,8 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
         reference: decode_reference(&reference_block)?,
         indexes,
         global_whitelist,
+        absolute_position_width,
+        delta_position_width,
     })
 }
 
@@ -5805,6 +5918,8 @@ mod tests {
             let encoded = encode_chunk(
                 &[],
                 &[pair],
+                1,
+                1,
                 &options,
                 IdMode::Independent,
                 AlignmentLayout::SingleEnd,
@@ -5829,6 +5944,8 @@ mod tests {
                 &[],
                 &descriptors,
                 &global_whitelist,
+                1,
+                1,
             )
             .unwrap();
             let (_, group) = decoded
@@ -5867,6 +5984,7 @@ mod tests {
         header.extend(MAGIC);
         write_u32(&mut header, VERSION).unwrap();
         write_u16(&mut header, 4).unwrap();
+        header.extend([1, 1]);
         write_u64(&mut header, reference.len() as u64).unwrap();
         write_u64(&mut header, metadata.len() as u64).unwrap();
         write_u64(&mut header, 9).unwrap();
@@ -7441,7 +7559,7 @@ mod tests {
             18,
             19,
             20,
-            22,
+            21,
             u32::MAX,
         ] {
             let mut header = Vec::new();
@@ -7609,6 +7727,8 @@ mod tests {
         let encoded = write_v21_record_stream(
             reference.as_slice(),
             &pairs,
+            1,
+            1,
             AlignmentLayout::PairedEnd,
             &[],
             &whitelist,
@@ -7636,6 +7756,8 @@ mod tests {
             AlignmentLayout::PairedEnd,
             &[],
             &whitelist,
+            1,
+            1,
         )
         .unwrap();
         assert_eq!(decoded[0][0], b"AACC");
@@ -7681,6 +7803,8 @@ mod tests {
         let encoded = write_v21_record_stream(
             reference.as_slice(),
             &pairs,
+            1,
+            1,
             AlignmentLayout::PairedEnd,
             &[],
             &whitelist,
@@ -7699,10 +7823,7 @@ mod tests {
             assert_eq!(raw.len(), raw_len);
             sections.push(raw);
         }
-        assert_eq!(
-            sections[10],
-            [7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
-        );
+        assert_eq!(sections[10], [7, 7]);
         assert_eq!(sections[15], [0, 1]);
 
         let decoded = decode_v21_records(
@@ -7712,12 +7833,63 @@ mod tests {
             AlignmentLayout::PairedEnd,
             &[],
             &whitelist,
+            1,
+            1,
         )
         .unwrap();
         assert_eq!(decoded[0][0], b"CCAA");
         assert_eq!(decoded[1][0], b"AACC");
         assert_eq!(decoded[0][1], b"CCAA");
         assert_eq!(decoded[1][1], b"GGTT");
+    }
+
+    #[test]
+    fn position_width_depends_on_pruned_reference_length() {
+        for (length, width) in [
+            (0, 1),
+            (1, 1),
+            (256, 1),
+            (257, 2),
+            (65_536, 2),
+            (65_537, 3),
+            (16_777_216, 3),
+            (16_777_217, 4),
+            (u32::MAX as usize + 1, 4),
+            (u32::MAX as usize + 2, 8),
+        ] {
+            assert_eq!(position_width(length), width);
+        }
+        for (length, width) in [
+            (1, 1),
+            (128, 1),
+            (129, 2),
+            (32_768, 2),
+            (32_769, 3),
+            (8_388_608, 3),
+            (8_388_609, 4),
+        ] {
+            assert_eq!(delta_width(length), width);
+        }
+    }
+
+    #[test]
+    fn positions_round_trip_at_each_supported_width() {
+        for width in [1, 2, 3, 4, 8] {
+            let max = if width == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (width * 8)) - 1
+            };
+            let values = [0, max / 2, max];
+            let mut encoded = Vec::new();
+            for value in values {
+                write_position(&mut encoded, value, width).unwrap();
+            }
+            let mut cursor = Cursor::new(encoded);
+            for value in values {
+                assert_eq!(read_position(&mut cursor, width).unwrap(), value);
+            }
+        }
     }
 
     #[test]

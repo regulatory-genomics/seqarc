@@ -1026,7 +1026,7 @@ mod tests {
         assert!(profile.reference_compressed_bytes > 0);
         assert_eq!(
             profile.archive_bytes,
-            39 + profile.reference_compressed_bytes
+            41 + profile.reference_compressed_bytes
                 + 17
                 + 44 * profile.chunk_count
                 + profile.chunks_compressed_bytes

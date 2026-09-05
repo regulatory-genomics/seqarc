@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
-const VERSION: u32 = 22;
+const VERSION: u32 = 23;
 const MAP_TASKS_PER_WORKER: usize = 4;
 const MAX_MAPPING_BATCH_RECORDS: usize = 131_072;
 const PIPELINE_BATCHES: usize = 2;
@@ -1714,7 +1714,13 @@ fn decode_chunk_sections(
     };
     let ids = decode_section(ids_compressed_len, ids_len)?;
     let qualities = decode_section(qualities_compressed_len, qualities_len)?;
-    let records = decode_section(records_compressed_len, records_len)?;
+    let mut records = vec![0; records_compressed_len];
+    input.read_exact(&mut records)?;
+    if records.len() != records_len {
+        return Err(Error::InvalidFormat(
+            "chunk record section length mismatch".into(),
+        ));
+    }
     let mut raw = Vec::with_capacity(ids_len + qualities_len + records_len);
     raw.extend(ids);
     raw.extend(qualities);
@@ -1967,7 +1973,9 @@ fn encode_chunk(
     let ids_compressed = zstd::stream::encode_all(Cursor::new(&ids), options.zstd_level)?;
     let qualities_compressed =
         zstd::stream::encode_all(Cursor::new(&qualities), options.zstd_level)?;
-    let records_compressed = zstd::stream::encode_all(Cursor::new(&records), options.zstd_level)?;
+    // `records` already contains independently compressed subsection frames.
+    let records_len = records.len() as u64;
+    let records_compressed = records;
     let mut compressed = Vec::with_capacity(
         24 + ids_compressed.len() + qualities_compressed.len() + records_compressed.len(),
     );
@@ -1980,10 +1988,10 @@ fn encode_chunk(
     Ok(EncodedChunk {
         pairs: u32::try_from(pairs.len())
             .map_err(|_| Error::InvalidInput("chunk contains too many records".into()))?,
-        raw_len: (ids.len() + qualities.len() + records.len()) as u64,
+        raw_len: (ids.len() + qualities.len()) as u64 + records_len,
         ids_len: ids.len() as u64,
         qualities_len: qualities.len() as u64,
-        records_len: records.len() as u64,
+        records_len,
         ids_compressed_len: ids_compressed.len() as u64,
         qualities_compressed_len: qualities_compressed.len() as u64,
         records_compressed_len: records_compressed.len() as u64,

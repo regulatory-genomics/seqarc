@@ -8,6 +8,22 @@ compression tools only see redundant sequence text. For typical sequencing
 data, a SeqArc archive is roughly **30% of the size of the corresponding
 gzip-compressed FASTQ**, and decompression is **much faster than gzip**.
 
+## Design goals
+
+SeqArc is built around **asymmetric compression**: compression is allowed to
+take longer, but decompression is very fast.
+
+Traditional sequencing archivers such as Spring achieve very high compression
+ratios, but decompression takes a long time. Generic tools such as gzip or
+zstd decompress quickly, but their compression ratio on FASTQ data is poor.
+SeqArc bridges this gap: its compression ratio is close to Spring's, while
+decompression runs at super-fast speeds similar to zstd. This makes it well
+suited for storing FASTQ files that may need to be read again from time to
+time.
+
+SeqArc also supports single-cell sequencing data, including UMI/barcode
+extraction (embedded index ranges) and index reads (I1/I2).
+
 ## How it works
 
 - Reads are aligned to a reference genome with a built-in aligner

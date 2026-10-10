@@ -1284,6 +1284,9 @@ pub(crate) fn decompress_into<R: Read, S: AlignedRecordSink>(
     let index_streams = decoded.index_streams();
     let mut records = 0;
     for record in decoded {
+        if options.max_records.is_some_and(|limit| records >= limit) {
+            break;
+        }
         let (original_id, group) = record?;
         sink.write_group(original_id, group)?;
         records += 1;
@@ -3752,10 +3755,7 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
         ));
     }
     let reference_len = usize_from(read_u64(&mut parsed)?, "reference block")?;
-    let index_metadata_len = usize_from(
-        read_u64(&mut parsed)?,
-        "embedded index metadata block",
-    )?;
+    let index_metadata_len = usize_from(read_u64(&mut parsed)?, "embedded index metadata block")?;
     let chunks = read_u64(&mut parsed)?;
     let stored_crc = read_u32(input)?;
     let mut reference_block = vec![0; reference_len];
@@ -4831,10 +4831,10 @@ mod tests {
         // Flips in magic, version, or flags are caught by earlier validation,
         // so only positions guarded solely by the CRC are exercised here.
         for flip in [
-            34, // chunk count low byte
-            35, // chunk count second byte
-            42, // stored CRC field
-            PREAMBLE_BYTES + 3, // reference block payload
+            34,                                   // chunk count low byte
+            35,                                   // chunk count second byte
+            42,                                   // stored CRC field
+            PREAMBLE_BYTES + 3,                   // reference block payload
             PREAMBLE_BYTES + reference.len() + 2, // index metadata payload
         ] {
             let error = match read_header(&mut Cursor::new(build(Some(flip)))) {
@@ -4928,8 +4928,7 @@ mod tests {
         let chunk = read_chunk_header(&mut Cursor::new(&encoded)).unwrap();
         assert_eq!(chunk.record_count, 2);
         assert_eq!(chunk.compressed_len, 13);
-        let decoded =
-            read_chunk_payload(&mut Cursor::new(&encoded[48..]), &chunk, 7, 3).unwrap();
+        let decoded = read_chunk_payload(&mut Cursor::new(&encoded[48..]), &chunk, 7, 3).unwrap();
         assert_eq!(decoded, payload);
         // A flipped payload byte must fail the checksum.
         let mut damaged = encoded.clone();
@@ -4941,9 +4940,7 @@ mod tests {
         let mut damaged = encoded.clone();
         damaged[0] ^= 1;
         let error = read_chunk_header(&mut Cursor::new(&damaged))
-            .and_then(|header| {
-                read_chunk_payload(&mut Cursor::new(&damaged[48..]), &header, 7, 3)
-            })
+            .and_then(|header| read_chunk_payload(&mut Cursor::new(&damaged[48..]), &header, 7, 3))
             .unwrap_err();
         assert!(error.is_checksum());
     }

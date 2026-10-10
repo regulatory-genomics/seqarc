@@ -151,6 +151,10 @@ struct CompressArgs {
     /// Directory in which to create temporary compression files.
     #[arg(long)]
     temp_dir: Option<PathBuf>,
+    /// Validate the first N decoded records against the originals after
+    /// compression finishes. 0 disables the check.
+    #[arg(long, default_value_t = 1_000_000)]
+    post_validate_records: u64,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -237,6 +241,9 @@ struct ValidateArgs {
     /// Apply the compression-time identifier field selection before comparison.
     #[arg(long, requires = "mate_1")]
     id_field: Option<usize>,
+    /// Stop after validating this many records instead of the whole archive.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    records: Option<u64>,
 }
 
 fn parse_range(value: &str) -> std::result::Result<RangeInclusive<u64>, String> {
@@ -509,12 +516,37 @@ impl AlignedRecordSink for CountingSink {
 
 type OriginalReader = FastxReader<Box<dyn std::io::BufRead + Send>>;
 
+/// Which fields an archival comparison should check. Archives written with
+/// `--no-ids`, lossy quality modes, or embedded index ranges without original
+/// index files cannot be compared byte-for-byte on every field.
+#[derive(Clone, Copy, Debug)]
+struct ComparisonMode {
+    ids: bool,
+    quality: bool,
+    index: bool,
+}
+
+impl Default for ComparisonMode {
+    fn default() -> Self {
+        Self {
+            ids: true,
+            quality: true,
+            index: true,
+        }
+    }
+}
+
 struct ComparisonSink {
     first: OriginalReader,
     second: Option<OriginalReader>,
     index: Vec<OriginalReader>,
     id_prefix_chars: Option<usize>,
     id_field: Option<usize>,
+    mode: ComparisonMode,
+    /// Record limit applied to the decode, if any. `finish` skips the
+    /// leftover-original check once this many records have been compared,
+    /// because the remaining originals were intentionally not consumed.
+    limit: Option<u64>,
     records: u64,
 }
 
@@ -541,8 +573,9 @@ impl ComparisonSink {
         expected: ReadRecord,
         label: &str,
         original_id: u64,
+        mode: ComparisonMode,
     ) -> Result<()> {
-        if actual.id != expected.id {
+        if mode.ids && actual.id != expected.id {
             return Err(Error::InvalidInput(format!(
                 "mismatch at {label} {original_id}: identifier differs"
             )));
@@ -560,7 +593,7 @@ impl ComparisonSink {
                 expected.sequence.len()
             )));
         }
-        if actual.quality != expected.quality {
+        if mode.quality && actual.quality != expected.quality {
             return Err(Error::InvalidInput(format!(
                 "mismatch at {label} {original_id}: quality differs"
             )));
@@ -583,6 +616,7 @@ impl AlignedRecordSink for ComparisonSink {
                     Self::expected(&mut self.first, self.id_prefix_chars, self.id_field)?,
                     "record",
                     original_id,
+                    self.mode,
                 )?;
             }
             SequenceRecordGroup::Paired(first, second) => {
@@ -594,35 +628,44 @@ impl AlignedRecordSink for ComparisonSink {
                     Self::expected(&mut self.first, self.id_prefix_chars, self.id_field)?,
                     "pair mate 1",
                     original_id,
+                    self.mode,
                 )?;
                 Self::compare(
                     &second,
                     Self::expected(second_reader, self.id_prefix_chars, self.id_field)?,
                     "pair mate 2",
                     original_id,
+                    self.mode,
                 )?;
             }
         }
-        if group.index_reads.len() != self.index.len() {
-            return Err(Error::InvalidInput(format!(
-                "archive contains {} index reads per record but {} index originals were provided",
-                group.index_reads.len(),
-                self.index.len()
-            )));
-        }
-        for (reader, actual) in self.index.iter_mut().zip(&group.index_reads) {
-            Self::compare(
-                actual,
-                Self::expected(reader, self.id_prefix_chars, self.id_field)?,
-                "index read",
-                original_id,
-            )?;
+        if self.mode.index {
+            if group.index_reads.len() != self.index.len() {
+                return Err(Error::InvalidInput(format!(
+                    "archive contains {} index reads per record but {} index originals were provided",
+                    group.index_reads.len(),
+                    self.index.len()
+                )));
+            }
+            for (reader, actual) in self.index.iter_mut().zip(&group.index_reads) {
+                Self::compare(
+                    actual,
+                    Self::expected(reader, self.id_prefix_chars, self.id_field)?,
+                    "index read",
+                    original_id,
+                    self.mode,
+                )?;
+            }
         }
         self.records += 1;
         Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
+        let truncated = self.limit.is_some_and(|limit| self.records >= limit);
+        if truncated {
+            return Ok(());
+        }
         if self.first.next().is_some()
             || self
                 .second
@@ -724,6 +767,22 @@ fn run(cli: Cli) -> Result<()> {
                 ));
             }
             validate_index_ranges(&args.index_ranges, args.mate_2.is_some())?;
+            let quality = quality_mode(&args)?;
+            let post_validation = (args.post_validate_records > 0).then(|| PostValidation {
+                archive: args.output.clone(),
+                mate_1: args.mate_1.clone(),
+                mate_2: args.mate_2.clone(),
+                index_read_1: args.index_read_1.clone(),
+                index_read_2: args.index_read_2.clone(),
+                id_prefix_chars: args.id_prefix_chars,
+                id_field: args.id_field,
+                mode: ComparisonMode {
+                    ids: !args.no_ids,
+                    quality: !args.no_quality && matches!(quality, QualityMode::Lossless),
+                    index: args.index_read_1.is_some() || args.index_ranges.is_empty(),
+                },
+                limit: args.post_validate_records,
+            });
             let options = AlignmentCompressionOptions {
                 chunk_records: args.chunk_records,
                 threads: args.threads,
@@ -732,7 +791,7 @@ fn run(cli: Cli) -> Result<()> {
                 id_prefix_chars: args.id_prefix_chars,
                 id_field: args.id_field,
                 preserve_quality: !args.no_quality,
-                quality_mode: quality_mode(&args)?,
+                quality_mode: quality,
                 zstd_level: args.zstd_level,
                 embedded_index_ranges: args.index_ranges.clone(),
                 index_read_files: [args.index_read_1, args.index_read_2]
@@ -817,6 +876,9 @@ fn run(cli: Cli) -> Result<()> {
                     "pipeline: {} chunks, {} spool bytes, max {} pending chunks",
                     profile.chunk_count, profile.spool_bytes, profile.max_pending_chunks
                 );
+            }
+            if let Some(post_validation) = post_validation {
+                post_compress_validation(&post_validation)?;
             }
             Ok(())
         }
@@ -989,6 +1051,88 @@ fn verify_command(args: VerifyArgs) -> Result<()> {
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Everything needed to re-check a freshly written archive against its
+/// originals. Captured before compression consumes the input paths.
+struct PostValidation {
+    archive: PathBuf,
+    mate_1: PathBuf,
+    mate_2: Option<PathBuf>,
+    index_read_1: Option<PathBuf>,
+    index_read_2: Option<PathBuf>,
+    id_prefix_chars: Option<usize>,
+    id_field: Option<usize>,
+    mode: ComparisonMode,
+    limit: u64,
+}
+
+fn post_compress_validation(validation: &PostValidation) -> Result<()> {
+    let result = (|| -> Result<()> {
+        let started = std::time::Instant::now();
+        let archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(&validation.archive)?);
+        let options = DecompressionOptions {
+            max_records: Some(validation.limit),
+            ..DecompressionOptions::default()
+        };
+        let index_files: Vec<PathBuf> = [
+            validation.index_read_1.clone(),
+            validation.index_read_2.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut sink = comparison_sink(
+            &validation.mate_1,
+            validation.mate_2.as_deref(),
+            &index_files,
+            validation.id_prefix_chars,
+            validation.id_field,
+            validation.mode,
+            Some(validation.limit),
+        )?;
+        decompress_aligned_into(archive, &options, &mut sink)?;
+        eprintln!(
+            "[seqarc] stage=post_validate done elapsed={:.2}s records={}",
+            started.elapsed().as_secs_f64(),
+            sink.records
+        );
+        Ok(())
+    })();
+    result.map_err(|error| {
+        Error::InvalidInput(format!("post-compression validation failed: {error}"))
+    })
+}
+
+fn comparison_sink(
+    mate_1: &Path,
+    mate_2: Option<&Path>,
+    index_files: &[PathBuf],
+    id_prefix_chars: Option<usize>,
+    id_field: Option<usize>,
+    mode: ComparisonMode,
+    limit: Option<u64>,
+) -> Result<ComparisonSink> {
+    Ok(ComparisonSink {
+        first: FastxReader::new(open_fastx_reader(mate_1)?, Format::Fastq),
+        second: mate_2
+            .map(|second| {
+                open_fastx_reader(second).map(|reader| FastxReader::new(reader, Format::Fastq))
+            })
+            .transpose()?,
+        index: index_files
+            .iter()
+            .map(|path| {
+                open_fastx_reader(path).map(|reader| FastxReader::new(reader, Format::Fastq))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        id_prefix_chars,
+        id_field,
+        mode,
+        limit,
+        records: 0,
+    })
+}
+
 fn output_is_gzip(path: &Path, force_gzip: bool, force_plain: bool) -> bool {
     force_gzip
         || (!force_plain
@@ -1011,37 +1155,40 @@ fn decompression_progress(total_chunks: u64) -> ProgressBar {
 
 fn validate_command(args: ValidateArgs) -> Result<()> {
     let archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(args.archive)?);
+    let options = DecompressionOptions {
+        max_records: args.records,
+        ..DecompressionOptions::default()
+    };
+    let limit_note = args
+        .records
+        .map(|limit| format!(" (record limit {limit})"))
+        .unwrap_or_default();
+    let index_files: Vec<PathBuf> = [args.index_read_1, args.index_read_2]
+        .into_iter()
+        .flatten()
+        .collect();
     if let Some(first) = args.mate_1 {
-        let mut sink = ComparisonSink {
-            first: FastxReader::new(open_fastx_reader(first)?, Format::Fastq),
-            second: args
-                .mate_2
-                .map(|second| {
-                    open_fastx_reader(second).map(|reader| FastxReader::new(reader, Format::Fastq))
-                })
-                .transpose()?,
-            index: [args.index_read_1, args.index_read_2]
-                .into_iter()
-                .flatten()
-                .map(|path| {
-                    open_fastx_reader(path).map(|reader| FastxReader::new(reader, Format::Fastq))
-                })
-                .collect::<Result<Vec<_>>>()?,
-            id_prefix_chars: args.id_prefix_chars,
-            id_field: args.id_field,
-            records: 0,
-        };
-        let metadata =
-            decompress_aligned_into(archive, &DecompressionOptions::default(), &mut sink)?;
+        let mut sink = comparison_sink(
+            &first,
+            args.mate_2.as_deref(),
+            &index_files,
+            args.id_prefix_chars,
+            args.id_field,
+            ComparisonMode::default(),
+            args.records,
+        )?;
+        let metadata = decompress_aligned_into(archive, &options, &mut sink)?;
         println!(
-            "validated {} records against originals ({:?})",
+            "validated {} records{limit_note} against originals ({:?})",
             sink.records, metadata.layout
         );
     } else {
         let mut sink = CountingSink { records: 0 };
-        let metadata =
-            decompress_aligned_into(archive, &DecompressionOptions::default(), &mut sink)?;
-        println!("validated {} records ({:?})", sink.records, metadata.layout);
+        let metadata = decompress_aligned_into(archive, &options, &mut sink)?;
+        println!(
+            "validated {} records{limit_note} ({:?})",
+            sink.records, metadata.layout
+        );
     }
     Ok(())
 }

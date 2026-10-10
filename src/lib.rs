@@ -25,7 +25,7 @@ pub use aligners::{
     align_dna_batch, build_alignment_index, build_genome_index, build_genome_index_with_options,
     AlignerKind, GenomeAlignment, GenomeIndexBuildOptions,
 };
-pub use alignment_archive::{AlignedRecordIter, VerifyReport, verify_aligned_archive};
+pub use alignment_archive::{verify_aligned_archive, AlignedRecordIter, VerifyReport};
 pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
 pub use reference_free::record_store::{PairStore, StoreStats};
 pub use reference_free::reorder;
@@ -292,6 +292,8 @@ pub struct DecompressionOptions {
     pub threads: usize,
     /// Skip chunks that fail their checksum instead of aborting the decode.
     pub best_effort: bool,
+    /// Stop after emitting this many records; `None` decodes the whole archive.
+    pub max_records: Option<u64>,
 }
 
 impl Default for DecompressionOptions {
@@ -302,6 +304,7 @@ impl Default for DecompressionOptions {
             temp_dir: None,
             threads: 1,
             best_effort: false,
+            max_records: None,
         }
     }
 }
@@ -1266,8 +1269,10 @@ mod tests {
         assert_eq!(report.records, 1);
 
         // Strict decoding refuses the damaged archive.
-        let strict =
-            decompress_aligned_paired(Cursor::new(damaged.clone()), &DecompressionOptions::default());
+        let strict = decompress_aligned_paired(
+            Cursor::new(damaged.clone()),
+            &DecompressionOptions::default(),
+        );
         assert!(strict.is_err());
 
         // Best-effort decoding skips the damaged chunk and recovers the rest.

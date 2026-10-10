@@ -309,6 +309,162 @@ fn aligned_cli_round_trip_and_validation() {
 }
 
 #[test]
+fn validate_respects_record_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n@read1\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    std::fs::write(&input_path, fastq.as_bytes()).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("-1")
+        .arg(&input_path)
+        .arg("--records")
+        .arg("1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "validated 1 records (record limit 1) against originals (SingleEnd)",
+        ));
+
+    // A limit past the end of the archive behaves like a full run.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("-1")
+        .arg(&input_path)
+        .arg("--records")
+        .arg("5")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "validated 2 records (record limit 5) against originals (SingleEnd)",
+        ));
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("--records")
+        .arg("0")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("0 is not in 1.."));
+}
+
+#[test]
+fn compress_post_validates_first_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n@read1\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    std::fs::write(&input_path, fastq.as_bytes()).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    let compress = |extra_args: &[&str], archive: &std::path::Path| {
+        Command::cargo_bin("seqarc")
+            .unwrap()
+            .args(["compress", "--index"])
+            .arg(&index_path)
+            .arg("--mate-1")
+            .arg(&input_path)
+            .args(extra_args)
+            .arg("--output")
+            .arg(archive)
+            .assert()
+            .success()
+    };
+
+    // Default: the limit exceeds the archive, so every record is checked.
+    let archive_path = directory.path().join("default.seqarc");
+    compress(&[], &archive_path).stderr(
+        predicate::str::contains("stage=post_validate done")
+            .and(predicate::str::contains("records=2")),
+    );
+
+    // An explicit limit below the archive size checks only the first records.
+    let limited_path = directory.path().join("limited.seqarc");
+    compress(&["--post-validate-records", "1"], &limited_path).stderr(
+        predicate::str::contains("stage=post_validate done")
+            .and(predicate::str::contains("records=1")),
+    );
+
+    // Zero disables the check entirely.
+    let disabled_path = directory.path().join("disabled.seqarc");
+    compress(&["--post-validate-records", "0"], &disabled_path)
+        .stderr(predicate::str::contains("post_validate").not());
+
+    // Archives without stored identifiers still validate on the remaining
+    // fields.
+    let no_ids_path = directory.path().join("no-ids.seqarc");
+    compress(&["--no-ids"], &no_ids_path).stderr(
+        predicate::str::contains("stage=post_validate done")
+            .and(predicate::str::contains("records=2")),
+    );
+}
+
+#[test]
 fn index_cleans_custom_temp_directory_after_failure() {
     let directory = tempfile::tempdir().unwrap();
     let reference_path = directory.path().join("empty.fa");

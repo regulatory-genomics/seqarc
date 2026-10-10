@@ -4,10 +4,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use seqarc::{
     build_alignment_index, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
-    decompress_aligned_iter, open_fastx_reader, truncate_read_id, AlignedRecordGroup,
-    AlignedRecordSink, AlignerKind, AlignmentCompressionOptions, DecompressionOptions,
-    EmbeddedIndexMate, EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions,
-    QualityMode, ReadRecord, Result, SequenceRecordGroup,
+    decompress_aligned_iter, open_fastx_reader, select_id_field, truncate_read_id,
+    AlignedRecordGroup, AlignedRecordSink, AlignerKind, AlignmentCompressionOptions,
+    DecompressionOptions, EmbeddedIndexMate, EmbeddedIndexRange, Error, FastxReader, Format,
+    GenomeIndexBuildOptions, QualityMode, ReadRecord, Result, SequenceRecordGroup,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -126,6 +126,9 @@ struct CompressArgs {
     /// Retain at most the first N identifier characters, excluding FASTQ '@'.
     #[arg(long, conflicts_with = "no_ids")]
     id_prefix_chars: Option<usize>,
+    /// Keep only the Nth whitespace-delimited identifier field (zero-based).
+    #[arg(long, conflicts_with = "no_ids")]
+    id_field: Option<usize>,
     #[arg(long)]
     no_quality: bool,
     #[arg(long, value_enum, default_value_t = QualityChoice::Lossless)]
@@ -218,6 +221,9 @@ struct ValidateArgs {
     /// Apply the compression-time identifier prefix before comparison.
     #[arg(long, requires = "mate_1")]
     id_prefix_chars: Option<usize>,
+    /// Apply the compression-time identifier field selection before comparison.
+    #[arg(long, requires = "mate_1")]
+    id_field: Option<usize>,
 }
 
 fn parse_range(value: &str) -> std::result::Result<RangeInclusive<u64>, String> {
@@ -422,9 +428,7 @@ impl AlignedRecordSink for OutputSink {
         }
         for (writer, index_record) in self.index.iter_mut().zip(&group.index_reads) {
             write_record(
-                writer
-                    .as_mut()
-                    .expect("index output writer is required"),
+                writer.as_mut().expect("index output writer is required"),
                 index_record,
                 self.format,
             )?;
@@ -497,14 +501,22 @@ struct ComparisonSink {
     second: Option<OriginalReader>,
     index: Vec<OriginalReader>,
     id_prefix_chars: Option<usize>,
+    id_field: Option<usize>,
     records: u64,
 }
 
 impl ComparisonSink {
-    fn expected(reader: &mut OriginalReader, id_prefix_chars: Option<usize>) -> Result<ReadRecord> {
+    fn expected(
+        reader: &mut OriginalReader,
+        id_prefix_chars: Option<usize>,
+        id_field: Option<usize>,
+    ) -> Result<ReadRecord> {
         let mut record = reader
             .next()
             .ok_or_else(|| Error::InvalidInput("archive has extra records".into()))??;
+        if let Some(id_field) = id_field {
+            select_id_field(&mut record, id_field)?;
+        }
         if let Some(id_prefix_chars) = id_prefix_chars {
             truncate_read_id(&mut record, id_prefix_chars)?;
         }
@@ -555,7 +567,7 @@ impl AlignedRecordSink for ComparisonSink {
                 }
                 Self::compare(
                     &record,
-                    Self::expected(&mut self.first, self.id_prefix_chars)?,
+                    Self::expected(&mut self.first, self.id_prefix_chars, self.id_field)?,
                     "record",
                     original_id,
                 )?;
@@ -566,13 +578,13 @@ impl AlignedRecordSink for ComparisonSink {
                 })?;
                 Self::compare(
                     &first,
-                    Self::expected(&mut self.first, self.id_prefix_chars)?,
+                    Self::expected(&mut self.first, self.id_prefix_chars, self.id_field)?,
                     "pair mate 1",
                     original_id,
                 )?;
                 Self::compare(
                     &second,
-                    Self::expected(second_reader, self.id_prefix_chars)?,
+                    Self::expected(second_reader, self.id_prefix_chars, self.id_field)?,
                     "pair mate 2",
                     original_id,
                 )?;
@@ -588,7 +600,7 @@ impl AlignedRecordSink for ComparisonSink {
         for (reader, actual) in self.index.iter_mut().zip(&group.index_reads) {
             Self::compare(
                 actual,
-                Self::expected(reader, self.id_prefix_chars)?,
+                Self::expected(reader, self.id_prefix_chars, self.id_field)?,
                 "index read",
                 original_id,
             )?;
@@ -705,6 +717,7 @@ fn run(cli: Cli) -> Result<()> {
                 temp_dir: args.temp_dir.clone(),
                 preserve_ids: !args.no_ids,
                 id_prefix_chars: args.id_prefix_chars,
+                id_field: args.id_field,
                 preserve_quality: !args.no_quality,
                 quality_mode: quality_mode(&args)?,
                 zstd_level: args.zstd_level,
@@ -815,9 +828,7 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
     for (index, path) in output_paths.iter().enumerate() {
         for other in &output_paths[index + 1..] {
             if path == other {
-                return Err(Error::InvalidInput(
-                    "output paths must be different".into(),
-                ));
+                return Err(Error::InvalidInput("output paths must be different".into()));
             }
         }
     }
@@ -946,11 +957,11 @@ fn validate_command(args: ValidateArgs) -> Result<()> {
                 .into_iter()
                 .flatten()
                 .map(|path| {
-                    open_fastx_reader(path)
-                        .map(|reader| FastxReader::new(reader, Format::Fastq))
+                    open_fastx_reader(path).map(|reader| FastxReader::new(reader, Format::Fastq))
                 })
                 .collect::<Result<Vec<_>>>()?,
             id_prefix_chars: args.id_prefix_chars,
+            id_field: args.id_field,
             records: 0,
         };
         let metadata =

@@ -12,9 +12,9 @@ use crate::minibwa::{CigarKind, CigarOp};
 use crate::packed_sequence::PackedSequence;
 use crate::quality::{decode_stream_bytes, encode_stream_bytes};
 use crate::{
-    apply_quality, open_fastx_reader, truncate_read_id, AlignedCompressionProfile,
-    AlignedDecompressionMetadata, AlignedRecordGroup, AlignedRecordSink, AlignmentLayout,
-    ArchiveRecords, CompressionMetadata, DecompressionOptions, EmbeddedIndexMate,
+    apply_quality, identifier_token, open_fastx_reader, select_id_field, truncate_read_id,
+    AlignedCompressionProfile, AlignedDecompressionMetadata, AlignedRecordGroup, AlignedRecordSink,
+    AlignmentLayout, ArchiveRecords, CompressionMetadata, DecompressionOptions, EmbeddedIndexMate,
     EmbeddedIndexRange, Error, FastxReader, Format, GenomeAlignment, PairedRecordSink, ReadRecord,
     Result, SequenceRecordGroup,
 };
@@ -563,11 +563,17 @@ fn apply_identifier_policy(
     record: &mut ReadRecord,
     preserve_ids: bool,
     prefix_chars: Option<usize>,
+    id_field: Option<usize>,
 ) -> Result<()> {
     if !preserve_ids {
         record.id.clear();
-    } else if let Some(prefix_chars) = prefix_chars {
-        truncate_read_id(record, prefix_chars)?;
+    } else {
+        if let Some(id_field) = id_field {
+            select_id_field(record, id_field)?;
+        }
+        if let Some(prefix_chars) = prefix_chars {
+            truncate_read_id(record, prefix_chars)?;
+        }
     }
     Ok(())
 }
@@ -726,6 +732,11 @@ fn compress_with_index<I2: AsRef<Path>>(
             "identifier prefix cannot be retained when identifiers are disabled".into(),
         ));
     }
+    if !options.preserve_ids && options.id_field.is_some() {
+        return Err(Error::InvalidInput(
+            "identifier field selection requires identifier preservation".into(),
+        ));
+    }
     let preserve_ids = options.preserve_ids && options.id_prefix_chars != Some(0);
     let mapping_threads = options.threads.max(1);
     let mapping_batch_records = mapping_threads
@@ -738,7 +749,7 @@ fn compress_with_index<I2: AsRef<Path>>(
         .map_err(|error| Error::InvalidInput(format!("failed to create mapping pool: {error}")))?;
     let progress = mapping_progress();
     stage_log(&progress, format!(
-        "[seqarc] stage=initialize layout={:?} streams={} index_streams={} threads={} mapping_batch_records={} map_task_reads={} chunk_records={} zstd_level={} preserve_ids={} id_prefix_chars={:?} preserve_quality={}",
+        "[seqarc] stage=initialize layout={:?} streams={} index_streams={} threads={} mapping_batch_records={} map_task_reads={} chunk_records={} zstd_level={} preserve_ids={} id_prefix_chars={:?} id_field={:?} preserve_quality={}",
         layout,
         layout.streams(),
         options.index_read_files.len(),
@@ -749,6 +760,7 @@ fn compress_with_index<I2: AsRef<Path>>(
         options.zstd_level,
         preserve_ids,
         options.id_prefix_chars,
+        options.id_field,
         options.preserve_quality
     ));
     let temp_dir =
@@ -783,16 +795,22 @@ fn compress_with_index<I2: AsRef<Path>>(
             }
             let biological_streams = layout.streams();
             let mut pairs = Vec::with_capacity(mapping_batch_records);
-            let mut preview_identifier = mapper_options.id_prefix_chars.is_some();
+            let mut preview_identifier =
+                mapper_options.id_prefix_chars.is_some() || mapper_options.id_field.is_some();
             let mut prepare_identifier = |record: &mut ReadRecord| -> Result<()> {
                 let original = preview_identifier.then(|| record.id.clone());
-                apply_identifier_policy(record, preserve_ids, mapper_options.id_prefix_chars)?;
+                apply_identifier_policy(
+                    record,
+                    preserve_ids,
+                    mapper_options.id_prefix_chars,
+                    mapper_options.id_field,
+                )?;
                 if let Some(original) = original {
                     let old_header = format!("@{}", String::from_utf8_lossy(&original));
                     let new_header = format!("@{}", String::from_utf8_lossy(&record.id));
                     stage_log(
                         &producer_progress,
-                        format!("[seqarc] id-prefix preview: {old_header:?} -> {new_header:?}"),
+                        format!("[seqarc] id-transform preview: {old_header:?} -> {new_header:?}"),
                     );
                     preview_identifier = false;
                 }
@@ -814,7 +832,7 @@ fn compress_with_index<I2: AsRef<Path>>(
                     records.push(record?);
                 }
                 for record in records.iter().skip(biological_streams) {
-                    if record.id != records[0].id {
+                    if identifier_token(&record.id)? != identifier_token(&records[0].id)? {
                         return Err(Error::InvalidInput(
                             "index read identifier does not match mate 1 identifier".into(),
                         ));
@@ -825,6 +843,13 @@ fn compress_with_index<I2: AsRef<Path>>(
                     prepare_identifier(record)?;
                     if mapper_options.preserve_quality {
                         apply_quality(record, &mapper_options.quality_mode);
+                    }
+                }
+                for record in records.iter().skip(biological_streams) {
+                    if record.id != records[0].id {
+                        return Err(Error::InvalidInput(
+                            "transformed index read identifier does not match transformed mate 1 identifier".into(),
+                        ));
                     }
                 }
                 let mut record_iter = records.into_iter();
@@ -1879,7 +1904,11 @@ impl SpoolPair {
                 .index_reads
                 .iter()
                 .map(|index| {
-                    Ok(ReadRecord::new(Vec::new(), index.sequence.clone(), index.quality.clone()))
+                    Ok(ReadRecord::new(
+                        Vec::new(),
+                        index.sequence.clone(),
+                        index.quality.clone(),
+                    ))
                 })
                 .collect::<Result<Vec<_>>>()?,
         })
@@ -2324,9 +2353,10 @@ fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
                     let index = pair
                         .index_read(stream)
                         .ok_or_else(|| Error::InvalidInput("index read is missing".into()))?;
-                    index.quality.as_deref().ok_or_else(|| {
-                        Error::InvalidInput("index read quality is missing".into())
-                    })
+                    index
+                        .quality
+                        .as_deref()
+                        .ok_or_else(|| Error::InvalidInput("index read quality is missing".into()))
                 })
                 .collect::<Result<Vec<_>>>()?;
             quality_stream = encode_stream_bytes(&values)?;
@@ -2538,7 +2568,6 @@ fn substitution_base(reference: u8, symbol: u8) -> Result<u8> {
         .ok_or_else(|| Error::InvalidFormat("invalid substitution symbol".into()))
 }
 
-
 fn encode_record_columns<R: ReferenceBases + ?Sized>(
     programs: &mut Vec<u8>,
     literals: &mut Vec<u8>,
@@ -2678,13 +2707,7 @@ fn alignment_candidate_core_cost<R: ReferenceBases + ?Sized>(
 ) -> Result<usize> {
     let mut programs = Vec::new();
     let mut literals = Vec::new();
-    encode_record_columns(
-        &mut programs,
-        &mut literals,
-        sequence,
-        mapped,
-        runs,
-    )?;
+    encode_record_columns(&mut programs, &mut literals, sequence, mapped, runs)?;
     Ok(programs.len() + literals.len())
 }
 
@@ -2716,7 +2739,6 @@ fn select_alignment<R: ReferenceBases + ?Sized>(
 ) -> Result<SelectedAlignment> {
     aligners::select_minibwa_alignment(record, hits, reference, &alignment_candidate_cost)
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn decode_v21_records(
@@ -2824,11 +2846,10 @@ fn decode_v21_records(
                 let mut biological_start = 0usize;
                 let mut removed = 0usize;
                 for (descriptor_index, descriptor) in &selected {
-                    let boundary = descriptor
-                        .range
-                        .start
-                        .checked_sub(removed)
-                        .ok_or_else(|| Error::InvalidFormat("index insertion underflow".into()))?;
+                    let boundary =
+                        descriptor.range.start.checked_sub(removed).ok_or_else(|| {
+                            Error::InvalidFormat("index insertion underflow".into())
+                        })?;
                     if boundary < biological_start || boundary > biological.len() {
                         return Err(Error::InvalidFormat("index insertion exceeds read".into()));
                     }
@@ -2868,9 +2889,11 @@ fn decode_v21_records(
             }
             vec![None; count]
         };
-        if lengths_block.len() != count.checked_mul(2).ok_or_else(|| {
-            Error::InvalidFormat("index read length section overflow".into())
-        })? {
+        if lengths_block.len()
+            != count
+                .checked_mul(2)
+                .ok_or_else(|| Error::InvalidFormat("index read length section overflow".into()))?
+        {
             return Err(Error::InvalidFormat(
                 "index read length section mismatch".into(),
             ));
@@ -3259,7 +3282,6 @@ fn reconstruct_v21_aligned_read(
     Ok(sequence)
 }
 
-
 fn decode_ids(
     input: &[u8],
     count: usize,
@@ -3419,7 +3441,6 @@ fn archive_normalize(cigar: impl IntoIterator<Item = CigarOp>) -> Result<Vec<Arc
     Ok(runs)
 }
 
-
 fn encode_index_metadata(descriptors: &[IndexDescriptor]) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     write_u64(&mut output, descriptors.len() as u64)?;
@@ -3437,10 +3458,7 @@ fn encode_index_metadata(descriptors: &[IndexDescriptor]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn decode_index_metadata(
-    input: &[u8],
-    layout: AlignmentLayout,
-) -> Result<Vec<IndexDescriptor>> {
+fn decode_index_metadata(input: &[u8], layout: AlignmentLayout) -> Result<Vec<IndexDescriptor>> {
     if input.len() < 8 {
         return Err(Error::InvalidFormat(
             "embedded index metadata is too short".into(),
@@ -4454,10 +4472,7 @@ mod tests {
                 unreachable!();
             };
             assert_eq!(record.sequence, b"ACGT");
-            assert_eq!(
-                record.quality,
-                preserve_quality.then_some(b"ABCD".to_vec())
-            );
+            assert_eq!(record.quality, preserve_quality.then_some(b"ABCD".to_vec()));
             assert_eq!(
                 record.id,
                 if preserve_ids {
@@ -4497,7 +4512,9 @@ mod tests {
                     &b""[..]
                 }
             );
-            assert!(decoded.next_group(AlignmentLayout::SingleEnd, None).is_none());
+            assert!(decoded
+                .next_group(AlignmentLayout::SingleEnd, None)
+                .is_none());
         }
     }
 
@@ -4733,7 +4750,6 @@ mod tests {
                         len: 6,
                     }]
                 );
-
             }
         }
     }
@@ -4803,7 +4819,6 @@ mod tests {
             .into_genome(&runs, reference.len())
             .unwrap();
         assert_eq!(overlapping.start, 3);
-
     }
 
     #[test]
@@ -5379,5 +5394,4 @@ mod tests {
         assert!(selected.hit.is_none());
         assert!(selected.selection.rejected_alignment);
     }
-
 }

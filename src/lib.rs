@@ -147,6 +147,34 @@ pub fn truncate_read_id(record: &mut ReadRecord, max_chars: usize) -> Result<()>
     Ok(())
 }
 
+/// Replace the read identifier with its `field`-th whitespace-delimited field.
+///
+/// Fields are indexed from zero, and runs of consecutive ASCII whitespace act
+/// as one separator. Fails when the identifier has fewer fields than requested.
+pub fn select_id_field(record: &mut ReadRecord, field: usize) -> Result<()> {
+    let id = std::str::from_utf8(&record.id)
+        .map_err(|_| Error::InvalidInput("read identifier is not valid UTF-8".into()))?;
+    let selected = id.split_ascii_whitespace().nth(field).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "identifier field {field} is missing from read identifier {id:?}"
+        ))
+    })?;
+    record.id = selected.as_bytes().to_vec();
+    Ok(())
+}
+
+/// Return the identifier proper: the first whitespace-delimited token of the
+/// read identifier, excluding any trailing description.
+pub fn identifier_token(id: &[u8]) -> Result<&[u8]> {
+    let id = std::str::from_utf8(id)
+        .map_err(|_| Error::InvalidInput("read identifier is not valid UTF-8".into()))?;
+    Ok(id
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default()
+        .as_bytes())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum QualityMode {
     Lossless,
@@ -173,6 +201,7 @@ pub struct AlignmentCompressionOptions {
     pub temp_dir: Option<std::path::PathBuf>,
     pub preserve_ids: bool,
     pub id_prefix_chars: Option<usize>,
+    pub id_field: Option<usize>,
     pub preserve_quality: bool,
     pub quality_mode: QualityMode,
     pub zstd_level: i32,
@@ -194,6 +223,7 @@ impl Default for AlignmentCompressionOptions {
             temp_dir: None,
             preserve_ids: true,
             id_prefix_chars: None,
+            id_field: None,
             preserve_quality: true,
             quality_mode: QualityMode::Lossless,
             zstd_level: 19,
@@ -921,6 +951,43 @@ mod tests {
         assert_eq!(record.id, "ré".as_bytes());
         truncate_read_id(&mut record, 0).unwrap();
         assert!(record.id.is_empty());
+    }
+
+    #[test]
+    fn identifier_field_selection_keeps_selected_whitespace_field() {
+        let mut record = ReadRecord::new("READID 1:N:0:ATCG+CCAG", b"ACGT".to_vec(), None);
+        select_id_field(&mut record, 1).unwrap();
+        assert_eq!(record.id, b"1:N:0:ATCG+CCAG");
+        let mut record = ReadRecord::new("READID 1:N:0:ATCG+CCAG", b"ACGT".to_vec(), None);
+        select_id_field(&mut record, 0).unwrap();
+        assert_eq!(record.id, b"READID");
+    }
+
+    #[test]
+    fn identifier_field_selection_collapses_whitespace_runs() {
+        let mut record = ReadRecord::new("a \t b\t\tc", b"ACGT".to_vec(), None);
+        select_id_field(&mut record, 1).unwrap();
+        assert_eq!(record.id, b"b");
+    }
+
+    #[test]
+    fn identifier_field_selection_rejects_missing_fields() {
+        let mut record = ReadRecord::new("only", b"ACGT".to_vec(), None);
+        assert!(select_id_field(&mut record, 1).is_err());
+        let mut invalid = ReadRecord::new(vec![0xff], b"ACGT".to_vec(), None);
+        assert!(select_id_field(&mut invalid, 0).is_err());
+    }
+
+    #[test]
+    fn identifier_token_returns_first_whitespace_field() {
+        assert_eq!(
+            identifier_token(b"read0 1:N:0:ATCG+CCAG").unwrap(),
+            b"read0"
+        );
+        assert_eq!(identifier_token(b"read0\tcomment").unwrap(), b"read0");
+        assert_eq!(identifier_token(b"read0").unwrap(), b"read0");
+        assert_eq!(identifier_token(b"  spaced  id ").unwrap(), b"spaced");
+        assert!(identifier_token(&[0xff]).is_err());
     }
 
     #[test]

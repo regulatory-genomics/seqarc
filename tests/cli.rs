@@ -418,6 +418,218 @@ fn single_end_cli_round_trip_and_validation() {
 }
 
 #[test]
+fn id_field_selection_round_trips_and_combines_with_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let second_path = directory.path().join("reads.2.fastq");
+    let decoded_first = directory.path().join("decoded.1.fastq");
+    let decoded_second = directory.path().join("decoded.2.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let reverse_complement = sequence
+        .iter()
+        .rev()
+        .map(|base| match base {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let first_fastq = format!(
+        "@read0 1:N:0:ATCG+CCAG\n{}\n+\n{}\n@read1 1:N:0:GGTT+TTAA\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    let second_fastq = format!(
+        "@read0 2:N:0:ATCG+CCAG\n{}\n+\n{}\n@read1 2:N:0:GGTT+TTAA\n{}\n+\n{}\n",
+        String::from_utf8_lossy(&reverse_complement),
+        "J".repeat(sequence.len()),
+        "N".repeat(40),
+        "$".repeat(40),
+    );
+    std::fs::write(&first_path, first_fastq.as_bytes()).unwrap();
+    std::fs::write(&second_path, second_fastq.as_bytes()).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    let field_only_archive = directory.path().join("field.seqarc");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--output")
+        .arg(&field_only_archive)
+        .arg("--chunk-records")
+        .arg("1")
+        .arg("--id-field")
+        .arg("1")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("id_field=Some(1)"))
+        .stderr(predicate::str::contains(
+            "id-transform preview: \"@read0 1:N:0:ATCG+CCAG\" -> \"@1:N:0:ATCG+CCAG\"",
+        ));
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&field_only_archive)
+        .arg("-1")
+        .arg(&first_path)
+        .arg("-2")
+        .arg(&second_path)
+        .assert()
+        .failure();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&field_only_archive)
+        .arg("-1")
+        .arg(&first_path)
+        .arg("-2")
+        .arg(&second_path)
+        .arg("--id-field")
+        .arg("1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "validated 2 records against originals (PairedEnd)",
+        ));
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&field_only_archive)
+        .arg("--mate-1")
+        .arg(&decoded_first)
+        .arg("--mate-2")
+        .arg(&decoded_second)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&decoded_first).unwrap(),
+        first_fastq
+            .replace("@read0 1:N:0:ATCG+CCAG", "@1:N:0:ATCG+CCAG")
+            .replace("@read1 1:N:0:GGTT+TTAA", "@1:N:0:GGTT+TTAA")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&decoded_second).unwrap(),
+        second_fastq
+            .replace("@read0 2:N:0:ATCG+CCAG", "@2:N:0:ATCG+CCAG")
+            .replace("@read1 2:N:0:GGTT+TTAA", "@2:N:0:GGTT+TTAA")
+    );
+
+    let combined_archive = directory.path().join("combined.seqarc");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--output")
+        .arg(&combined_archive)
+        .arg("--id-field")
+        .arg("1")
+        .arg("--id-prefix-chars")
+        .arg("3")
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&combined_archive)
+        .arg("-1")
+        .arg(&first_path)
+        .arg("-2")
+        .arg(&second_path)
+        .arg("--id-field")
+        .arg("1")
+        .arg("--id-prefix-chars")
+        .arg("3")
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&combined_archive)
+        .arg("--mate-1")
+        .arg(&decoded_first)
+        .arg("--mate-2")
+        .arg(&decoded_second)
+        .arg("--force")
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&decoded_first).unwrap(),
+        first_fastq
+            .replace("@read0 1:N:0:ATCG+CCAG", "@1:N")
+            .replace("@read1 1:N:0:GGTT+TTAA", "@1:N")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&decoded_second).unwrap(),
+        second_fastq
+            .replace("@read0 2:N:0:ATCG+CCAG", "@2:N")
+            .replace("@read1 2:N:0:GGTT+TTAA", "@2:N")
+    );
+
+    let missing_field_archive = directory.path().join("missing-field.seqarc");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--output")
+        .arg(&missing_field_archive)
+        .arg("--id-field")
+        .arg("2")
+        .assert()
+        .failure();
+    assert!(!missing_field_archive.exists());
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--output")
+        .arg(&missing_field_archive)
+        .arg("--no-ids")
+        .arg("--id-field")
+        .arg("0")
+        .assert()
+        .failure();
+}
+
+#[test]
 fn embedded_index_ranges_round_trip_across_mates() {
     let directory = tempfile::tempdir().unwrap();
     let reference_path = directory.path().join("reference.fa");
@@ -647,6 +859,203 @@ fn paired_with_index_read_files_round_trips() {
     assert!(!partial_first.exists());
     assert!(!partial_second.exists());
     assert!(!missing_output.exists());
+}
+
+#[test]
+fn index_read_descriptions_may_differ_across_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let second_path = directory.path().join("reads.2.fastq");
+    let i1_path = directory.path().join("index.1.fastq");
+    let i2_path = directory.path().join("index.2.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let reverse_complement = sequence
+        .iter()
+        .rev()
+        .map(|base| match base {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let first_fastq = format!(
+        "@pair0 1:N:0:ATCG+CCAG\n{}\n+\n{}\n@pair1 1:N:0:GGTT+TTAA\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    let second_fastq = format!(
+        "@pair0 2:N:0:ATCG+CCAG\n{}\n+\n{}\n@pair1 2:N:0:GGTT+TTAA\n{}\n+\n{}\n",
+        String::from_utf8_lossy(&reverse_complement),
+        "J".repeat(sequence.len()),
+        "N".repeat(40),
+        "$".repeat(40),
+    );
+    let i1_fastq = "@pair0 some other comment\nAACCGGTT\n+\nJJJJJJJJ\n@pair1 another comment\nTTTTGGCC\n+\nJJJJJJJJ\n";
+    let i2_fastq = "@pair0 a third comment\nGGCCTTAA\n+\nKKKKKKKK\n@pair1 a fourth comment\nACGTACGT\n+\nKKKKKKKK\n";
+    std::fs::write(&first_path, first_fastq.as_bytes()).unwrap();
+    std::fs::write(&second_path, second_fastq.as_bytes()).unwrap();
+    std::fs::write(&i1_path, i1_fastq).unwrap();
+    std::fs::write(&i2_path, i2_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    // Without a transform the differing descriptions cannot round-trip, since
+    // index reads inherit mate-1's identifier during reconstruction.
+    let raw_archive = directory.path().join("raw.seqarc");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--index-read-2")
+        .arg(&i2_path)
+        .arg("--output")
+        .arg(&raw_archive)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "transformed index read identifier does not match transformed mate 1 identifier",
+        ));
+    assert!(!raw_archive.exists());
+
+    // Field selection homogenizes the identifiers, so the archive round-trips
+    // and validate accepts the transformed originals.
+    let field_archive = directory.path().join("field.seqarc");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--index-read-2")
+        .arg(&i2_path)
+        .arg("--id-field")
+        .arg("0")
+        .arg("--output")
+        .arg(&field_archive)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&field_archive)
+        .arg("-1")
+        .arg(&first_path)
+        .arg("-2")
+        .arg(&second_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--index-read-2")
+        .arg(&i2_path)
+        .arg("--id-field")
+        .arg("0")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "validated 2 records against originals (PairedEnd)",
+        ));
+
+    let decoded_i1 = directory.path().join("decoded.i1.fastq");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&field_archive)
+        .arg("--mate-1")
+        .arg(directory.path().join("field.1.fastq"))
+        .arg("--mate-2")
+        .arg(directory.path().join("field.2.fastq"))
+        .arg("--index-output-1")
+        .arg(&decoded_i1)
+        .arg("--index-output-2")
+        .arg(directory.path().join("decoded.i2.fastq"))
+        .arg("--force")
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&decoded_i1).unwrap(),
+        "@pair0\nAACCGGTT\n+\nJJJJJJJJ\n@pair1\nTTTTGGCC\n+\nJJJJJJJJ\n"
+    );
+
+    // A differing identifier proper is always rejected, even with field selection.
+    let mismatched_i1 = directory.path().join("mismatched.1.fastq");
+    let mismatched_i1_fastq = i1_fastq
+        .replace("@pair0", "@other0")
+        .replace("@pair1", "@other1");
+    std::fs::write(&mismatched_i1, mismatched_i1_fastq).unwrap();
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-read-1")
+        .arg(&mismatched_i1)
+        .arg("--index-read-2")
+        .arg(&i2_path)
+        .arg("--id-field")
+        .arg("0")
+        .arg("--output")
+        .arg(directory.path().join("mismatched.seqarc"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "index read identifier does not match mate 1 identifier",
+        ));
+
+    // Field selection that diverges between mate 1 and the index reads is
+    // rejected after transformation.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--index-read-2")
+        .arg(&i2_path)
+        .arg("--id-field")
+        .arg("1")
+        .arg("--output")
+        .arg(directory.path().join("divergent.seqarc"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "transformed index read identifier does not match transformed mate 1 identifier",
+        ));
 }
 
 #[test]
@@ -902,12 +1311,18 @@ fn index_reads_coexist_with_ranges_and_respect_global_options() {
         .filter(|(index, _)| index % 4 == 1)
         .map(|(_, line)| format!(">\n{line}\n"))
         .collect::<String>();
-    assert_eq!(std::fs::read_to_string(&fasta_first).unwrap(), expected_first_fasta);
+    assert_eq!(
+        std::fs::read_to_string(&fasta_first).unwrap(),
+        expected_first_fasta
+    );
     assert_eq!(
         std::fs::read_to_string(&fasta_second).unwrap(),
         expected_second_fasta
     );
-    assert_eq!(std::fs::read_to_string(&fasta_i1).unwrap(), expected_i1_fasta);
+    assert_eq!(
+        std::fs::read_to_string(&fasta_i1).unwrap(),
+        expected_i1_fasta
+    );
 }
 
 #[test]

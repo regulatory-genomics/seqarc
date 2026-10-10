@@ -10,9 +10,12 @@ the aligned single-end and paired-end compression APIs.
   Counts and ordinals refer to logical records: one read for single-end
   archives, one read pair for paired-end archives. Each logical record also
   carries one stored index read per declared index stream. All input FASTQ
-  files share the same identifier per logical record; index reads are never
-  stored with their own identifiers and are reconstructed using the biological
-  mate-1 identifier.
+  files share the same identifier proper (the first whitespace-delimited token)
+  per logical record; trailing descriptions may differ between files. Index
+  reads are never stored with their own identifiers and are reconstructed using
+  the biological mate-1 identifier, so after any compression-time identifier
+  preprocessing the index-read identifiers must equal the transformed mate-1
+  identifier.
 - All fixed-width integers are unsigned little-endian unless explicitly stated.
 - Varints use unsigned LEB128: seven payload bits per byte, least-significant
   group first, with bit 7 set when another byte follows.
@@ -197,10 +200,12 @@ chunk header.
 ## Identifier Section
 
 An encoder may preprocess identifiers before archive encoding, including
-retaining only a Unicode-character prefix. The leading FASTQ `@` is syntax and
+retaining only a Unicode-character prefix or retaining only one
+whitespace-delimited field of the identifier (zero-based; runs of consecutive
+ASCII whitespace act as one separator). The leading FASTQ `@` is syntax and
 is not part of the identifier. The archive stores and reconstructs the resulting
-identifier bytes exactly; discarded suffixes and the preprocessing length are
-not stored and cannot be recovered during decompression.
+identifier bytes exactly; discarded identifier bytes and the preprocessing
+parameters are not stored and cannot be recovered during decompression.
 
 The raw identifier section contains one length-delimited block per biological
 stream. Index-read identifiers are stored separately, as record-section
@@ -375,10 +380,11 @@ in this order:
 3. Sequences: concatenated raw bytes; the read lengths determine boundaries.
 
 Index reads are never stored with identifiers. All input FASTQ files must
-share the same identifier per logical record, which compression validates;
-decoders reconstruct index reads using the biological mate-1 identifier.
-Index reads are never mapped and never contribute mapped flags, positions,
-CIGAR data, or reference coverage.
+share the same identifier proper per logical record, which compression
+validates; trailing descriptions may differ between files. Decoders reconstruct
+index reads using the biological mate-1 identifier. Index reads are never
+mapped and never contribute mapped flags, positions, CIGAR data, or reference
+coverage.
 
 ## Integrity and Validation
 

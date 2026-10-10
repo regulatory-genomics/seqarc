@@ -868,7 +868,16 @@ pub(crate) fn temporary_directory(root: Option<&Path>, prefix: &str) -> Result<t
 }
 
 /// Decompress an archive, optionally selecting an inclusive zero-based record range.
+///
+/// The reference-free decoder decodes the whole payload in one pass and does
+/// not support `max_records` or `best_effort`; setting either returns an
+/// error instead of being silently ignored.
 pub fn decompress<R: Read>(input: R, options: &DecompressionOptions) -> Result<ArchiveRecords> {
+    if options.max_records.is_some() || options.best_effort {
+        return Err(Error::InvalidInput(
+            "reference-free decompression does not support max_records or best_effort".into(),
+        ));
+    }
     reference_free::consensus_archive::read_reordered(input, options)
 }
 
@@ -950,6 +959,26 @@ mod tests {
             b"ACGTN".to_vec(),
             Some(b"IIIII".to_vec()),
         )
+    }
+
+    #[test]
+    fn reference_free_decompress_rejects_unsupported_options() {
+        for options in [
+            DecompressionOptions {
+                max_records: Some(1),
+                ..DecompressionOptions::default()
+            },
+            DecompressionOptions {
+                best_effort: true,
+                ..DecompressionOptions::default()
+            },
+        ] {
+            let error = decompress(Cursor::new(Vec::new()), &options).unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidInput(_)),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1135,6 +1164,50 @@ mod tests {
         assert_eq!(decoded.streams[1].len(), 2);
         assert_eq!(decoded.streams[0][0].sequence, forward);
         assert_eq!(decoded.streams[1][0].sequence, reverse);
+
+        // The record limit applies to the paired collection decoder too.
+        let limited = decompress_aligned_paired(
+            Cursor::new(archive.clone()),
+            &DecompressionOptions {
+                max_records: Some(1),
+                ..DecompressionOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(limited.streams[0].len(), 1);
+        assert_eq!(limited.streams[1].len(), 1);
+
+        struct VecPairSink {
+            pairs: Vec<(u64, ReadRecord, ReadRecord)>,
+        }
+
+        impl PairedRecordSink for VecPairSink {
+            fn write_pair(
+                &mut self,
+                original_id: u64,
+                first: ReadRecord,
+                second: ReadRecord,
+            ) -> Result<()> {
+                self.pairs.push((original_id, first, second));
+                Ok(())
+            }
+
+            fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut sink = VecPairSink { pairs: Vec::new() };
+        decompress_aligned_paired_into(
+            Cursor::new(&archive),
+            &DecompressionOptions {
+                max_records: Some(1),
+                ..DecompressionOptions::default()
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.pairs.len(), 1);
         assert_eq!(decoded.streams[0][1].sequence, unknown);
         assert_eq!(decoded.streams[1][1].sequence, unknown);
         assert_eq!(

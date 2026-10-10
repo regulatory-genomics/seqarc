@@ -3007,7 +3007,7 @@ fn consensus_base(count: &[u32; 5]) -> u8 {
             best = index;
         }
     }
-    [b'A', b'C', b'G', b'T', b'N'][best]
+    b"ACGTN"[best]
 }
 
 fn finish_cluster(mut group: ClusterGroup) -> Result<ConsensusCluster> {
@@ -4720,9 +4720,7 @@ fn read_reference_stream<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
                 return Err(Error::InvalidFormat("invalid packed RS4 reference".into()));
             }
             Ok((0..width)
-                .map(|i| {
-                    [b'A', b'C', b'G', b'T'][((packed[i / 4] >> (6 - 2 * (i % 4))) & 3) as usize]
-                })
+                .map(|i| b"ACGT"[((packed[i / 4] >> (6 - 2 * (i % 4))) & 3) as usize])
                 .collect())
         }
         _ => Err(Error::InvalidFormat("invalid RS4 reference mode".into())),
@@ -4899,7 +4897,7 @@ impl<'a> Cursor<'a> {
                     return Err(Error::InvalidFormat("invalid RS3 packed reference".into()));
                 }
                 let packed = self.take(data_len)?;
-                let bases = [b'A', b'C', b'G', b'T'];
+                let bases = *b"ACGT";
                 let mut reference = Vec::with_capacity(width);
                 for position in 0..width {
                     let value = (packed[position / 4] >> (6 - 2 * (position % 4))) & 3;
@@ -5064,7 +5062,7 @@ impl<'a> Cursor<'a> {
                     )));
                 }
                 let data = self.take(data_len)?;
-                let bases = [b'A', b'C', b'G', b'T'];
+                let bases = *b"ACGT";
                 let mut values = Vec::with_capacity(count);
                 for packed in data.chunks_exact(packed_width.max(1)).take(count) {
                     let mut sequence = Vec::with_capacity(width);
@@ -5085,7 +5083,7 @@ impl<'a> Cursor<'a> {
                 let data_len = usize_from(self.u64()?, field)?;
                 let data = self.take(data_len)?;
                 let mut source = Cursor::new(data);
-                let bases = [b'A', b'C', b'G', b'T'];
+                let bases = *b"ACGT";
                 let mut values = Vec::with_capacity(count);
                 for _ in 0..count {
                     match source.u8()? {

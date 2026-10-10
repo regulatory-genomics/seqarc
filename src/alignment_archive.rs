@@ -1193,6 +1193,13 @@ pub(crate) fn decompress_paired<R: Read>(
     for _ in 0..records.index_streams() {
         streams.push(Vec::new());
     }
+    let records: Box<dyn Iterator<Item = Result<(u64, AlignedRecordGroup)>>> = match options
+        .max_records
+        .and_then(|limit| usize::try_from(limit).ok())
+    {
+        Some(limit) => Box::new(records.take(limit)),
+        None => Box::new(records),
+    };
     for record in records {
         let (_, group) = record?;
         let AlignedRecordGroup {
@@ -1225,6 +1232,13 @@ pub(crate) fn decompress_single<R: Read>(
     }
     let mut stream = Vec::new();
     let mut index_streams = vec![Vec::new(); records.index_streams()];
+    let records: Box<dyn Iterator<Item = Result<(u64, AlignedRecordGroup)>>> = match options
+        .max_records
+        .and_then(|limit| usize::try_from(limit).ok())
+    {
+        Some(limit) => Box::new(records.take(limit)),
+        None => Box::new(records),
+    };
     for record in records {
         let (_, group) = record?;
         let AlignedRecordGroup {
@@ -1257,6 +1271,9 @@ pub(crate) fn decompress_paired_into<R: Read, S: PairedRecordSink>(
     }
     let mut pairs = 0;
     for record in records {
+        if options.max_records.is_some_and(|limit| pairs >= limit) {
+            break;
+        }
         let (original_id, group) = record?;
         match group.sequence {
             SequenceRecordGroup::Paired(first, second) => {
@@ -1741,14 +1758,36 @@ fn read_chunk_payload<R: Read>(
     first_record: u64,
     chunk_index: u64,
 ) -> Result<Vec<u8>> {
-    let mut compressed = vec![0; header.compressed_len];
-    input.read_exact(&mut compressed)?;
-    let computed_crc = chunk_crc32c(&header.bytes, &compressed);
-    if computed_crc != header.stored_crc {
+    // Read the payload incrementally while hashing, so a corrupt
+    // `compressed_len` cannot trigger a huge allocation up front; memory grows
+    // only as bytes actually arrive. The initial capacity is capped so even
+    // the reservation stays bounded.
+    let mut compressed = Vec::with_capacity(header.compressed_len.min(4 * 1024 * 1024));
+    let mut crc = crc32c::crc32c(&header.bytes);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = header.compressed_len;
+    while remaining > 0 {
+        let want = remaining.min(buffer.len());
+        let read = input.read(&mut buffer[..want])?;
+        if read == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "chunk {chunk_index} (record {first_record}): payload ended after {} of {} bytes",
+                    compressed.len(),
+                    header.compressed_len
+                ),
+            )));
+        }
+        crc = crc32c::crc32c_append(crc, &buffer[..read]);
+        compressed.extend_from_slice(&buffer[..read]);
+        remaining -= read;
+    }
+    if crc != header.stored_crc {
         return Err(Error::Checksum(format!(
             "chunk {chunk_index} (record {first_record}): stored CRC 0x{:08x} does not match \
-             computed CRC 0x{computed_crc:08x}",
-            header.stored_crc
+             computed CRC 0x{:08x}",
+            header.stored_crc, crc
         )));
     }
     Ok(compressed)
@@ -1792,10 +1831,14 @@ pub fn verify_aligned_archive<R: Read>(input: &mut R) -> Result<VerifyReport> {
         let chunk_index = report.scanned_chunks;
         let chunk_header = match read_chunk_header(input) {
             Ok(chunk_header) => chunk_header,
-            Err(_) => {
+            // A clean early EOF is truncation; any other error (I/O failure,
+            // permissions) is reported to the caller instead of being
+            // mislabeled as a truncated archive.
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                 report.truncated = true;
                 return Ok(report);
             }
+            Err(error) => return Err(error),
         };
         let mut crc = crc32c::crc32c(&chunk_header.bytes);
         let mut remaining = chunk_header.compressed_len;
@@ -1803,12 +1846,17 @@ pub fn verify_aligned_archive<R: Read>(input: &mut R) -> Result<VerifyReport> {
         let mut truncated = false;
         while remaining > 0 {
             let want = remaining.min(buffer.len());
-            if input.read_exact(&mut buffer[..want]).is_err() {
-                truncated = true;
-                break;
+            match input.read(&mut buffer[..want]) {
+                Ok(0) => {
+                    truncated = true;
+                    break;
+                }
+                Ok(read) => {
+                    crc = crc32c::crc32c_append(crc, &buffer[..read]);
+                    remaining -= read;
+                }
+                Err(error) => return Err(Error::Io(error)),
             }
-            crc = crc32c::crc32c_append(crc, &buffer[..want]);
-            remaining -= want;
         }
         if truncated {
             report.truncated = true;
@@ -2724,7 +2772,7 @@ fn event_delta(position: usize, cursor: usize) -> Result<u16> {
 }
 
 fn substitution_symbol(reference: u8, actual: u8) -> Result<u8> {
-    let alternatives = [b'A', b'C', b'G', b'T', b'N'];
+    let alternatives = *b"ACGTN";
     let reference_index = alternatives
         .iter()
         .position(|&base| base == reference)
@@ -2745,7 +2793,7 @@ fn substitution_symbol(reference: u8, actual: u8) -> Result<u8> {
 }
 
 fn substitution_base(reference: u8, symbol: u8) -> Result<u8> {
-    let alternatives = [b'A', b'C', b'G', b'T', b'N'];
+    let alternatives = *b"ACGTN";
     if !alternatives.contains(&reference) {
         return Err(Error::InvalidFormat("noncanonical reference base".into()));
     }
@@ -3758,10 +3806,9 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
     let index_metadata_len = usize_from(read_u64(&mut parsed)?, "embedded index metadata block")?;
     let chunks = read_u64(&mut parsed)?;
     let stored_crc = read_u32(input)?;
-    let mut reference_block = vec![0; reference_len];
-    input.read_exact(&mut reference_block)?;
-    let mut index_metadata = vec![0; index_metadata_len];
-    input.read_exact(&mut index_metadata)?;
+    let reference_block = read_incremental(input, reference_len, "reference block")?;
+    let index_metadata =
+        read_incremental(input, index_metadata_len, "embedded index metadata block")?;
     let mut preamble = [0u8; PREAMBLE_BYTES];
     preamble[..magic.len()].copy_from_slice(&magic);
     preamble[magic.len()..magic.len() + version.len()].copy_from_slice(&version);
@@ -4121,6 +4168,28 @@ fn read_u32(input: &mut impl Read) -> Result<u32> {
     input.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
+
+/// Read exactly `len` bytes, growing the buffer incrementally so a corrupt or
+/// attacker-controlled length cannot trigger a huge allocation up front.
+fn read_incremental(input: &mut impl Read, len: usize, label: &str) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(len.min(4 * 1024 * 1024));
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(buffer.len());
+        let read = input.read(&mut buffer[..want])?;
+        if read == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("{label} ended after {} of {} bytes", data.len(), len),
+            )));
+        }
+        data.extend_from_slice(&buffer[..read]);
+        remaining -= read;
+    }
+    Ok(data)
+}
+
 fn read_u64(input: &mut impl Read) -> Result<u64> {
     let mut bytes = [0; 8];
     input.read_exact(&mut bytes)?;
@@ -4966,6 +5035,102 @@ mod tests {
             error.to_string().contains("chunk 4 (record 9)"),
             "unexpected message: {error}"
         );
+    }
+
+    #[test]
+    fn corrupt_chunk_length_fails_without_huge_allocation() {
+        let payload = vec![7u8; 13];
+        let mut encoded = Vec::new();
+        write_u32(&mut encoded, 2).unwrap();
+        for value in [13u64, 0, 0, 0, 0] {
+            write_u64(&mut encoded, value).unwrap();
+        }
+        let header = encoded.clone();
+        let crc = chunk_crc32c(&header, &payload);
+        write_u32(&mut encoded, crc).unwrap();
+        encoded.extend(&payload);
+        // Corrupt compressed_len to usize::MAX; the reader must hit the end of
+        // the input and return an error instead of attempting the allocation.
+        let mut damaged = encoded;
+        damaged[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        let corrupt = read_chunk_header(&mut Cursor::new(&damaged)).unwrap();
+        let error = read_chunk_payload(&mut Cursor::new(&payload), &corrupt, 0, 0).unwrap_err();
+        assert!(matches!(error, Error::Io(_)), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn corrupt_reference_length_fails_without_huge_allocation() {
+        let options = crate::AlignmentCompressionOptions::default();
+        let reference = encode_reference(b"ACGT", &options).unwrap().block;
+        let metadata = encode_index_metadata(&[]).unwrap();
+        let mut header = Vec::new();
+        header.extend(MAGIC);
+        write_u16(&mut header, VERSION_MAJOR).unwrap();
+        write_u16(&mut header, VERSION_MINOR).unwrap();
+        write_u16(&mut header, 4).unwrap();
+        header.push(0);
+        header.extend([1, 1]);
+        // Declare a reference block far larger than the input provides.
+        write_u64(&mut header, u64::MAX).unwrap();
+        write_u64(&mut header, metadata.len() as u64).unwrap();
+        write_u64(&mut header, 0).unwrap();
+        let crc = preamble_crc32c(&header, &reference, &metadata);
+        write_u32(&mut header, crc).unwrap();
+        header.extend(&reference);
+        header.extend(&metadata);
+        // The read must fail at the end of the input before the CRC check;
+        // with the old pre-CRC allocation this attempted a usize::MAX buffer.
+        let error = match read_header(&mut Cursor::new(&header)) {
+            Err(error) => error,
+            Ok(_) => panic!("expected corrupt reference length to fail"),
+        };
+        assert!(matches!(error, Error::Io(_)), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn verify_reports_io_errors_instead_of_truncation() {
+        let options = crate::AlignmentCompressionOptions::default();
+        let reference = encode_reference(b"ACGT", &options).unwrap().block;
+        let metadata = encode_index_metadata(&[]).unwrap();
+        let mut header = Vec::new();
+        header.extend(MAGIC);
+        write_u16(&mut header, VERSION_MAJOR).unwrap();
+        write_u16(&mut header, VERSION_MINOR).unwrap();
+        write_u16(&mut header, 4).unwrap();
+        header.push(0);
+        header.extend([1, 1]);
+        write_u64(&mut header, reference.len() as u64).unwrap();
+        write_u64(&mut header, metadata.len() as u64).unwrap();
+        write_u64(&mut header, 1).unwrap();
+        let crc = preamble_crc32c(&header, &reference, &metadata);
+        write_u32(&mut header, crc).unwrap();
+        header.extend(&reference);
+        header.extend(&metadata);
+        // Serves the archive bytes, then fails with an I/O error instead of
+        // reporting a clean end of file.
+        struct FailAfterEof<'a> {
+            data: Cursor<&'a [u8]>,
+        }
+        impl Read for FailAfterEof<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.data.read(buf)?;
+                if read == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(read)
+            }
+        }
+        let error = verify_aligned_archive(&mut FailAfterEof {
+            data: Cursor::new(&header),
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::Io(_)), "unexpected error: {error}");
+        // A clean early end of file during the chunk scan is still reported
+        // as truncation; append a partial chunk header and cut there.
+        let mut truncated_archive = header.clone();
+        truncated_archive.extend(std::iter::repeat_n(0u8, 10));
+        let report = verify_aligned_archive(&mut Cursor::new(&truncated_archive)).unwrap();
+        assert!(report.truncated);
     }
 
     #[test]

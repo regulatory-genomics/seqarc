@@ -465,6 +465,101 @@ fn compress_post_validates_first_records() {
 }
 
 #[test]
+fn compress_from_stdin_skips_post_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let archive_path = directory.path().join("stdin.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+    );
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    // Pipes and /dev/stdin cannot be re-opened for the post-compression
+    // check, so the check is skipped instead of failing the compression.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .args(["-1", "/dev/stdin"])
+        .arg("--output")
+        .arg(&archive_path)
+        .write_stdin(fastq.as_bytes())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "stage=post_validate skipped input_not_reopenable",
+        ));
+}
+
+#[test]
+fn decompress_validates_output_layout_for_empty_archives() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+    let archive_path = directory.path().join("empty.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    std::fs::write(&input_path, b"").unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success();
+
+    // A single-end archive rejects a mate-2 output even with zero records.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .args(["-1", directory.path().join("e1.fastq").to_str().unwrap()])
+        .args(["-2", directory.path().join("e2.fastq").to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "single-end archive received two output paths",
+        ));
+    assert!(!directory.path().join("e2.fastq").exists());
+}
+
+#[test]
 fn index_cleans_custom_temp_directory_after_failure() {
     let directory = tempfile::tempdir().unwrap();
     let reference_path = directory.path().join("empty.fa");

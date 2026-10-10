@@ -6,9 +6,9 @@ use seqarc::{
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
     decompress_aligned_iter, open_fastx_reader, select_id_field, truncate_read_id,
     verify_aligned_archive, AlignedRecordGroup, AlignedRecordSink, AlignerKind,
-    AlignmentCompressionOptions, DecompressionOptions, EmbeddedIndexMate, EmbeddedIndexRange,
-    Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode, ReadRecord, Result,
-    SequenceRecordGroup,
+    AlignmentCompressionOptions, AlignmentLayout, DecompressionOptions, EmbeddedIndexMate,
+    EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode,
+    ReadRecord, Result, SequenceRecordGroup,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -322,7 +322,6 @@ fn validate_index_ranges(ranges: &[EmbeddedIndexRange], paired: bool) -> Result<
 struct AtomicPath {
     final_path: PathBuf,
     partial_path: PathBuf,
-    force: bool,
     committed: bool,
 }
 
@@ -344,7 +343,6 @@ impl AtomicPath {
         Ok(Self {
             final_path,
             partial_path,
-            force,
             committed: false,
         })
     }
@@ -354,9 +352,9 @@ impl AtomicPath {
     }
 
     fn commit(mut self) -> Result<()> {
-        if self.force && self.final_path.exists() {
-            std::fs::remove_file(&self.final_path)?;
-        }
+        // POSIX rename atomically replaces an existing destination, so no
+        // explicit remove is needed; removing first would open a crash window
+        // in which both the old and new archives are lost.
         std::fs::rename(&self.partial_path, &self.final_path)?;
         self.committed = true;
         Ok(())
@@ -966,6 +964,21 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
         )));
     }
     let layout = records.layout();
+    // Check the layout eagerly so empty (zero-record) archives are validated
+    // too; the per-record sink checks never fire for them.
+    match layout {
+        AlignmentLayout::SingleEnd if sink.second.is_some() => {
+            return Err(Error::InvalidInput(
+                "single-end archive received two output paths".into(),
+            ));
+        }
+        AlignmentLayout::PairedEnd if sink.second.is_none() => {
+            return Err(Error::InvalidInput(
+                "paired archive requires a second output path".into(),
+            ));
+        }
+        _ => {}
+    }
     let total_chunks = records.total_chunks();
     let progress = decompression_progress(total_chunks);
     if progress.is_hidden() {
@@ -1067,6 +1080,30 @@ struct PostValidation {
 }
 
 fn post_compress_validation(validation: &PostValidation) -> Result<()> {
+    // Validation re-opens the original input paths. Streams such as pipes,
+    // /dev/stdin, or process substitution cannot be re-opened (the second
+    // read yields EOF immediately), so skip the check for them.
+    let reopenable = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+    };
+    if !reopenable(&validation.mate_1)
+        || validation
+            .mate_2
+            .as_deref()
+            .is_some_and(|path| !reopenable(path))
+        || [
+            validation.index_read_1.as_deref(),
+            validation.index_read_2.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|path| !reopenable(path))
+    {
+        eprintln!("[seqarc] stage=post_validate skipped input_not_reopenable");
+        return Ok(());
+    }
     let result = (|| -> Result<()> {
         let started = std::time::Instant::now();
         let archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(&validation.archive)?);
@@ -1099,7 +1136,13 @@ fn post_compress_validation(validation: &PostValidation) -> Result<()> {
         Ok(())
     })();
     result.map_err(|error| {
-        Error::InvalidInput(format!("post-compression validation failed: {error}"))
+        // A validation failure right after writing means the archive or the
+        // comparison is wrong; remove the archive so a corrupt file cannot be
+        // mistaken for a good one, then report.
+        let _ = std::fs::remove_file(&validation.archive);
+        Error::InvalidInput(format!(
+            "post-compression validation failed (archive removed): {error}"
+        ))
     })
 }
 

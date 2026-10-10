@@ -21,7 +21,7 @@ the aligned single-end and paired-end compression APIs.
   group first, with bit 7 set when another byte follows.
 - Zstandard frames use the compression level selected by the encoder. The level
   is not stored in the archive and is not needed for decompression.
-- Version 26 is the only supported aligned archive version.
+- Version 0.27 is the only supported aligned archive version.
 
 ## Top-Level Layout
 
@@ -42,7 +42,8 @@ The global header is exactly 42 bytes.
 | Offset | Size | Type | Field |
 |---:|---:|---|---|
 | 0 | 9 | bytes | Magic: `SEQARC-AL` |
-| 9 | 4 | `u32` | Version: `26` |
+| 9 | 2 | `u16` | Version major: `0` |
+| 11 | 2 | `u16` | Version minor: `27` |
 | 13 | 2 | `u16` | Flags |
 | 15 | 1 | `u8` | Index read stream count: `0`, `1`, or `2` |
 | 16 | 1 | `u8` | Absolute position width: `1`, `2`, `3`, `4`, or `8` |
@@ -166,7 +167,7 @@ size is not fixed by the format.
 
 ### Chunk Header
 
-Each chunk starts with a 44-byte header.
+Each chunk starts with a 48-byte header.
 
 | Size | Type | Field |
 |---:|---|---|
@@ -176,8 +177,14 @@ Each chunk starts with a 44-byte header.
 | 8 | `u64` | Raw identifier section length |
 | 8 | `u64` | Raw quality section length |
 | 8 | `u64` | Raw record section length |
+| 4 | `u32` | CRC32C checksum |
 
 The total raw length must equal the sum of all declared raw section lengths.
+
+The CRC32C checksum is computed over the first 44 header bytes (the six fields
+above, in order) followed by the complete compressed payload. It detects
+corruption in the chunk framing as well as in the payload. Readers must verify
+the checksum before decompressing any chunk payload.
 
 ### Compressed Chunk Payload
 
@@ -388,7 +395,18 @@ coverage.
 
 ## Integrity and Validation
 
-The aligned format has no archive-level checksum. Decoders rely on:
+Every chunk carries a CRC32C checksum over its 44-byte field block and
+compressed payload, verified before payload decompression. This localizes
+corruption to individual chunks and enables:
+
+- `verify`: a checksum-only scan that validates the global header, chunk
+  framing, and every chunk checksum without decompressing;
+- best-effort decompression: when enabled, chunks that fail their checksum are
+  skipped and records are recovered from all undamaged chunks; the operation
+  reports the skipped chunk count and estimated lost records, and exits with
+  an error.
+
+Beyond the per-chunk checksum, decoders rely on:
 
 - exact magic and version checks;
 - reserved flag checks;
@@ -399,6 +417,10 @@ The aligned format has no archive-level checksum. Decoders rely on:
 - bounds checks for coordinates, read lengths, noise deltas and symbols,
   reference skips, emitted-sequence counts, index ranges, index read lengths,
   reference payload lengths, and packed-reference padding.
+
+The global header, embedded reference block, and index metadata block are not
+checksummed; corruption there is detected indirectly through downstream
+structural checks.
 
 Writers should reject values that cannot fit their specified integer widths.
 Readers must use checked arithmetic when combining stored lengths and offsets.

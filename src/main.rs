@@ -5,9 +5,10 @@ use seqarc::{
     build_alignment_index, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
     decompress_aligned_iter, open_fastx_reader, select_id_field, truncate_read_id,
-    AlignedRecordGroup, AlignedRecordSink, AlignerKind, AlignmentCompressionOptions,
-    DecompressionOptions, EmbeddedIndexMate, EmbeddedIndexRange, Error, FastxReader, Format,
-    GenomeIndexBuildOptions, QualityMode, ReadRecord, Result, SequenceRecordGroup,
+    verify_aligned_archive, AlignedRecordGroup, AlignedRecordSink, AlignerKind,
+    AlignmentCompressionOptions, DecompressionOptions, EmbeddedIndexMate, EmbeddedIndexRange,
+    Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode, ReadRecord, Result,
+    SequenceRecordGroup,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -32,6 +33,8 @@ enum Command {
     Decompress(DecompressArgs),
     /// Fully decode and validate an aligned SeqArc archive.
     Validate(ValidateArgs),
+    /// Verify chunk checksums and framing without decompressing.
+    Verify(VerifyArgs),
 }
 
 #[derive(Args)]
@@ -200,6 +203,16 @@ struct DecompressArgs {
     /// Replace existing output files.
     #[arg(long)]
     force: bool,
+    /// Skip chunks that fail their checksum instead of aborting, recovering
+    /// records from all undamaged chunks.
+    #[arg(long)]
+    best_effort: bool,
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// Input aligned .seqarc archive.
+    archive: PathBuf,
 }
 
 #[derive(Args)]
@@ -809,6 +822,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Decompress(args) => decompress_command(args),
         Command::Validate(args) => validate_command(args),
+        Command::Verify(args) => verify_command(args),
     }
 }
 
@@ -875,6 +889,7 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
     let options = DecompressionOptions {
         original_range: args.range,
         threads: args.threads,
+        best_effort: args.best_effort,
         ..DecompressionOptions::default()
     };
     let mut records = decompress_aligned_iter(
@@ -918,8 +933,60 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
     for index_path in index_paths {
         index_path.commit()?;
     }
+    if records.skipped_chunks() > 0 {
+        eprintln!(
+            "best-effort recovery: skipped {} corrupt chunks (about {} records lost)",
+            records.skipped_chunks(),
+            records.skipped_records()
+        );
+        return Err(Error::Checksum(format!(
+            "recovered {} records from undamaged chunks; {} chunks failed their checksums",
+            record_count,
+            records.skipped_chunks()
+        )));
+    }
     eprintln!("decompressed {} records ({:?})", record_count, layout);
     Ok(())
+}
+
+fn verify_command(args: VerifyArgs) -> Result<()> {
+    let mut archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(&args.archive)?);
+    let report = verify_aligned_archive(&mut archive)?;
+    if report.is_ok() {
+        println!(
+            "verified {} chunks, {} records: all checksums match",
+            report.scanned_chunks, report.records
+        );
+        return Ok(());
+    }
+    if report.truncated {
+        eprintln!(
+            "archive is truncated: {}/{} declared chunks scanned",
+            report.scanned_chunks, report.declared_chunks
+        );
+    }
+    if report.bad_chunks > 0 {
+        eprintln!(
+            "{} of {} chunks failed their checksums (first bad chunk: {})",
+            report.bad_chunks,
+            report.scanned_chunks,
+            report
+                .first_bad_chunk
+                .map(|chunk| chunk.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
+    }
+    if report.trailing_bytes {
+        eprintln!("archive contains trailing bytes after the final chunk");
+    }
+    println!(
+        "verified {} chunks, {} records: {} damaged",
+        report.scanned_chunks, report.records, report.bad_chunks
+    );
+    Err(Error::Checksum(format!(
+        "archive {} failed verification",
+        args.archive.display()
+    )))
 }
 
 fn output_is_gzip(path: &Path, force_gzip: bool, force_plain: bool) -> bool {

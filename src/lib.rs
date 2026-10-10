@@ -25,7 +25,7 @@ pub use aligners::{
     align_dna_batch, build_alignment_index, build_genome_index, build_genome_index_with_options,
     AlignerKind, GenomeAlignment, GenomeIndexBuildOptions,
 };
-pub use alignment_archive::AlignedRecordIter;
+pub use alignment_archive::{AlignedRecordIter, VerifyReport, verify_aligned_archive};
 pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
 pub use reference_free::record_store::{PairStore, StoreStats};
 pub use reference_free::reorder;
@@ -41,6 +41,14 @@ pub enum Error {
     Io(std::io::Error),
     InvalidFormat(String),
     InvalidInput(String),
+    Checksum(String),
+}
+
+impl Error {
+    /// Returns true when the error was caused by a failed checksum comparison.
+    pub fn is_checksum(&self) -> bool {
+        matches!(self, Self::Checksum(_))
+    }
 }
 
 impl From<std::io::Error> for Error {
@@ -55,6 +63,7 @@ impl std::fmt::Display for Error {
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::InvalidFormat(error) => write!(f, "invalid archive: {error}"),
             Self::InvalidInput(error) => write!(f, "invalid input: {error}"),
+            Self::Checksum(error) => write!(f, "checksum verification failed: {error}"),
         }
     }
 }
@@ -281,6 +290,8 @@ pub struct DecompressionOptions {
     pub output_order: OutputOrder,
     pub temp_dir: Option<std::path::PathBuf>,
     pub threads: usize,
+    /// Skip chunks that fail their checksum instead of aborting the decode.
+    pub best_effort: bool,
 }
 
 impl Default for DecompressionOptions {
@@ -290,6 +301,7 @@ impl Default for DecompressionOptions {
             output_order: OutputOrder::Original,
             temp_dir: None,
             threads: 1,
+            best_effort: false,
         }
     }
 }
@@ -1102,7 +1114,7 @@ mod tests {
             profile.archive_bytes,
             42 + profile.reference_compressed_bytes
                 + 8
-                + 44 * profile.chunk_count
+                + 48 * profile.chunk_count
                 + profile.chunks_compressed_bytes
         );
         let mut archive = Vec::new();
@@ -1168,6 +1180,115 @@ mod tests {
                 if message == "trailing aligned archive bytes"
         ));
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn verify_and_best_effort_detect_and_recover_corrupt_chunks() {
+        let directory = tempfile::tempdir().unwrap();
+        let genome = directory.path().join("genome.fa");
+        let input_1 = directory.path().join("reads.1.fastq.gz");
+        let input_2 = directory.path().join("reads.2.fastq.gz");
+        let output = directory.path().join("reads.aln");
+        let reference =
+            b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+        std::fs::write(&genome, [b">chr1\n".as_slice(), reference, b"\n"].concat()).unwrap();
+        let mut forward = reference[20..60].to_vec();
+        forward[5] = match forward[5] {
+            b'A' => b'C',
+            _ => b'A',
+        };
+        let reverse = reference[20..60]
+            .iter()
+            .rev()
+            .map(|base| match base {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                _ => *base,
+            })
+            .collect::<Vec<_>>();
+        let unknown = b"NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN";
+        let first_fastq = format!(
+            "@pair0/1\n{}\n+\n{}\n@pair1/1\n{}\n+\n{}\n",
+            String::from_utf8_lossy(&forward),
+            "I".repeat(forward.len()),
+            String::from_utf8_lossy(unknown),
+            "#".repeat(unknown.len()),
+        );
+        let second_fastq = format!(
+            "@pair0/2\n{}\n+\n{}\n@pair1/2\n{}\n+\n{}\n",
+            String::from_utf8_lossy(&reverse),
+            "J".repeat(reverse.len()),
+            String::from_utf8_lossy(unknown),
+            "$".repeat(unknown.len()),
+        );
+        for (path, contents) in [(&input_1, first_fastq), (&input_2, second_fastq)] {
+            let encoder = gzip_writer(File::create(path).unwrap(), 1);
+            let mut writer = encoder;
+            writer.write_all(contents.as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+        let alignment_options = AlignmentCompressionOptions {
+            chunk_records: 1,
+            ..AlignmentCompressionOptions::default()
+        };
+        compress_aligned_paired_fastq_files_profiled(
+            &genome,
+            &input_1,
+            &input_2,
+            &output,
+            &alignment_options,
+        )
+        .unwrap();
+        let mut archive = Vec::new();
+        File::open(&output)
+            .unwrap()
+            .read_to_end(&mut archive)
+            .unwrap();
+
+        // A healthy archive verifies cleanly.
+        let report = verify_aligned_archive(&mut Cursor::new(archive.clone())).unwrap();
+        assert!(report.is_ok());
+        assert_eq!(report.declared_chunks, 2);
+        assert_eq!(report.scanned_chunks, 2);
+        assert_eq!(report.records, 2);
+
+        // Flip the final payload byte, which belongs to the last chunk.
+        let mut damaged = archive.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0xff;
+        let report = verify_aligned_archive(&mut Cursor::new(damaged.clone())).unwrap();
+        assert!(!report.is_ok());
+        assert_eq!(report.bad_chunks, 1);
+        assert_eq!(report.first_bad_chunk, Some(1));
+        assert!(!report.truncated);
+        assert_eq!(report.records, 1);
+
+        // Strict decoding refuses the damaged archive.
+        let strict =
+            decompress_aligned_paired(Cursor::new(damaged.clone()), &DecompressionOptions::default());
+        assert!(strict.is_err());
+
+        // Best-effort decoding skips the damaged chunk and recovers the rest.
+        let mut iter = decompress_aligned_iter(
+            Cursor::new(damaged),
+            &DecompressionOptions {
+                best_effort: true,
+                ..DecompressionOptions::default()
+            },
+        )
+        .unwrap();
+        let recovered = iter.by_ref().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(iter.skipped_chunks(), 1);
+        assert_eq!(iter.skipped_records(), 1);
+        assert!(iter.next().is_none());
+        let SequenceRecordGroup::Paired(first, second) = &recovered[0].1.sequence else {
+            panic!("expected paired record")
+        };
+        assert_eq!(first.sequence, forward);
+        assert_eq!(second.sequence, reverse);
     }
 
     #[test]

@@ -29,7 +29,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
-const VERSION: u32 = 26;
+const VERSION_MAJOR: u16 = 0;
+const VERSION_MINOR: u16 = 27;
 const MAP_TASKS_PER_WORKER: usize = 4;
 const MAX_MAPPING_BATCH_RECORDS: usize = 131_072;
 const PIPELINE_BATCHES: usize = 2;
@@ -287,6 +288,7 @@ pub struct AlignedRecordIter<R: Read> {
     delta_position_width: usize,
     index_streams: usize,
     original_range: Option<RangeInclusive<u64>>,
+    best_effort: bool,
     total_chunks: u64,
     decoded_chunks: u64,
     chunks_remaining: u64,
@@ -298,6 +300,9 @@ pub struct AlignedRecordIter<R: Read> {
     target_jobs: usize,
     max_resident_chunks: usize,
     pending: BTreeMap<u64, Result<DecodedArchiveChunk>>,
+    skipped_chunks: BTreeMap<u64, u64>,
+    skipped_chunk_total: u64,
+    skipped_record_total: u64,
     current: Option<DecodedArchiveChunk>,
     input_finished: bool,
     done: bool,
@@ -977,7 +982,8 @@ fn compress_with_index<I2: AsRef<Path>>(
     let mut archive = File::create(output)?;
     let header_size = 9 + 4 + 2 + 1 + 2 + 8 * 3;
     archive.write_all(MAGIC)?;
-    write_u32(&mut archive, VERSION)?;
+    write_u16(&mut archive, VERSION_MAJOR)?;
+    write_u16(&mut archive, VERSION_MINOR)?;
     let mut flags = 0u16;
     if preserve_ids {
         flags |= 1;
@@ -1312,6 +1318,7 @@ pub(crate) fn decompress_iter<R: Read>(
         delta_position_width: header.delta_position_width,
         index_streams: header.index_streams,
         original_range: options.original_range.clone(),
+        best_effort: options.best_effort,
         total_chunks: header.chunk_count,
         decoded_chunks: 0,
         chunks_remaining: header.chunk_count,
@@ -1327,6 +1334,9 @@ pub(crate) fn decompress_iter<R: Read>(
             decoder_threads.saturating_mul(2)
         },
         pending: BTreeMap::new(),
+        skipped_chunks: BTreeMap::new(),
+        skipped_chunk_total: 0,
+        skipped_record_total: 0,
         current: None,
         input_finished: false,
         done: false,
@@ -1348,6 +1358,16 @@ impl<R: Read> AlignedRecordIter<R> {
 
     pub fn total_chunks(&self) -> u64 {
         self.total_chunks
+    }
+
+    /// Number of chunks skipped in best-effort mode after failed checksums.
+    pub fn skipped_chunks(&self) -> u64 {
+        self.skipped_chunk_total
+    }
+
+    /// Estimated number of records lost in chunks skipped by best-effort mode.
+    pub fn skipped_records(&self) -> u64 {
+        self.skipped_record_total
     }
 
     pub fn decoded_chunks(&self) -> u64 {
@@ -1394,12 +1414,46 @@ impl<R: Read> AlignedRecordIter<R> {
             }
             let chunk_index = self.next_submit_chunk;
             let first_record = self.next_submit_record;
-            let encoded = match read_encoded_archive_chunk(&mut self.input, first_record) {
-                Ok(encoded) => encoded,
+            let header = match read_chunk_header(&mut self.input) {
+                Ok(header) => header,
                 Err(error) => {
                     self.stop_input_with_error(chunk_index, error);
                     break;
                 }
+            };
+            let compressed =
+                match read_chunk_payload(&mut self.input, &header, first_record, chunk_index) {
+                    Ok(compressed) => compressed,
+                    Err(error) => {
+                        if self.best_effort && error.is_checksum() {
+                            eprintln!("[seqarc] warning: skipping chunk {chunk_index}: {error}");
+                            self.skipped_chunks.insert(chunk_index, first_record);
+                            self.skipped_chunk_total += 1;
+                            self.skipped_record_total += header.record_count as u64;
+                            self.next_submit_chunk += 1;
+                            self.next_submit_record = self
+                                .next_submit_record
+                                .saturating_add(header.record_count as u64);
+                            self.chunks_remaining -= 1;
+                            continue;
+                        }
+                        self.stop_input_with_error(chunk_index, error);
+                        break;
+                    }
+                };
+            let record_count = header.record_count;
+            let raw_len = header.raw_len;
+            let ids_len = header.ids_len;
+            let qualities_len = header.qualities_len;
+            let records_len = header.records_len;
+            let encoded = EncodedArchiveChunk {
+                first_record,
+                record_count,
+                raw_len,
+                ids_len,
+                qualities_len,
+                records_len,
+                compressed,
             };
             let next_record = match first_record.checked_add(encoded.record_count as u64) {
                 Some(next_record) => next_record,
@@ -1507,6 +1561,10 @@ impl<R: Read> AlignedRecordIter<R> {
                 self.current = Some(result?);
                 debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
                 return Ok(true);
+            }
+            if self.skipped_chunks.contains_key(&self.next_yield_chunk) {
+                self.next_yield_chunk += 1;
+                continue;
             }
             if self.input_finished && self.outstanding_jobs == 0 {
                 if self.next_yield_chunk >= self.terminal_chunk {
@@ -1628,27 +1686,132 @@ impl<R: Read> Iterator for AlignedRecordIter<R> {
 
 impl<R: Read> std::iter::FusedIterator for AlignedRecordIter<R> {}
 
-fn read_encoded_archive_chunk<R: Read>(
-    input: &mut R,
-    first_record: u64,
-) -> Result<EncodedArchiveChunk> {
-    let record_count = read_u32(input)? as usize;
-    let compressed_len = usize_from(read_u64(input)?, "chunk compressed size")?;
-    let raw_len = usize_from(read_u64(input)?, "chunk uncompressed size")?;
-    let ids_len = usize_from(read_u64(input)?, "chunk ID block size")?;
-    let qualities_len = usize_from(read_u64(input)?, "chunk quality section size")?;
-    let records_len = usize_from(read_u64(input)?, "chunk record block size")?;
-    let mut compressed = vec![0; compressed_len];
-    input.read_exact(&mut compressed)?;
-    Ok(EncodedArchiveChunk {
-        first_record,
+struct ChunkHeader {
+    bytes: [u8; 44],
+    record_count: usize,
+    compressed_len: usize,
+    raw_len: usize,
+    ids_len: usize,
+    qualities_len: usize,
+    records_len: usize,
+    stored_crc: u32,
+}
+
+fn read_chunk_header<R: Read>(input: &mut R) -> Result<ChunkHeader> {
+    let mut bytes = [0u8; 44];
+    input.read_exact(&mut bytes)?;
+    let mut fields = Cursor::new(&bytes[..]);
+    let record_count = read_u32(&mut fields)? as usize;
+    let compressed_len = usize_from(read_u64(&mut fields)?, "chunk compressed size")?;
+    let raw_len = usize_from(read_u64(&mut fields)?, "chunk uncompressed size")?;
+    let ids_len = usize_from(read_u64(&mut fields)?, "chunk ID block size")?;
+    let qualities_len = usize_from(read_u64(&mut fields)?, "chunk quality section size")?;
+    let records_len = usize_from(read_u64(&mut fields)?, "chunk record block size")?;
+    let stored_crc = read_u32(input)?;
+    Ok(ChunkHeader {
+        bytes,
         record_count,
+        compressed_len,
         raw_len,
         ids_len,
         qualities_len,
         records_len,
-        compressed,
+        stored_crc,
     })
+}
+
+fn read_chunk_payload<R: Read>(
+    input: &mut R,
+    header: &ChunkHeader,
+    first_record: u64,
+    chunk_index: u64,
+) -> Result<Vec<u8>> {
+    let mut compressed = vec![0; header.compressed_len];
+    input.read_exact(&mut compressed)?;
+    let computed_crc = chunk_crc32c(&header.bytes, &compressed);
+    if computed_crc != header.stored_crc {
+        return Err(Error::Checksum(format!(
+            "chunk {chunk_index} (record {first_record}): stored CRC 0x{:08x} does not match \
+             computed CRC 0x{computed_crc:08x}",
+            header.stored_crc
+        )));
+    }
+    Ok(compressed)
+}
+
+/// Result of a checksum-only archive scan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// Chunk count declared by the global header.
+    pub declared_chunks: u64,
+    /// Chunks whose 48-byte header and payload were successfully read.
+    pub scanned_chunks: u64,
+    /// Records contained in chunks whose checksum matched.
+    pub records: u64,
+    /// Chunks whose stored CRC32C did not match the computed CRC32C.
+    pub bad_chunks: u64,
+    /// Ordinal of the first chunk with a checksum mismatch, if any.
+    pub first_bad_chunk: Option<u64>,
+    /// True when the archive ended before all declared chunks were scanned.
+    pub truncated: bool,
+    /// True when bytes follow the declared final chunk.
+    pub trailing_bytes: bool,
+}
+
+impl VerifyReport {
+    /// True when no damage was detected.
+    pub fn is_ok(&self) -> bool {
+        self.bad_chunks == 0 && !self.truncated && !self.trailing_bytes
+    }
+}
+
+/// Verify the global header, chunk framing, and per-chunk CRC32C checksums
+/// without decompressing chunk payloads.
+pub fn verify_aligned_archive<R: Read>(input: &mut R) -> Result<VerifyReport> {
+    let header = read_header(input)?;
+    let mut report = VerifyReport {
+        declared_chunks: header.chunk_count,
+        ..VerifyReport::default()
+    };
+    while report.scanned_chunks < header.chunk_count {
+        let chunk_index = report.scanned_chunks;
+        let chunk_header = match read_chunk_header(input) {
+            Ok(chunk_header) => chunk_header,
+            Err(_) => {
+                report.truncated = true;
+                return Ok(report);
+            }
+        };
+        let mut crc = crc32c::crc32c(&chunk_header.bytes);
+        let mut remaining = chunk_header.compressed_len;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut truncated = false;
+        while remaining > 0 {
+            let want = remaining.min(buffer.len());
+            if input.read_exact(&mut buffer[..want]).is_err() {
+                truncated = true;
+                break;
+            }
+            crc = crc32c::crc32c_append(crc, &buffer[..want]);
+            remaining -= want;
+        }
+        if truncated {
+            report.truncated = true;
+            return Ok(report);
+        }
+        if crc == chunk_header.stored_crc {
+            report.records += chunk_header.record_count as u64;
+        } else {
+            report.bad_chunks += 1;
+            if report.first_bad_chunk.is_none() {
+                report.first_bad_chunk = Some(chunk_index);
+            }
+        }
+        report.scanned_chunks += 1;
+    }
+    let mut trailing = [0u8; 1];
+    report.trailing_bytes = input.read(&mut trailing)? > 0;
+    Ok(report)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2077,14 +2240,25 @@ fn encode_chunk(
 }
 
 fn write_encoded_chunk(archive: &mut File, chunk: EncodedChunk) -> Result<()> {
-    write_u32(archive, chunk.pairs)?;
-    write_u64(archive, chunk.compressed.len() as u64)?;
-    write_u64(archive, chunk.raw_len)?;
-    write_u64(archive, chunk.ids_len)?;
-    write_u64(archive, chunk.qualities_len)?;
-    write_u64(archive, chunk.records_len)?;
+    let mut header = Vec::with_capacity(44);
+    write_u32(&mut header, chunk.pairs)?;
+    write_u64(&mut header, chunk.compressed.len() as u64)?;
+    write_u64(&mut header, chunk.raw_len)?;
+    write_u64(&mut header, chunk.ids_len)?;
+    write_u64(&mut header, chunk.qualities_len)?;
+    write_u64(&mut header, chunk.records_len)?;
+    debug_assert_eq!(header.len(), 44);
+    let crc = chunk_crc32c(&header, &chunk.compressed);
+    archive.write_all(&header)?;
+    write_u32(archive, crc)?;
     archive.write_all(&chunk.compressed)?;
     Ok(())
+}
+
+/// CRC32C over the 44-byte chunk header fields followed by the compressed payload.
+fn chunk_crc32c(header: &[u8], payload: &[u8]) -> u32 {
+    let crc = crc32c::crc32c(header);
+    crc32c::crc32c_append(crc, payload)
 }
 
 fn write_id_stream(
@@ -3514,11 +3688,13 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
     if magic != *MAGIC {
         return Err(Error::InvalidFormat("bad alignment archive magic".into()));
     }
-    let version = read_u32(input)?;
-    if version != VERSION {
-        return Err(Error::InvalidFormat(
-            "unsupported alignment archive version".into(),
-        ));
+    let version_major = read_u16(input)?;
+    let version_minor = read_u16(input)?;
+    if version_major != VERSION_MAJOR || version_minor != VERSION_MINOR {
+        return Err(Error::InvalidFormat(format!(
+            "unsupported alignment archive version {version_major}.{version_minor}; expected \
+             {VERSION_MAJOR}.{VERSION_MINOR}"
+        )));
     }
     let flags = read_u16(input)?;
     if flags & !0x1f != 0 {
@@ -4533,7 +4709,8 @@ mod tests {
         let metadata = encode_index_metadata(&descriptors).unwrap();
         let mut header = Vec::new();
         header.extend(MAGIC);
-        write_u32(&mut header, VERSION).unwrap();
+        write_u16(&mut header, VERSION_MAJOR).unwrap();
+        write_u16(&mut header, VERSION_MINOR).unwrap();
         write_u16(&mut header, 4).unwrap();
         header.push(0);
         header.extend([1, 1]);
@@ -4614,16 +4791,62 @@ mod tests {
     }
 
     #[test]
-    fn chunk_header_is_44_bytes() {
+    fn chunk_header_is_48_bytes_with_crc() {
+        let payload = vec![7u8; 13];
         let mut encoded = Vec::new();
         write_u32(&mut encoded, 2).unwrap();
-        for value in [0u64, 0, 0, 0, 0] {
+        for value in [13u64, 0, 0, 0, 0] {
             write_u64(&mut encoded, value).unwrap();
         }
-        assert_eq!(encoded.len(), 44);
-        let chunk = read_encoded_archive_chunk(&mut Cursor::new(encoded), 7).unwrap();
-        assert_eq!(chunk.first_record, 7);
+        let header = encoded.clone();
+        let crc = chunk_crc32c(&header, &payload);
+        write_u32(&mut encoded, crc).unwrap();
+        encoded.extend(&payload);
+        assert_eq!(encoded.len(), 48 + 13);
+        let chunk = read_chunk_header(&mut Cursor::new(&encoded)).unwrap();
         assert_eq!(chunk.record_count, 2);
+        assert_eq!(chunk.compressed_len, 13);
+        let decoded =
+            read_chunk_payload(&mut Cursor::new(&encoded[48..]), &chunk, 7, 3).unwrap();
+        assert_eq!(decoded, payload);
+        // A flipped payload byte must fail the checksum.
+        let mut damaged = encoded.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        let error = read_chunk_payload(&mut Cursor::new(&damaged[48..]), &chunk, 7, 3).unwrap_err();
+        assert!(error.is_checksum());
+        // A flipped header byte must fail the checksum too.
+        let mut damaged = encoded.clone();
+        damaged[0] ^= 1;
+        let error = read_chunk_header(&mut Cursor::new(&damaged))
+            .and_then(|header| {
+                read_chunk_payload(&mut Cursor::new(&damaged[48..]), &header, 7, 3)
+            })
+            .unwrap_err();
+        assert!(error.is_checksum());
+    }
+
+    #[test]
+    fn chunk_checksum_error_names_the_chunk() {
+        let payload = vec![1u8; 4];
+        let mut encoded = Vec::new();
+        write_u32(&mut encoded, 1).unwrap();
+        for value in [4u64, 0, 0, 0, 0] {
+            write_u64(&mut encoded, value).unwrap();
+        }
+        let crc = chunk_crc32c(&encoded, &payload);
+        write_u32(&mut encoded, crc).unwrap();
+        encoded.extend(&payload);
+        let mut damaged = encoded;
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0xff;
+        let header = read_chunk_header(&mut Cursor::new(&damaged)).unwrap();
+        let error =
+            read_chunk_payload(&mut Cursor::new(&damaged[48..]), &header, 9, 4).unwrap_err();
+        assert!(
+            error.to_string().contains("chunk 4 (record 9)"),
+            "unexpected message: {error}"
+        );
     }
 
     #[test]
@@ -4964,41 +5187,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_v21_archives() {
-        for version in [
-            0,
-            7,
-            8,
-            9,
-            10,
-            11,
-            12,
-            13,
-            14,
-            15,
-            16,
-            17,
-            18,
-            19,
-            20,
-            21,
-            u32::MAX,
+    fn rejects_non_v0_27_archives() {
+        for (major, minor) in [
+            (0, 0),
+            (0, 7),
+            (0, 26),
+            (0, 28),
+            (1, 0),
+            (1, 27),
+            (2, 3),
+            (u16::MAX, u16::MAX),
         ] {
             let mut header = Vec::new();
             header.extend(MAGIC);
-            write_u32(&mut header, version).unwrap();
-            assert!(matches!(
-                read_header(&mut Cursor::new(header)),
-                Err(Error::InvalidFormat(message))
-                    if message == "unsupported alignment archive version"
-            ));
+            write_u16(&mut header, major).unwrap();
+            write_u16(&mut header, minor).unwrap();
+            let message = match read_header(&mut Cursor::new(header)) {
+                Err(Error::InvalidFormat(message)) => message,
+                Err(Error::Checksum(message)) => {
+                    panic!("unexpected checksum error: {message}")
+                }
+                Err(Error::InvalidInput(message)) => {
+                    panic!("unexpected input error: {message}")
+                }
+                Err(Error::Io(error)) => panic!("unexpected I/O error: {error}"),
+                Ok(_) => panic!("expected version {major}.{minor} to be rejected"),
+            };
+            assert_eq!(
+                message,
+                format!(
+                    "unsupported alignment archive version {major}.{minor}; expected {}.{}",
+                    VERSION_MAJOR, VERSION_MINOR
+                )
+            );
         }
     }
 
     #[test]
     fn rejects_foreign_alignment_magic() {
         let mut header = vec![0; MAGIC.len()];
-        write_u32(&mut header, VERSION).unwrap();
+        write_u16(&mut header, VERSION_MAJOR).unwrap();
+        write_u16(&mut header, VERSION_MINOR).unwrap();
         assert!(matches!(
             read_header(&mut Cursor::new(header)),
             Err(Error::InvalidFormat(message)) if message == "bad alignment archive magic"

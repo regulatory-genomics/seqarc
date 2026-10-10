@@ -30,7 +30,10 @@ use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
 const VERSION_MAJOR: u16 = 0;
-const VERSION_MINOR: u16 = 27;
+const VERSION_MINOR: u16 = 28;
+/// Header bytes covered by the preamble CRC: magic, version, flags, stream
+/// count, position widths, block lengths, and chunk count.
+const PREAMBLE_BYTES: usize = 42;
 const MAP_TASKS_PER_WORKER: usize = 4;
 const MAX_MAPPING_BATCH_RECORDS: usize = 131_072;
 const PIPELINE_BATCHES: usize = 2;
@@ -979,8 +982,14 @@ fn compress_with_index<I2: AsRef<Path>>(
     ));
     progress.finish_and_clear();
     let index_metadata = encode_index_metadata(&index_descriptors)?;
-    let mut archive = File::create(output)?;
-    let header_size = 9 + 4 + 2 + 1 + 2 + 8 * 3;
+    // Read access is required to recompute and patch the preamble CRC.
+    let mut archive = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output)?;
+    let header_size = 9 + 4 + 2 + 1 + 2 + 8 * 3 + 4;
     archive.write_all(MAGIC)?;
     write_u16(&mut archive, VERSION_MAJOR)?;
     write_u16(&mut archive, VERSION_MINOR)?;
@@ -1002,9 +1011,11 @@ fn compress_with_index<I2: AsRef<Path>>(
     write_u64(&mut archive, index_metadata.len() as u64)?;
     let chunk_count_pos = archive.stream_position()?;
     write_u64(&mut archive, 0)?;
+    write_u32(&mut archive, 0)?;
     debug_assert_eq!(archive.stream_position()?, header_size as u64);
     archive.write_all(&reference_block.block)?;
     archive.write_all(&index_metadata)?;
+    write_preamble_crc(&mut archive)?;
 
     let mut written_chunks = 0u64;
     let mut replay_pair_count = 0u64;
@@ -1138,6 +1149,7 @@ fn compress_with_index<I2: AsRef<Path>>(
     let end = archive.stream_position()?;
     archive.seek(SeekFrom::Start(chunk_count_pos))?;
     write_u64(&mut archive, written_chunks)?;
+    write_preamble_crc(&mut archive)?;
     archive.seek(SeekFrom::Start(end))?;
     archive.flush()?;
     profile.archive_bytes = end;
@@ -3688,28 +3700,34 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
     if magic != *MAGIC {
         return Err(Error::InvalidFormat("bad alignment archive magic".into()));
     }
-    let version_major = read_u16(input)?;
-    let version_minor = read_u16(input)?;
+    let mut version = [0; 4];
+    input.read_exact(&mut version)?;
+    let mut version_fields = Cursor::new(&version[..]);
+    let version_major = read_u16(&mut version_fields)?;
+    let version_minor = read_u16(&mut version_fields)?;
     if version_major != VERSION_MAJOR || version_minor != VERSION_MINOR {
         return Err(Error::InvalidFormat(format!(
             "unsupported alignment archive version {version_major}.{version_minor}; expected \
              {VERSION_MAJOR}.{VERSION_MINOR}"
         )));
     }
-    let flags = read_u16(input)?;
+    let mut fields = [0u8; PREAMBLE_BYTES - 9 - 4];
+    input.read_exact(&mut fields)?;
+    let mut parsed = Cursor::new(&fields[..]);
+    let flags = read_u16(&mut parsed)?;
     if flags & !0x1f != 0 {
         return Err(Error::InvalidFormat(
             "unknown alignment archive flags".into(),
         ));
     }
-    let index_stream_count = usize::from(read_u8(input)?);
+    let index_stream_count = usize::from(read_u8(&mut parsed)?);
     if index_stream_count > 2 {
         return Err(Error::InvalidFormat(
             "index stream count must be at most two".into(),
         ));
     }
-    let absolute_position_width = usize::from(read_u8(input)?);
-    let delta_position_width = usize::from(read_u8(input)?);
+    let absolute_position_width = usize::from(read_u8(&mut parsed)?);
+    let delta_position_width = usize::from(read_u8(&mut parsed)?);
     if !matches!(absolute_position_width, 1 | 2 | 3 | 4 | 8)
         || !matches!(delta_position_width, 1 | 2 | 3 | 4 | 8)
     {
@@ -3733,13 +3751,28 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
             "mate-specific ID mode in single-end archive".into(),
         ));
     }
-    let reference_len = usize_from(read_u64(input)?, "reference block")?;
-    let index_metadata_len = usize_from(read_u64(input)?, "embedded index metadata block")?;
-    let chunks = read_u64(input)?;
+    let reference_len = usize_from(read_u64(&mut parsed)?, "reference block")?;
+    let index_metadata_len = usize_from(
+        read_u64(&mut parsed)?,
+        "embedded index metadata block",
+    )?;
+    let chunks = read_u64(&mut parsed)?;
+    let stored_crc = read_u32(input)?;
     let mut reference_block = vec![0; reference_len];
     input.read_exact(&mut reference_block)?;
     let mut index_metadata = vec![0; index_metadata_len];
     input.read_exact(&mut index_metadata)?;
+    let mut preamble = [0u8; PREAMBLE_BYTES];
+    preamble[..magic.len()].copy_from_slice(&magic);
+    preamble[magic.len()..magic.len() + version.len()].copy_from_slice(&version);
+    preamble[magic.len() + version.len()..].copy_from_slice(&fields);
+    let computed_crc = preamble_crc32c(&preamble, &reference_block, &index_metadata);
+    if computed_crc != stored_crc {
+        return Err(Error::Checksum(format!(
+            "archive preamble: stored CRC 0x{stored_crc:08x} does not match computed CRC \
+             0x{computed_crc:08x}"
+        )));
+    }
     let indexes = decode_index_metadata(&index_metadata, layout)?;
     Ok(ArchiveHeader {
         flags,
@@ -3752,6 +3785,46 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
         delta_position_width,
         index_streams: index_stream_count,
     })
+}
+
+/// CRC32C over the archive preamble: the fixed header bytes followed by the
+/// embedded reference block and the index metadata block.
+fn preamble_crc32c(preamble: &[u8], reference_block: &[u8], index_metadata: &[u8]) -> u32 {
+    let crc = crc32c::crc32c(preamble);
+    let crc = crc32c::crc32c_append(crc, reference_block);
+    crc32c::crc32c_append(crc, index_metadata)
+}
+
+/// Recompute the preamble CRC from the bytes on disk and patch it into the
+/// header. Used after the preamble is first written and again after the final
+/// chunk count is patched, since the chunk count is covered by the CRC.
+fn write_preamble_crc(archive: &mut File) -> Result<()> {
+    archive.seek(SeekFrom::Start(0))?;
+    let mut preamble = [0u8; PREAMBLE_BYTES];
+    archive.read_exact(&mut preamble)?;
+    let reference_len = u64::from_le_bytes(preamble[18..26].try_into().unwrap());
+    let metadata_len = u64::from_le_bytes(preamble[26..34].try_into().unwrap());
+    let mut crc = crc32c::crc32c(&preamble);
+    // The CRC field itself sits between the covered header bytes and the
+    // reference block, so resume hashing after it.
+    archive.seek(SeekFrom::Start(PREAMBLE_BYTES as u64 + 4))?;
+    let mut remaining = reference_len + metadata_len;
+    let mut buffer = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        archive.read_exact(&mut buffer[..want])?;
+        crc = crc32c::crc32c_append(crc, &buffer[..want]);
+        remaining -= want as u64;
+    }
+    archive.seek(SeekFrom::Start(PREAMBLE_BYTES as u64))?;
+    write_u32(archive, crc)?;
+    // Restore the position to the first byte after the preamble (header
+    // fields, CRC field, reference block, and metadata) so callers that are
+    // mid-write continue appending in the right place.
+    archive.seek(SeekFrom::Start(
+        PREAMBLE_BYTES as u64 + 4 + reference_len + metadata_len,
+    ))?;
+    Ok(())
 }
 
 fn encode_reference(
@@ -4717,6 +4790,9 @@ mod tests {
         write_u64(&mut header, reference.len() as u64).unwrap();
         write_u64(&mut header, metadata.len() as u64).unwrap();
         write_u64(&mut header, 9).unwrap();
+        assert_eq!(header.len(), PREAMBLE_BYTES);
+        let crc = preamble_crc32c(&header, &reference, &metadata);
+        write_u32(&mut header, crc).unwrap();
         header.extend(reference);
         header.extend(metadata);
         let decoded = read_header(&mut Cursor::new(header)).unwrap();
@@ -4724,6 +4800,52 @@ mod tests {
         assert_eq!(decoded.index_streams, 0);
         assert_eq!(decoded.indexes.len(), 1);
         assert_eq!(decoded.indexes[0].range, range);
+    }
+
+    #[test]
+    fn preamble_crc_detects_corruption() {
+        let options = crate::AlignmentCompressionOptions::default();
+        let reference = encode_reference(b"ACGT", &options).unwrap().block;
+        let metadata = encode_index_metadata(&[]).unwrap();
+        let build = |flip: Option<usize>| -> Vec<u8> {
+            let mut header = Vec::new();
+            header.extend(MAGIC);
+            write_u16(&mut header, VERSION_MAJOR).unwrap();
+            write_u16(&mut header, VERSION_MINOR).unwrap();
+            write_u16(&mut header, 4).unwrap();
+            header.push(0);
+            header.extend([1, 1]);
+            write_u64(&mut header, reference.len() as u64).unwrap();
+            write_u64(&mut header, metadata.len() as u64).unwrap();
+            write_u64(&mut header, 9).unwrap();
+            let crc = preamble_crc32c(&header, &reference, &metadata);
+            write_u32(&mut header, crc).unwrap();
+            header.extend(&reference);
+            header.extend(&metadata);
+            if let Some(index) = flip {
+                header[index] ^= 0xff;
+            }
+            header
+        };
+        read_header(&mut Cursor::new(build(None))).unwrap();
+        // Flips in magic, version, or flags are caught by earlier validation,
+        // so only positions guarded solely by the CRC are exercised here.
+        for flip in [
+            34, // chunk count low byte
+            35, // chunk count second byte
+            42, // stored CRC field
+            PREAMBLE_BYTES + 3, // reference block payload
+            PREAMBLE_BYTES + reference.len() + 2, // index metadata payload
+        ] {
+            let error = match read_header(&mut Cursor::new(build(Some(flip)))) {
+                Err(error) => error,
+                Ok(_) => panic!("flip at {flip} was not detected"),
+            };
+            assert!(
+                error.is_checksum(),
+                "flip at {flip} did not fail the preamble CRC: {error}"
+            );
+        }
     }
 
     #[test]
@@ -5187,14 +5309,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_v0_27_archives() {
+    fn rejects_non_v0_28_archives() {
         for (major, minor) in [
             (0, 0),
             (0, 7),
             (0, 26),
-            (0, 28),
+            (0, 27),
+            (0, 29),
             (1, 0),
-            (1, 27),
+            (1, 28),
             (2, 3),
             (u16::MAX, u16::MAX),
         ] {

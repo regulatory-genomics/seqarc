@@ -21,12 +21,12 @@ the aligned single-end and paired-end compression APIs.
   group first, with bit 7 set when another byte follows.
 - Zstandard frames use the compression level selected by the encoder. The level
   is not stored in the archive and is not needed for decompression.
-- Version 0.27 is the only supported aligned archive version.
+- Version 0.28 is the only supported aligned archive version.
 
 ## Top-Level Layout
 
 ```text
-global header                         42 bytes
+global header                         46 bytes
 embedded compact reference block     reference_block_length bytes
 embedded index metadata block        index_metadata_block_length bytes
 chunk 0
@@ -37,13 +37,13 @@ chunk N-1
 
 ## Global Header
 
-The global header is exactly 42 bytes.
+The global header is exactly 46 bytes.
 
 | Offset | Size | Type | Field |
 |---:|---:|---|---|
 | 0 | 9 | bytes | Magic: `SEQARC-AL` |
 | 9 | 2 | `u16` | Version major: `0` |
-| 11 | 2 | `u16` | Version minor: `27` |
+| 11 | 2 | `u16` | Version minor: `28` |
 | 13 | 2 | `u16` | Flags |
 | 15 | 1 | `u8` | Index read stream count: `0`, `1`, or `2` |
 | 16 | 1 | `u8` | Absolute position width: `1`, `2`, `3`, `4`, or `8` |
@@ -51,9 +51,17 @@ The global header is exactly 42 bytes.
 | 18 | 8 | `u64` | Reference block length |
 | 26 | 8 | `u64` | Index metadata block length |
 | 34 | 8 | `u64` | Chunk count |
+| 42 | 4 | `u32` | CRC32C checksum |
 
 The absolute and delta position widths select the fixed-width encoding used by
 the R1/R2 position subsections; both must be one of `1`, `2`, `3`, `4`, or `8`.
+
+The CRC32C checksum is computed over the first 42 header bytes (magic through
+chunk count) followed by the complete embedded reference block and the
+complete index metadata block. It is verified before the reference block is
+decoded, so corruption anywhere in the archive preamble is detected before any
+alignment data is reconstructed. Because the chunk count is covered, writers
+must patch this checksum after writing the final chunk count.
 
 ### Flags
 
@@ -176,10 +184,15 @@ Each chunk starts with a 48-byte header.
 | 8 | `u64` | Total raw section length |
 | 8 | `u64` | Raw identifier section length |
 | 8 | `u64` | Raw quality section length |
-| 8 | `u64` | Raw record section length |
+| 8 | `u64` | Record section length |
 | 4 | `u32` | CRC32C checksum |
 
-The total raw length must equal the sum of all declared raw section lengths.
+The total raw length must equal the sum of the raw identifier section length,
+the raw quality section length, and the record section length.
+
+The record section length is the byte length of the record section's compressed
+subsection directory (see Record Section); unlike the identifier and quality
+lengths, it is not a decompressed size.
 
 The CRC32C checksum is computed over the first 44 header bytes (the six fields
 above, in order) followed by the complete compressed payload. It detects
@@ -188,8 +201,8 @@ the checksum before decompressing any chunk payload.
 
 ### Compressed Chunk Payload
 
-The compressed payload is a section directory followed by three independent
-Zstandard frames:
+The compressed payload is a 24-byte section directory followed by two
+independent Zstandard frames and the record section's subsection directory:
 
 ```text
 u64 compressed_identifier_length
@@ -197,12 +210,13 @@ u64 compressed_quality_length
 u64 compressed_record_length
 u8  compressed_identifiers[compressed_identifier_length]
 u8  compressed_qualities[compressed_quality_length]
-u8  compressed_records[compressed_record_length]
+u8  record_section[compressed_record_length]
 ```
 
-The chunk header's `compressed_payload_length` includes the 24-byte section
-directory. Each frame must decompress to the corresponding raw length from the
-chunk header.
+The identifier and quality frames must each decompress to the corresponding raw
+length from the chunk header. The record section is consumed verbatim; it is
+not wrapped in an outer frame, and its byte length must match
+`compressed_record_length` and the chunk header's record section length.
 
 ## Identifier Section
 
@@ -284,8 +298,10 @@ rows. There is no separate index-quality stream.
 
 ## Record Section
 
-The record section is itself a directory of independently compressed Zstandard
-frames. This nested framing is inside the existing outer record-section frame.
+The record section is stored verbatim inside the chunk payload — it is not
+wrapped in an outer Zstandard frame. It is itself a directory of independently
+compressed Zstandard frames, one per subsection, so each subsection can be
+decompressed on its own:
 
 ```text
 u32 subsection_count
@@ -331,10 +347,12 @@ Single-end archives permit only `0` and `3`.
 Each biological stream has eight independently compressed subsections:
 
 1. Read lengths: one little-endian `u16` per logical record.
-2. Positions: one compact-reference position per aligned read. R1 positions and
-   R2-only positions are absolute `u64` values. R2 positions for records with
-   both mates aligned are signed R2-minus-R1 deltas encoded with ZigZag as
-   `u64`.
+2. Positions: one compact-reference position per aligned read, written
+   little-endian at the width declared by the global header. R1 positions and
+   R2-only positions are absolute values using `absolute_position_width`; R2
+   positions for records with both mates aligned are signed R2-minus-R1 deltas
+   encoded with ZigZag and written using `delta_position_width`. Encoders must
+   reject values that exceed the selected width.
 3. Noise positions: one little-endian `u16` position delta per noise symbol.
 4. Noise symbols: one ASCII row per aligned read, terminated by newline.
 5. Reference skips: one little-endian `u64` for every `4` noise symbol.
@@ -406,7 +424,7 @@ corruption to individual chunks and enables:
   reports the skipped chunk count and estimated lost records, and exits with
   an error.
 
-Beyond the per-chunk checksum, decoders rely on:
+Beyond the preamble and per-chunk checksums, decoders rely on:
 
 - exact magic and version checks;
 - reserved flag checks;
@@ -417,10 +435,6 @@ Beyond the per-chunk checksum, decoders rely on:
 - bounds checks for coordinates, read lengths, noise deltas and symbols,
   reference skips, emitted-sequence counts, index ranges, index read lengths,
   reference payload lengths, and packed-reference padding.
-
-The global header, embedded reference block, and index metadata block are not
-checksummed; corruption there is detected indirectly through downstream
-structural checks.
 
 Writers should reject values that cannot fit their specified integer widths.
 Readers must use checked arithmetic when combining stored lengths and offsets.

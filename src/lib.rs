@@ -25,7 +25,9 @@ pub use aligners::{
     align_dna_batch, build_alignment_index, build_genome_index, build_genome_index_with_options,
     AlignerKind, GenomeAlignment, GenomeIndexBuildOptions,
 };
-pub use alignment_archive::{verify_aligned_archive, AlignedRecordIter, VerifyReport};
+pub use alignment_archive::{
+    read_archive_info, verify_aligned_archive, AlignedRecordIter, ArchiveInfo, VerifyReport,
+};
 pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
 pub use reference_free::record_store::{PairStore, StoreStats};
 pub use reference_free::reorder;

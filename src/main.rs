@@ -4,8 +4,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use seqarc::{
     build_alignment_index, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
-    decompress_aligned_iter, open_fastx_reader, select_id_field, truncate_read_id,
-    verify_aligned_archive, AlignedRecordGroup, AlignedRecordSink, AlignerKind,
+    decompress_aligned_iter, open_fastx_reader, read_archive_info, select_id_field,
+    truncate_read_id, verify_aligned_archive, AlignedRecordGroup, AlignedRecordSink, AlignerKind,
     AlignmentCompressionOptions, AlignmentLayout, DecompressionOptions, EmbeddedIndexMate,
     EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode,
     ReadRecord, Result, SequenceRecordGroup,
@@ -35,6 +35,8 @@ enum Command {
     Validate(ValidateArgs),
     /// Verify chunk checksums and framing without decompressing.
     Verify(VerifyArgs),
+    /// Print archive metadata without decoding records.
+    Info(InfoArgs),
 }
 
 #[derive(Args)]
@@ -215,6 +217,12 @@ struct DecompressArgs {
 
 #[derive(Args)]
 struct VerifyArgs {
+    /// Input aligned .seqarc archive.
+    archive: PathBuf,
+}
+
+#[derive(Args)]
+struct InfoArgs {
     /// Input aligned .seqarc archive.
     archive: PathBuf,
 }
@@ -883,6 +891,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Decompress(args) => decompress_command(args),
         Command::Validate(args) => validate_command(args),
         Command::Verify(args) => verify_command(args),
+        Command::Info(args) => info_command(args),
     }
 }
 
@@ -1062,6 +1071,70 @@ fn verify_command(args: VerifyArgs) -> Result<()> {
         "archive {} failed verification",
         args.archive.display()
     )))
+}
+
+fn info_command(args: InfoArgs) -> Result<()> {
+    let mut archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(&args.archive)?);
+    let info = read_archive_info(&mut archive)?;
+    let file_size = std::fs::metadata(&args.archive)?.len();
+    println!("archive: {}", args.archive.display());
+    println!(
+        "format version: {}.{}",
+        info.version_major, info.version_minor
+    );
+    println!("layout: {:?}", info.layout);
+    println!("records: {}", info.records);
+    println!(
+        "chunks: {}/{} scanned",
+        info.scanned_chunks, info.declared_chunks
+    );
+    println!(
+        "ids: {} (mode: {})",
+        if info.preserve_ids {
+            "preserved"
+        } else {
+            "not preserved"
+        },
+        info.id_mode
+    );
+    println!(
+        "quality: {}",
+        if info.preserve_quality {
+            "preserved"
+        } else {
+            "not preserved"
+        }
+    );
+    println!("index streams: {}", info.index_streams);
+    for range in &info.embedded_indexes {
+        println!(
+            "embedded index: {:?}:{}:{}",
+            range.mate,
+            range.start + 1,
+            range.end
+        );
+    }
+    println!(
+        "position widths: absolute={} delta={}",
+        info.absolute_position_width, info.delta_position_width
+    );
+    println!(
+        "reference block: {} bytes (compressed)",
+        info.reference_block_bytes
+    );
+    println!("index metadata: {} bytes", info.index_metadata_bytes);
+    println!("file size: {} bytes", file_size);
+    println!("note: chunk checksums are not checked; use `seqarc verify` for that");
+    if info.truncated {
+        eprintln!(
+            "warning: archive is truncated: {}/{} declared chunks present",
+            info.scanned_chunks, info.declared_chunks
+        );
+    }
+    if info.trailing_bytes {
+        eprintln!("warning: archive contains trailing bytes after the final chunk");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

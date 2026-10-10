@@ -1877,6 +1877,106 @@ pub fn verify_aligned_archive<R: Read>(input: &mut R) -> Result<VerifyReport> {
     Ok(report)
 }
 
+/// High-level archive summary readable without decoding chunk payloads.
+///
+/// The preamble (including its CRC) and every chunk header are read, but
+/// chunk payloads are skipped without checksum verification; use
+/// [`verify_aligned_archive`] for a full integrity check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveInfo {
+    pub version_major: u16,
+    pub version_minor: u16,
+    pub layout: AlignmentLayout,
+    /// Identifier storage mode: "none", "independent", "identical-mates", or
+    /// "slash-mate".
+    pub id_mode: &'static str,
+    pub preserve_ids: bool,
+    pub preserve_quality: bool,
+    pub index_streams: usize,
+    /// Embedded index read ranges in one-based inclusive coordinates.
+    pub embedded_indexes: Vec<EmbeddedIndexRange>,
+    pub absolute_position_width: usize,
+    pub delta_position_width: usize,
+    /// Chunk count declared by the global header.
+    pub declared_chunks: u64,
+    /// Chunk headers successfully read; less than `declared_chunks` when the
+    /// file is truncated.
+    pub scanned_chunks: u64,
+    /// Records declared by the scanned chunk headers.
+    pub records: u64,
+    /// Compressed size of the embedded reference block in bytes.
+    pub reference_block_bytes: u64,
+    /// Size of the embedded index metadata block in bytes.
+    pub index_metadata_bytes: u64,
+    /// True when the file ended before all declared chunk headers were read.
+    pub truncated: bool,
+    /// True when bytes follow the declared final chunk.
+    pub trailing_bytes: bool,
+}
+
+/// Read archive metadata from the header and chunk headers without decoding
+/// any chunk payloads.
+pub fn read_archive_info<R: Read + Seek>(input: &mut R) -> Result<ArchiveInfo> {
+    let parsed = parse_preamble(input)?;
+    let embedded_indexes = decode_index_metadata(&parsed.index_metadata, parsed.layout)?
+        .into_iter()
+        .map(|descriptor| descriptor.range)
+        .collect();
+    let id_mode = match parsed.id_mode {
+        IdMode::None => "none",
+        IdMode::Independent => "independent",
+        IdMode::IdenticalMates => "identical-mates",
+        IdMode::SlashMate => "slash-mate",
+    };
+    let mut info = ArchiveInfo {
+        version_major: parsed.version_major,
+        version_minor: parsed.version_minor,
+        layout: parsed.layout,
+        id_mode,
+        preserve_ids: parsed.flags & 1 != 0,
+        preserve_quality: parsed.flags & 2 != 0,
+        index_streams: parsed.index_streams,
+        embedded_indexes,
+        absolute_position_width: parsed.absolute_position_width,
+        delta_position_width: parsed.delta_position_width,
+        declared_chunks: parsed.chunk_count,
+        scanned_chunks: 0,
+        records: 0,
+        reference_block_bytes: parsed.reference_block.len() as u64,
+        index_metadata_bytes: parsed.index_metadata.len() as u64,
+        truncated: false,
+        trailing_bytes: false,
+    };
+    // Walk the chunk headers, skipping each payload with a seek. Chunk
+    // checksums are not verified here; `verify` covers that.
+    while info.scanned_chunks < info.declared_chunks {
+        let chunk_header = match read_chunk_header(input) {
+            Ok(chunk_header) => chunk_header,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                info.truncated = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        info.records += chunk_header.record_count as u64;
+        info.scanned_chunks += 1;
+        // A corrupt length that cannot be used as a seek offset leaves the
+        // framing unusable; stop and report what was scanned.
+        match i64::try_from(chunk_header.compressed_len) {
+            Ok(offset) => {
+                input.seek(SeekFrom::Current(offset))?;
+            }
+            Err(_) => {
+                info.truncated = true;
+                break;
+            }
+        }
+    }
+    let mut trailing = [0u8; 1];
+    info.trailing_bytes = input.read(&mut trailing)? > 0;
+    Ok(info)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_archive_chunk(
     encoded: EncodedArchiveChunk,
@@ -3746,6 +3846,37 @@ fn decode_index_metadata(input: &[u8], layout: AlignmentLayout) -> Result<Vec<In
 }
 
 fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
+    let parsed = parse_preamble(input)?;
+    Ok(ArchiveHeader {
+        flags: parsed.flags,
+        id_mode: parsed.id_mode,
+        layout: parsed.layout,
+        chunk_count: parsed.chunk_count,
+        reference: decode_reference(&parsed.reference_block)?,
+        indexes: decode_index_metadata(&parsed.index_metadata, parsed.layout)?,
+        absolute_position_width: parsed.absolute_position_width,
+        delta_position_width: parsed.delta_position_width,
+        index_streams: parsed.index_streams,
+    })
+}
+
+/// The archive preamble, parsed and CRC-verified, with the embedded blocks
+/// retained as raw bytes so callers can avoid decoding the reference.
+struct ParsedPreamble {
+    version_major: u16,
+    version_minor: u16,
+    flags: u16,
+    id_mode: IdMode,
+    layout: AlignmentLayout,
+    absolute_position_width: usize,
+    delta_position_width: usize,
+    index_streams: usize,
+    chunk_count: u64,
+    reference_block: Vec<u8>,
+    index_metadata: Vec<u8>,
+}
+
+fn parse_preamble<R: Read>(input: &mut R) -> Result<ParsedPreamble> {
     let mut magic = [0; 9];
     input.read_exact(&mut magic)?;
     if magic != *MAGIC {
@@ -3820,17 +3951,18 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
              0x{computed_crc:08x}"
         )));
     }
-    let indexes = decode_index_metadata(&index_metadata, layout)?;
-    Ok(ArchiveHeader {
+    Ok(ParsedPreamble {
+        version_major,
+        version_minor,
         flags,
         id_mode,
         layout,
-        chunk_count: chunks,
-        reference: decode_reference(&reference_block)?,
-        indexes,
         absolute_position_width,
         delta_position_width,
         index_streams: index_stream_count,
+        chunk_count: chunks,
+        reference_block,
+        index_metadata,
     })
 }
 

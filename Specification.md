@@ -419,6 +419,9 @@ corruption to individual chunks and enables:
 
 - `verify`: a checksum-only scan that validates the global header, chunk
   framing, and every chunk checksum without decompressing;
+- `info`: a header-level summary (version, layout, options, chunk and record
+  counts read from chunk headers) that skips chunk payloads by seeking and
+  therefore performs no checksum verification;
 - best-effort decompression: when enabled, chunks that fail their checksum are
   skipped and records are recovered from all undamaged chunks; the operation
   reports the skipped chunk count and estimated lost records, and exits with

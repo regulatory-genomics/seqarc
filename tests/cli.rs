@@ -560,6 +560,84 @@ fn decompress_validates_output_layout_for_empty_archives() {
 }
 
 #[test]
+fn info_reports_archive_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n@read1\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    std::fs::write(&input_path, fastq.as_bytes()).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("info")
+        .arg(&archive_path)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("format version: 0.28")
+                .and(predicate::str::contains("layout: SingleEnd"))
+                .and(predicate::str::contains("records: 2"))
+                .and(predicate::str::contains("chunks: 1/1 scanned"))
+                .and(predicate::str::contains(
+                    "ids: preserved (mode: independent)",
+                ))
+                .and(predicate::str::contains("quality: preserved"))
+                .and(predicate::str::contains("file size: "))
+                .and(predicate::str::contains("use `seqarc verify`")),
+        );
+
+    // A truncated chunk header is reported without failing the command.
+    // The preamble spans 46 + reference(27) + metadata(8) = 81 bytes; keep
+    // it plus only part of the 48-byte chunk header.
+    let archive = std::fs::read(&archive_path).unwrap();
+    let truncated_path = directory.path().join("truncated.seqarc");
+    std::fs::write(&truncated_path, &archive[..100]).unwrap();
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("info")
+        .arg(&truncated_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("chunks: 0/1 scanned"))
+        .stderr(predicate::str::contains("archive is truncated"));
+}
+
+#[test]
 fn index_cleans_custom_temp_directory_after_failure() {
     let directory = tempfile::tempdir().unwrap();
     let reference_path = directory.path().join("empty.fa");

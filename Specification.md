@@ -5,20 +5,25 @@ the aligned single-end and paired-end compression APIs.
 
 ## Conventions
 
-- The archive stores either single-end reads or paired-end reads. Counts and
-  ordinals refer to logical records: one read for single-end archives and one
-  read pair for paired-end archives.
+- The archive stores either single-end reads or paired-end reads, optionally
+  with up to two index reads (I1 and I2) taken from separate FASTQ files.
+  Counts and ordinals refer to logical records: one read for single-end
+  archives, one read pair for paired-end archives. Each logical record also
+  carries one stored index read per declared index stream. All input FASTQ
+  files share the same identifier per logical record; index reads are never
+  stored with their own identifiers and are reconstructed using the biological
+  mate-1 identifier.
 - All fixed-width integers are unsigned little-endian unless explicitly stated.
 - Varints use unsigned LEB128: seven payload bits per byte, least-significant
   group first, with bit 7 set when another byte follows.
 - Zstandard frames use the compression level selected by the encoder. The level
   is not stored in the archive and is not needed for decompression.
-- Version 21 is the only supported aligned archive version.
+- Version 26 is the only supported aligned archive version.
 
 ## Top-Level Layout
 
 ```text
-global header                         39 bytes
+global header                         42 bytes
 embedded compact reference block     reference_block_length bytes
 embedded index metadata block        index_metadata_block_length bytes
 chunk 0
@@ -29,16 +34,22 @@ chunk N-1
 
 ## Global Header
 
-The global header is exactly 39 bytes.
+The global header is exactly 42 bytes.
 
 | Offset | Size | Type | Field |
 |---:|---:|---|---|
 | 0 | 9 | bytes | Magic: `SEQARC-AL` |
-| 9 | 4 | `u32` | Version: `21` |
+| 9 | 4 | `u32` | Version: `26` |
 | 13 | 2 | `u16` | Flags |
-| 15 | 8 | `u64` | Reference block length |
-| 23 | 8 | `u64` | Index metadata block length |
-| 31 | 8 | `u64` | Chunk count |
+| 15 | 1 | `u8` | Index read stream count: `0`, `1`, or `2` |
+| 16 | 1 | `u8` | Absolute position width: `1`, `2`, `3`, `4`, or `8` |
+| 17 | 1 | `u8` | Delta position width: `1`, `2`, `3`, `4`, or `8` |
+| 18 | 8 | `u64` | Reference block length |
+| 26 | 8 | `u64` | Index metadata block length |
+| 34 | 8 | `u64` | Chunk count |
+
+The absolute and delta position widths select the fixed-width encoding used by
+the R1/R2 position subsections; both must be one of `1`, `2`, `3`, `4`, or `8`.
 
 ### Flags
 
@@ -121,7 +132,8 @@ byte must be zero.
 ## Embedded Index Metadata
 
 The metadata block is stored immediately after the compact reference. Archives
-without embedded indexes store a zero range count.
+without embedded indexes store a zero range count. Declared index read streams
+do not occupy descriptor entries; their count lives in the global header.
 
 The metadata block starts with:
 
@@ -141,27 +153,7 @@ Ranges use coordinates in the original biological read. Ranges on the same mate
 must be nonempty and non-overlapping. The CLI accepts one-based inclusive
 coordinates and converts them to the stored zero-based start and length.
 
-After all descriptors, the metadata stores one merged whitelist:
-
-```text
-u64 global_whitelist_length
-u8  global_whitelist[global_whitelist_length]
-```
-
-Each range first predicts its own local whitelist across every logical record.
-Local whitelists retain their counts for correction decisions during compression,
-but are not serialized. Their entries are deduplicated into one global whitelist;
-counts are dropped and unique sequences are sorted lexicographically.
-
-The global whitelist payload contains a varint entry count followed by entries:
-
-```text
-repeat entry_count times:
-    varint sequence_length
-    u8     sequence[sequence_length]
-```
-
-Whitelist entries contain uppercase A/C/G/T and are longer than one base.
+The metadata block ends immediately after the last descriptor.
 
 ## Chunks
 
@@ -210,10 +202,12 @@ is not part of the identifier. The archive stores and reconstructs the resulting
 identifier bytes exactly; discarded suffixes and the preprocessing length are
 not stored and cannot be recovered during decompression.
 
-The raw identifier section contains one length-delimited block per stream:
+The raw identifier section contains one length-delimited block per biological
+stream. Index-read identifiers are stored separately, as record-section
+subsections:
 
 ```text
-repeat stream_count times:
+repeat biological_stream_count times:
     u64 block_length
     u8  block[block_length]
 ```
@@ -238,11 +232,12 @@ encoding. The decoder appends `/1` to mate 1 and `/2` to mate 2.
 
 ## Quality Section
 
-The raw quality section contains one length-delimited quality stream per archive
-stream:
+The raw quality section contains one length-delimited quality stream per
+biological archive stream. Index-read qualities are stored separately, as
+record-section subsections:
 
 ```text
-repeat stream_count times:
+repeat biological_stream_count times:
     u64 stream_length
     u8  stream[stream_length]
 ```
@@ -292,6 +287,7 @@ The subsection count is:
 
 ```text
 1 + 8 * biological_stream_count + embedded_index_range_count
+    + 3 * index_stream_count
 ```
 
 Subsections occur in this order:
@@ -300,6 +296,7 @@ Subsections occur in this order:
 2. Eight R1 subsections.
 3. Eight R2 subsections for paired archives.
 4. One raw subsection for each embedded index range in declaration order.
+5. Four subsections for each declared index read stream in I1, I2 order.
 
 Every frame must decode to its declared raw length, and every subsection must be
 consumed exactly.
@@ -364,6 +361,25 @@ the metadata descriptor, so no per-record delimiter is stored. Decoders reinsert
 the ranges into R1 or R2 in original-coordinate order. Index-range qualities
 remain part of the ordinary complete quality rows.
 
+### Index-Read File Subsections
+
+Each declared index read stream has three independently compressed subsections,
+in this order:
+
+1. Quality stream: a sequence of raw quality runs as described by the quality
+   run format, containing one run-delimited body per logical record. Empty
+   when qualities are not preserved.
+2. Read lengths: one little-endian `u16` per logical record. Index read
+   sequences are nonempty, and writers must reject lengths that cannot fit
+   `u16`.
+3. Sequences: concatenated raw bytes; the read lengths determine boundaries.
+
+Index reads are never stored with identifiers. All input FASTQ files must
+share the same identifier per logical record, which compression validates;
+decoders reconstruct index reads using the biological mate-1 identifier.
+Index reads are never mapped and never contribute mapped flags, positions,
+CIGAR data, or reference coverage.
+
 ## Integrity and Validation
 
 The aligned format has no archive-level checksum. Decoders rely on:
@@ -375,8 +391,8 @@ The aligned format has no archive-level checksum. Decoders rely on:
 - exact section and substream consumption;
 - end-of-file immediately after the declared final chunk;
 - bounds checks for coordinates, read lengths, noise deltas and symbols,
-  reference skips, emitted-sequence counts, index ranges, reference payload
-  lengths, and packed-reference padding.
+  reference skips, emitted-sequence counts, index ranges, index read lengths,
+  reference payload lengths, and packed-reference padding.
 
 Writers should reject values that cannot fit their specified integer widths.
 Readers must use checked arithmetic when combining stored lengths and offsets.
@@ -391,7 +407,10 @@ qualities. Sequence reconstruction is lossless:
   reference skips, and emitted sequences;
 - unmapped reads are rebuilt from their raw sequence subsections;
 - embedded indexes are read from independent raw frames and reinserted at their
-  original R1 or R2 coordinates.
+  original R1 or R2 coordinates;
+- index reads are restored from their independent quality, length, and
+  sequence subsections in I1, I2 order, reusing the biological mate-1
+  identifier.
 
 If a lossy quality preprocessing mode was selected, the stored quality bytes
 are reproduced exactly, but they are not the original input qualities.

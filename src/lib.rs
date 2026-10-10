@@ -6,8 +6,6 @@
 mod aligners;
 mod alignment_archive;
 mod fastx;
-#[allow(dead_code)]
-mod index_read;
 pub mod minibwa;
 mod packed_sequence;
 mod quality;
@@ -179,6 +177,7 @@ pub struct AlignmentCompressionOptions {
     pub quality_mode: QualityMode,
     pub zstd_level: i32,
     pub embedded_index_ranges: Vec<EmbeddedIndexRange>,
+    pub index_read_files: Vec<std::path::PathBuf>,
     pub rustar_gtf: Option<std::path::PathBuf>,
     pub rustar_sjdb_overhang: u32,
     pub rustar_sa_sparse_d: u32,
@@ -199,6 +198,7 @@ impl Default for AlignmentCompressionOptions {
             quality_mode: QualityMode::Lossless,
             zstd_level: 19,
             embedded_index_ranges: Vec::new(),
+            index_read_files: Vec::new(),
             rustar_gtf: None,
             rustar_sjdb_overhang: 100,
             rustar_sa_sparse_d: 1,
@@ -327,9 +327,15 @@ impl AlignmentLayout {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AlignedRecordGroup {
+pub enum SequenceRecordGroup {
     Single(ReadRecord),
     Paired(ReadRecord, ReadRecord),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlignedRecordGroup {
+    pub sequence: SequenceRecordGroup,
+    pub index_reads: Vec<ReadRecord>,
 }
 
 pub trait AlignedRecordSink {
@@ -342,6 +348,7 @@ pub trait AlignedRecordSink {
 pub struct AlignedDecompressionMetadata {
     pub layout: AlignmentLayout,
     pub streams: usize,
+    pub index_streams: usize,
     pub records: u64,
     pub output_order: OutputOrder,
 }
@@ -1026,8 +1033,8 @@ mod tests {
         assert!(profile.reference_compressed_bytes > 0);
         assert_eq!(
             profile.archive_bytes,
-            41 + profile.reference_compressed_bytes
-                + 17
+            42 + profile.reference_compressed_bytes
+                + 8
                 + 44 * profile.chunk_count
                 + profile.chunks_compressed_bytes
         );
@@ -1069,7 +1076,8 @@ mod tests {
         assert_eq!(iter.decoded_chunks(), 2);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].0, 1);
-        let AlignedRecordGroup::Paired(first, second) = &selected[0].1 else {
+        assert!(selected[0].1.index_reads.is_empty());
+        let SequenceRecordGroup::Paired(first, second) = &selected[0].1.sequence else {
             panic!("expected paired record")
         };
         assert_eq!(first.sequence, unknown);

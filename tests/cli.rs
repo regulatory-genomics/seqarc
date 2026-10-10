@@ -469,7 +469,7 @@ fn embedded_index_ranges_round_trip_across_mates() {
         .success();
 
     let archive = std::fs::read(&archive_path).unwrap();
-    assert_eq!(u32::from_le_bytes(archive[9..13].try_into().unwrap()), 23);
+    assert_eq!(u32::from_le_bytes(archive[9..13].try_into().unwrap()), 26);
 
     Command::cargo_bin("seqarc")
         .unwrap()
@@ -497,4 +497,590 @@ fn embedded_index_ranges_round_trip_across_mates() {
 
     assert_eq!(std::fs::read(&decoded_first).unwrap(), first_fastq);
     assert_eq!(std::fs::read(&decoded_second).unwrap(), second_fastq);
+}
+
+#[test]
+fn paired_with_index_read_files_round_trips() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let second_path = directory.path().join("reads.2.fastq");
+    let i1_path = directory.path().join("index.1.fastq");
+    let i2_path = directory.path().join("index.2.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+    let decoded_first = directory.path().join("decoded.1.fastq");
+    let decoded_second = directory.path().join("decoded.2.fastq");
+    let decoded_i1 = directory.path().join("decoded.i1.fastq");
+    let decoded_i2 = directory.path().join("decoded.i2.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let first_sequence = &reference[20..60];
+    let second_sequence = reference[20..60]
+        .iter()
+        .rev()
+        .map(|base| match base {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let first_fastq = format!(
+        "@pair0/1\n{}\n+\n{}\n@pair1/1\n{}\n+\n{}\n",
+        String::from_utf8_lossy(first_sequence),
+        "I".repeat(first_sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    let second_fastq = format!(
+        "@pair0/2\n{}\n+\n{}\n@pair1/2\n{}\n+\n{}\n",
+        String::from_utf8_lossy(&second_sequence),
+        "J".repeat(second_sequence.len()),
+        "N".repeat(40),
+        "$".repeat(40),
+    );
+    let i1_fastq = "@pair0/1\nAACCGGTT\n+\nJJJJJJJJ\n@pair1/1\nTTTTGGCC\n+\nJJJJJJJJ\n";
+    let i2_fastq = "@pair0/1\nGGCCTTAA\n+\nKKKKKKKK\n@pair1/1\nACGTACGT\n+\nKKKKKKKK\n";
+    std::fs::write(&first_path, first_fastq.as_bytes()).unwrap();
+    std::fs::write(&second_path, second_fastq.as_bytes()).unwrap();
+    std::fs::write(&i1_path, i1_fastq).unwrap();
+    std::fs::write(&i2_path, i2_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--index-read-2")
+        .arg(&i2_path)
+        .arg("--chunk-records")
+        .arg("1")
+        .arg("--profile")
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("index_streams=2"))
+        .stderr(predicate::str::contains("index reads: 0 raw").not())
+        .stderr(predicate::str::contains("index reads:"));
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&decoded_first)
+        .arg("--mate-2")
+        .arg(&decoded_second)
+        .arg("--index-output-1")
+        .arg(&decoded_i1)
+        .arg("--index-output-2")
+        .arg(&decoded_i2)
+        .arg("--threads")
+        .arg("2")
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&decoded_first).unwrap(),
+        first_fastq
+    );
+    assert_eq!(
+        std::fs::read_to_string(&decoded_second).unwrap(),
+        second_fastq
+    );
+    assert_eq!(std::fs::read(&decoded_i1).unwrap(), i1_fastq.as_bytes());
+    assert_eq!(std::fs::read(&decoded_i2).unwrap(), i2_fastq.as_bytes());
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--index-read-2")
+        .arg(&i2_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "validated 2 records against originals (PairedEnd)",
+        ));
+
+    let missing_output = directory.path().join("missing-i2.fastq");
+    let partial_first = directory.path().join("partial.1.fastq");
+    let partial_second = directory.path().join("partial.2.fastq");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&partial_first)
+        .arg("--mate-2")
+        .arg(&partial_second)
+        .arg("--index-output-1")
+        .arg(&missing_output)
+        .assert()
+        .failure();
+    assert!(!partial_first.exists());
+    assert!(!partial_second.exists());
+    assert!(!missing_output.exists());
+}
+
+#[test]
+fn single_end_with_index_read_file_round_trips() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+    let i1_path = directory.path().join("index.1.fastq");
+    let i2_path = directory.path().join("index.2.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+    let decoded_path = directory.path().join("decoded.fastq");
+    let decoded_i1 = directory.path().join("decoded.i1.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n@read1\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    let i1_fastq = "@read0\nAACCGGTT\n+\nJJJJJJJJ\n@read1\nTTTTGGCC\n+\nJJJJJJJJ\n";
+    std::fs::write(&input_path, fastq.as_bytes()).unwrap();
+    std::fs::write(&i1_path, i1_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--index-read-2")
+        .arg(&i2_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .failure();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--chunk-records")
+        .arg("1")
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("index_streams=1"));
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&decoded_path)
+        .arg("--index-output-1")
+        .arg(&decoded_i1)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read_to_string(&decoded_path).unwrap(), fastq);
+    assert_eq!(std::fs::read(&decoded_i1).unwrap(), i1_fastq.as_bytes());
+
+    let no_index_output = directory.path().join("no-index.fastq");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&no_index_output)
+        .assert()
+        .failure();
+    assert!(!no_index_output.exists());
+
+    let excess_1 = directory.path().join("excess.1.fastq");
+    let excess_i2 = directory.path().join("excess.i2.fastq");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&excess_1)
+        .arg("--index-output-1")
+        .arg(&excess_i2)
+        .arg("--index-output-2")
+        .arg(&excess_1)
+        .assert()
+        .failure();
+    assert!(!excess_1.exists());
+    assert!(!excess_i2.exists());
+}
+
+#[test]
+fn index_reads_coexist_with_ranges_and_respect_global_options() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let second_path = directory.path().join("reads.2.fastq");
+    let i1_path = directory.path().join("index.1.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+    let decoded_first = directory.path().join("decoded.1.fastq");
+    let decoded_second = directory.path().join("decoded.2.fastq");
+    let decoded_i1 = directory.path().join("decoded.i1.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let first_fastq = b"@pair0/1\nAAAACCCCGGGGTTTTACGT\n+\nABCDEFGHIJKLMNOPQRST\n\
+@pair1/1\nAAAACCCCGGAGTTTTACGT\n+\nTSRQPONMLKJIHGFEDCBA\n";
+    let second_fastq = b"@pair0/2\nTGCATTTTAAAACCCCGGTA\n+\nIIIIIIIIIIIIIIIIIIII\n\
+@pair1/2\nTGCATTTGAAAACCCCGGTA\n+\nJJJJJJJJJJJJJJJJJJJJ\n";
+    let i1_fastq = "@pair0/1\nAACCGGT\n+\nJJJJJJJ\n@pair1/1\nTTTGGCC\n+\nJJJJJJJ\n";
+    std::fs::write(&first_path, first_fastq).unwrap();
+    std::fs::write(&second_path, second_fastq).unwrap();
+    std::fs::write(&i1_path, i1_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-range")
+        .arg("R1:9:12")
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--chunk-records")
+        .arg("1")
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("index_streams=1"));
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&decoded_first)
+        .arg("--mate-2")
+        .arg(&decoded_second)
+        .arg("--index-output-1")
+        .arg(&decoded_i1)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(&decoded_first).unwrap(), first_fastq);
+    assert_eq!(std::fs::read(&decoded_second).unwrap(), second_fastq);
+    assert_eq!(std::fs::read(&decoded_i1).unwrap(), i1_fastq.as_bytes());
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .assert()
+        .success();
+
+    let reduced_archive = directory.path().join("reduced.seqarc");
+    let fasta_first = directory.path().join("decoded.1.fa");
+    let fasta_second = directory.path().join("decoded.2.fa");
+    let fasta_i1 = directory.path().join("decoded.i1.fa");
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--index-range")
+        .arg("R1:9:12")
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--chunk-records")
+        .arg("1")
+        .arg("--no-ids")
+        .arg("--quality-mode")
+        .arg("illumina")
+        .arg("--output")
+        .arg(&reduced_archive)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&reduced_archive)
+        .arg("--mate-1")
+        .arg(&fasta_first)
+        .arg("--mate-2")
+        .arg(&fasta_second)
+        .arg("--index-output-1")
+        .arg(&fasta_i1)
+        .arg("--format")
+        .arg("fasta")
+        .assert()
+        .success();
+
+    let expected_first_fasta = String::from_utf8_lossy(first_fastq)
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| index % 4 == 1)
+        .map(|(_, line)| format!(">\n{line}\n"))
+        .collect::<String>();
+    let expected_second_fasta = String::from_utf8_lossy(second_fastq)
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| index % 4 == 1)
+        .map(|(_, line)| format!(">\n{line}\n"))
+        .collect::<String>();
+    let expected_i1_fasta = i1_fastq
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| index % 4 == 1)
+        .map(|(_, line)| format!(">\n{line}\n"))
+        .collect::<String>();
+    assert_eq!(std::fs::read_to_string(&fasta_first).unwrap(), expected_first_fasta);
+    assert_eq!(
+        std::fs::read_to_string(&fasta_second).unwrap(),
+        expected_second_fasta
+    );
+    assert_eq!(std::fs::read_to_string(&fasta_i1).unwrap(), expected_i1_fasta);
+}
+
+#[test]
+fn index_read_files_reject_unequal_record_counts() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+    let i1_path = directory.path().join("index.1.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n@read1\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    let i1_fastq = "@read0\nAACCGGTT\n+\nJJJJJJJJ\n";
+    std::fs::write(&input_path, fastq.as_bytes()).unwrap();
+    std::fs::write(&i1_path, i1_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .failure();
+    assert!(!archive_path.exists());
+}
+
+#[test]
+fn index_read_files_reject_mismatched_identifiers() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+    let i1_path = directory.path().join("index.1.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+    );
+    let i1_fastq = "@other\nAACCGGTT\n+\nJJJJJJJJ\n";
+    std::fs::write(&input_path, fastq.as_bytes()).unwrap();
+    std::fs::write(&i1_path, i1_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "index read identifier does not match mate 1 identifier",
+        ));
+    assert!(!archive_path.exists());
+}
+
+#[test]
+fn validate_rejects_mismatched_index_originals() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let input_path = directory.path().join("reads.fastq");
+    let i1_path = directory.path().join("index.1.fastq");
+    let wrong_i1_path = directory.path().join("wrong-index.1.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+    );
+    let i1_fastq = "@read0\nAACCGGTT\n+\nJJJJJJJJ\n";
+    let wrong_i1_fastq = "@wrong\nTTTTGGCC\n+\nJJJJJJJJ\n";
+    std::fs::write(&input_path, fastq.as_bytes()).unwrap();
+    std::fs::write(&i1_path, i1_fastq).unwrap();
+    std::fs::write(&wrong_i1_path, wrong_i1_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .arg("--chunk-records")
+        .arg("1")
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--index-read-1")
+        .arg(&wrong_i1_path)
+        .assert()
+        .failure();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&input_path)
+        .arg("--index-read-1")
+        .arg(&i1_path)
+        .assert()
+        .success();
 }

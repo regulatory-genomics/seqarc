@@ -5,7 +5,6 @@ use crate::aligners::{
     AlignmentSelection, KeptRun, MappingProgressStats, ReferenceBases, ReferenceMask,
     MAP_TASK_READS,
 };
-use crate::index_read::{self, IndexReadEncoding, IndexReadError, Whitelist, WhitelistBuilder};
 #[cfg(test)]
 use crate::minibwa::{self, Strand};
 use crate::minibwa::{CigarKind, CigarOp};
@@ -17,7 +16,7 @@ use crate::{
     AlignedDecompressionMetadata, AlignedRecordGroup, AlignedRecordSink, AlignmentLayout,
     ArchiveRecords, CompressionMetadata, DecompressionOptions, EmbeddedIndexMate,
     EmbeddedIndexRange, Error, FastxReader, Format, GenomeAlignment, PairedRecordSink, ReadRecord,
-    Result,
+    Result, SequenceRecordGroup,
 };
 use bed_utils::extsort::{ExternalChunk, ExternalChunkBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -30,7 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 9] = b"SEQARC-AL";
-const VERSION: u32 = 23;
+const VERSION: u32 = 26;
 const MAP_TASKS_PER_WORKER: usize = 4;
 const MAX_MAPPING_BATCH_RECORDS: usize = 131_072;
 const PIPELINE_BATCHES: usize = 2;
@@ -44,6 +43,7 @@ struct AlignedPair {
     first_selection: AlignmentSelection,
     second_selection: AlignmentSelection,
     indexes: Vec<SpoolIndexRead>,
+    index_reads: Vec<ReadRecord>,
 }
 
 impl AlignedPair {
@@ -70,6 +70,14 @@ impl AlignedPair {
             _ => unreachable!(),
         }
     }
+
+    fn index_read(&self, stream: usize) -> Option<&ReadRecord> {
+        self.index_reads.get(stream)
+    }
+
+    fn index_stream_count(&self) -> usize {
+        self.index_reads.len()
+    }
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -77,6 +85,7 @@ struct SpoolPair {
     first: SpoolRead,
     second: Option<SpoolRead>,
     indexes: Vec<SpoolIndexRead>,
+    index_reads: Vec<SpoolIndexRead>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -88,12 +97,6 @@ struct SpoolIndexRead {
 #[derive(Clone, Debug)]
 struct IndexDescriptor {
     range: EmbeddedIndexRange,
-}
-
-#[derive(Clone, Debug)]
-struct IndexEncodingDescriptor {
-    range: EmbeddedIndexRange,
-    local_whitelist: Whitelist,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -128,12 +131,20 @@ struct EncodedChunk {
     ids_compressed_len: u64,
     qualities_compressed_len: u64,
     records_compressed_len: u64,
+    indexes_raw_len: u64,
+    indexes_compressed_len: u64,
     compressed: Vec<u8>,
 }
 
 struct EncodedReference {
     block: Vec<u8>,
     raw_len: u64,
+}
+
+struct EncodedRecordStream {
+    bytes: Vec<u8>,
+    indexes_raw_len: u64,
+    indexes_compressed_len: u64,
 }
 
 struct EncodedArchiveChunk {
@@ -151,31 +162,12 @@ enum ArchiveOp {
     Match = 0,
     Literal = 1,
     RefAdvance = 2,
-    Whitelist = 3,
-}
-
-#[cfg(test)]
-impl ArchiveOp {
-    fn from_code(code: u8) -> Result<Self> {
-        match code {
-            0 => Ok(Self::Match),
-            1 => Ok(Self::Literal),
-            2 => Ok(Self::RefAdvance),
-            3 => Ok(Self::Whitelist),
-            _ => Err(Error::InvalidFormat("unknown archive operation".into())),
-        }
-    }
-
-    fn consumes_query(self) -> bool {
-        matches!(self, Self::Match | Self::Literal)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArchiveRun {
     op: ArchiveOp,
     len: usize,
-    descriptors: Vec<usize>,
 }
 
 struct DecodedArchiveChunk {
@@ -184,6 +176,17 @@ struct DecodedArchiveChunk {
     ids: Vec<Vec<Vec<u8>>>,
     qualities: Vec<Vec<Option<Vec<u8>>>>,
     sequences: Vec<Vec<Vec<u8>>>,
+    index_reads: Vec<DecodedIndexStream>,
+}
+
+struct DecodedIndexStream {
+    qualities: Vec<Option<Vec<u8>>>,
+    sequences: Vec<Vec<u8>>,
+}
+
+struct DecodedRecordSections {
+    biological: Vec<Vec<Vec<u8>>>,
+    index_streams: Vec<DecodedIndexStream>,
 }
 
 struct ArchiveHeader {
@@ -193,9 +196,9 @@ struct ArchiveHeader {
     chunk_count: u64,
     reference: Vec<u8>,
     indexes: Vec<IndexDescriptor>,
-    global_whitelist: Whitelist,
     absolute_position_width: usize,
     delta_position_width: usize,
+    index_streams: usize,
 }
 
 fn position_width(reference_len: usize) -> usize {
@@ -280,9 +283,9 @@ pub struct AlignedRecordIter<R: Read> {
     layout: AlignmentLayout,
     preserve_quality: bool,
     indexes: Arc<Vec<IndexDescriptor>>,
-    global_whitelist: Arc<Whitelist>,
     absolute_position_width: usize,
     delta_position_width: usize,
+    index_streams: usize,
     original_range: Option<RangeInclusive<u64>>,
     total_chunks: u64,
     decoded_chunks: u64,
@@ -569,14 +572,6 @@ fn apply_identifier_policy(
     Ok(())
 }
 
-fn index_encode_error(error: IndexReadError) -> Error {
-    Error::InvalidInput(error.to_string())
-}
-
-fn index_decode_error(error: IndexReadError) -> Error {
-    Error::InvalidFormat(error.to_string())
-}
-
 fn validate_index_ranges(ranges: &[EmbeddedIndexRange], layout: AlignmentLayout) -> Result<()> {
     if layout == AlignmentLayout::SingleEnd
         && ranges
@@ -721,6 +716,11 @@ fn compress_with_index<I2: AsRef<Path>>(
 ) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
     let pipeline_started = std::time::Instant::now();
     validate_index_ranges(&options.embedded_index_ranges, layout)?;
+    if options.index_read_files.len() > 2 {
+        return Err(Error::InvalidInput(
+            "at most two index read files are supported".into(),
+        ));
+    }
     if !options.preserve_ids && options.id_prefix_chars.is_some_and(|length| length != 0) {
         return Err(Error::InvalidInput(
             "identifier prefix cannot be retained when identifiers are disabled".into(),
@@ -738,9 +738,10 @@ fn compress_with_index<I2: AsRef<Path>>(
         .map_err(|error| Error::InvalidInput(format!("failed to create mapping pool: {error}")))?;
     let progress = mapping_progress();
     stage_log(&progress, format!(
-        "[seqarc] stage=initialize layout={:?} streams={} threads={} mapping_batch_records={} map_task_reads={} chunk_records={} zstd_level={} preserve_ids={} id_prefix_chars={:?} preserve_quality={}",
+        "[seqarc] stage=initialize layout={:?} streams={} index_streams={} threads={} mapping_batch_records={} map_task_reads={} chunk_records={} zstd_level={} preserve_ids={} id_prefix_chars={:?} preserve_quality={}",
         layout,
         layout.streams(),
+        options.index_read_files.len(),
         mapping_threads,
         mapping_batch_records,
         MAP_TASK_READS,
@@ -757,12 +758,10 @@ fn compress_with_index<I2: AsRef<Path>>(
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let mut mask = ReferenceMask::new(index.reference_len());
     let mut id_detector = IdModeDetector::new(preserve_ids, layout);
-    let mut whitelist_builders = (0..options.embedded_index_ranges.len())
-        .map(|_| WhitelistBuilder::new())
-        .collect::<Vec<_>>();
     let mut profile = AlignedCompressionProfile::default();
     let input_1 = input_1.as_ref().to_path_buf();
     let input_2 = input_2.map(|path| path.as_ref().to_path_buf());
+    let index_files = options.index_read_files.clone();
     let mapper_options = options.clone();
     let (parse_tx, parse_rx) =
         crossbeam_channel::bounded::<Result<Vec<AlignedPair>>>(PIPELINE_BATCHES);
@@ -774,7 +773,15 @@ fn compress_with_index<I2: AsRef<Path>>(
         let producer_tx = parse_tx.clone();
         let producer_progress = progress.clone();
         let producer = scope.spawn(move || -> Result<()> {
-            let mut first = FastxReader::new(open_fastx_reader(input_1)?, Format::Fastq);
+            let mut readers: Vec<FastxReader<Box<dyn std::io::BufRead + Send>>> = Vec::new();
+            readers.push(FastxReader::new(open_fastx_reader(input_1)?, Format::Fastq));
+            if let Some(input_2) = input_2 {
+                readers.push(FastxReader::new(open_fastx_reader(input_2)?, Format::Fastq));
+            }
+            for path in &index_files {
+                readers.push(FastxReader::new(open_fastx_reader(path)?, Format::Fastq));
+            }
+            let biological_streams = layout.streams();
             let mut pairs = Vec::with_capacity(mapping_batch_records);
             let mut preview_identifier = mapper_options.id_prefix_chars.is_some();
             let mut prepare_identifier = |record: &mut ReadRecord| -> Result<()> {
@@ -791,79 +798,61 @@ fn compress_with_index<I2: AsRef<Path>>(
                 }
                 Ok(())
             };
-            if let Some(input_2) = input_2 {
-                let mut second = FastxReader::new(open_fastx_reader(input_2)?, Format::Fastq);
-                loop {
-                    match (first.next(), second.next()) {
-                        (None, None) => break,
-                        (Some(Ok(mut first)), Some(Ok(mut second))) => {
-                            first.validate(true)?;
-                            second.validate(true)?;
-                            prepare_identifier(&mut first)?;
-                            prepare_identifier(&mut second)?;
-                            if mapper_options.preserve_quality {
-                                apply_quality(&mut first, &mapper_options.quality_mode);
-                                apply_quality(&mut second, &mapper_options.quality_mode);
-                            }
-                            let indexes = split_pair_indexes(
-                                &mut first,
-                                Some(&mut second),
-                                &mapper_options.embedded_index_ranges,
-                                mapper_options.preserve_quality,
-                            )?;
-                            pairs.push(AlignedPair {
-                                first,
-                                second: Some(second),
-                                first_hit: None,
-                                second_hit: None,
-                                first_selection: AlignmentSelection::default(),
-                                second_selection: AlignmentSelection::default(),
-                                indexes,
-                            });
-                        }
-                        (None, Some(_)) | (Some(_), None) => {
-                            return Err(Error::InvalidInput(
-                                "paired streams have different record counts".into(),
-                            ));
-                        }
-                        (Some(Err(error)), _) | (_, Some(Err(error))) => return Err(error),
-                    }
-                    if pairs.len() == mapping_batch_records {
-                        producer_tx
-                            .send(Ok(std::mem::take(&mut pairs)))
-                            .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
-                        pairs = Vec::with_capacity(mapping_batch_records);
+            loop {
+                let next: Vec<Option<Result<ReadRecord>>> =
+                    readers.iter_mut().map(|reader| reader.next()).collect();
+                if next.iter().all(Option::is_none) {
+                    break;
+                }
+                let mut records = Vec::with_capacity(next.len());
+                for item in next {
+                    let Some(record) = item else {
+                        return Err(Error::InvalidInput(
+                            "input streams have different record counts".into(),
+                        ));
+                    };
+                    records.push(record?);
+                }
+                for record in records.iter().skip(biological_streams) {
+                    if record.id != records[0].id {
+                        return Err(Error::InvalidInput(
+                            "index read identifier does not match mate 1 identifier".into(),
+                        ));
                     }
                 }
-            } else {
-                for first in first {
-                    let mut first = first?;
-                    first.validate(true)?;
-                    prepare_identifier(&mut first)?;
+                for record in records.iter_mut() {
+                    record.validate(true)?;
+                    prepare_identifier(record)?;
                     if mapper_options.preserve_quality {
-                        apply_quality(&mut first, &mapper_options.quality_mode);
+                        apply_quality(record, &mapper_options.quality_mode);
                     }
-                    let indexes = split_pair_indexes(
-                        &mut first,
-                        None,
-                        &mapper_options.embedded_index_ranges,
-                        mapper_options.preserve_quality,
-                    )?;
-                    pairs.push(AlignedPair {
-                        first,
-                        second: None,
-                        first_hit: None,
-                        second_hit: None,
-                        first_selection: AlignmentSelection::default(),
-                        second_selection: AlignmentSelection::default(),
-                        indexes,
-                    });
-                    if pairs.len() == mapping_batch_records {
-                        producer_tx
-                            .send(Ok(std::mem::take(&mut pairs)))
-                            .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
-                        pairs = Vec::with_capacity(mapping_batch_records);
-                    }
+                }
+                let mut record_iter = records.into_iter();
+                let mut first = record_iter.next().expect("mate 1 stream is required");
+                let mut second = (biological_streams == 2)
+                    .then(|| record_iter.next().expect("mate 2 stream is required"));
+                let indexes = split_pair_indexes(
+                    &mut first,
+                    second.as_mut(),
+                    &mapper_options.embedded_index_ranges,
+                    mapper_options.preserve_quality,
+                )?;
+                let index_reads = record_iter.collect::<Vec<_>>();
+                pairs.push(AlignedPair {
+                    first,
+                    second,
+                    first_hit: None,
+                    second_hit: None,
+                    first_selection: AlignmentSelection::default(),
+                    second_selection: AlignmentSelection::default(),
+                    indexes,
+                    index_reads,
+                });
+                if pairs.len() == mapping_batch_records {
+                    producer_tx
+                        .send(Ok(std::mem::take(&mut pairs)))
+                        .map_err(|_| Error::InvalidInput("mapping worker exited".into()))?;
+                    pairs = Vec::with_capacity(mapping_batch_records);
                 }
             }
             if !pairs.is_empty() {
@@ -901,16 +890,6 @@ fn compress_with_index<I2: AsRef<Path>>(
         while let Ok(batch) = mapped_rx.recv() {
             let pairs = batch?;
             update_mapping_profile(&mut profile, &pairs);
-            for pair in &pairs {
-                if pair.indexes.len() != whitelist_builders.len() {
-                    return Err(Error::InvalidInput(
-                        "embedded index count changed during ingestion".into(),
-                    ));
-                }
-                for (builder, index) in whitelist_builders.iter_mut().zip(&pair.indexes) {
-                    builder.add(&index.sequence).map_err(index_encode_error)?;
-                }
-            }
             spool_mapped_pairs(&pairs, &mut id_detector, &mut mask, &mut spool_builder)?;
         }
         producer
@@ -927,21 +906,11 @@ fn compress_with_index<I2: AsRef<Path>>(
         .finish()
         .map_err(|error| Error::InvalidInput(error.to_string()))?;
     drop(spool_chunk);
-    let local_whitelists = whitelist_builders
-        .into_iter()
-        .map(|builder| builder.finish().map_err(index_encode_error))
-        .collect::<Result<Vec<_>>>()?;
-    let global_whitelist =
-        index_read::merge_whitelists(&local_whitelists).map_err(index_encode_error)?;
     let index_descriptors = options
         .embedded_index_ranges
         .iter()
         .cloned()
-        .zip(local_whitelists)
-        .map(|(range, local_whitelist)| IndexEncodingDescriptor {
-            range,
-            local_whitelist,
-        })
+        .map(|range| IndexDescriptor { range })
         .collect::<Vec<_>>();
     profile.map_and_spool = map_started.elapsed();
     profile.spool_bytes = std::fs::metadata(&spool_path)?.len();
@@ -979,9 +948,9 @@ fn compress_with_index<I2: AsRef<Path>>(
         profile.reference_compressed_bytes
     ));
     progress.finish_and_clear();
-    let index_metadata = encode_index_metadata(&index_descriptors, &global_whitelist)?;
+    let index_metadata = encode_index_metadata(&index_descriptors)?;
     let mut archive = File::create(output)?;
-    let header_size = 9 + 4 + 2 + 2 + 8 * 3;
+    let header_size = 9 + 4 + 2 + 1 + 2 + 8 * 3;
     archive.write_all(MAGIC)?;
     write_u32(&mut archive, VERSION)?;
     let mut flags = 0u16;
@@ -996,6 +965,7 @@ fn compress_with_index<I2: AsRef<Path>>(
     }
     flags |= (id_mode as u16) << 3;
     write_u16(&mut archive, flags)?;
+    archive.write_all(&[options.index_read_files.len() as u8])?;
     archive.write_all(&[absolute_position_width as u8, delta_position_width as u8])?;
     write_u64(&mut archive, reference_block.block.len() as u64)?;
     write_u64(&mut archive, index_metadata.len() as u64)?;
@@ -1025,7 +995,6 @@ fn compress_with_index<I2: AsRef<Path>>(
         crossbeam_channel::bounded::<Result<(usize, EncodedChunk)>>(worker_count);
     let reference_for_workers = compact_reference.as_slice();
     let index_descriptors_for_workers = index_descriptors.as_slice();
-    let global_whitelist_for_workers = &global_whitelist;
     std::thread::scope(|scope| -> Result<()> {
         let dispatcher = scope.spawn({
             let job_tx = job_tx.clone();
@@ -1072,7 +1041,6 @@ fn compress_with_index<I2: AsRef<Path>>(
                             id_mode,
                             layout,
                             index_descriptors_for_workers,
-                            global_whitelist_for_workers,
                         )
                         .map(|chunk| (index, chunk))
                     });
@@ -1099,6 +1067,8 @@ fn compress_with_index<I2: AsRef<Path>>(
                 profile.ids_compressed_bytes += chunk.ids_compressed_len;
                 profile.qualities_compressed_bytes += chunk.qualities_compressed_len;
                 profile.records_compressed_bytes += chunk.records_compressed_len;
+                profile.indexes_raw_bytes += chunk.indexes_raw_len;
+                profile.indexes_compressed_bytes += chunk.indexes_compressed_len;
                 profile.chunks_compressed_bytes += chunk.compressed.len() as u64;
                 replay_pair_count += chunk.pairs as u64;
                 write_encoded_chunk(&mut archive, chunk)?;
@@ -1141,8 +1111,6 @@ fn compress_with_index<I2: AsRef<Path>>(
     archive.flush()?;
     profile.archive_bytes = end;
     profile.records = replay_pair_count;
-    profile.indexes_raw_bytes = 0;
-    profile.indexes_compressed_bytes = 0;
     stage_log(
         &progress,
         format!(
@@ -1179,14 +1147,24 @@ pub(crate) fn decompress_paired<R: Read>(
         ));
     }
     let mut streams = vec![Vec::new(), Vec::new()];
+    for _ in 0..records.index_streams() {
+        streams.push(Vec::new());
+    }
     for record in records {
         let (_, group) = record?;
-        match group {
-            AlignedRecordGroup::Paired(first, second) => {
+        let AlignedRecordGroup {
+            sequence,
+            index_reads,
+        } = group;
+        match sequence {
+            SequenceRecordGroup::Paired(first, second) => {
                 streams[0].push(first);
                 streams[1].push(second);
             }
-            AlignedRecordGroup::Single(_) => unreachable!(),
+            SequenceRecordGroup::Single(_) => unreachable!(),
+        }
+        for (stream, index_read) in streams.iter_mut().skip(2).zip(index_reads) {
+            stream.push(index_read);
         }
     }
     Ok(ArchiveRecords { streams })
@@ -1203,16 +1181,24 @@ pub(crate) fn decompress_single<R: Read>(
         ));
     }
     let mut stream = Vec::new();
+    let mut index_streams = vec![Vec::new(); records.index_streams()];
     for record in records {
         let (_, group) = record?;
-        match group {
-            AlignedRecordGroup::Single(record) => stream.push(record),
-            AlignedRecordGroup::Paired(_, _) => unreachable!(),
+        let AlignedRecordGroup {
+            sequence,
+            index_reads,
+        } = group;
+        match sequence {
+            SequenceRecordGroup::Single(record) => stream.push(record),
+            SequenceRecordGroup::Paired(_, _) => unreachable!(),
+        }
+        for (stream, index_read) in index_streams.iter_mut().zip(index_reads) {
+            stream.push(index_read);
         }
     }
-    Ok(ArchiveRecords {
-        streams: vec![stream],
-    })
+    let mut streams = vec![stream];
+    streams.extend(index_streams);
+    Ok(ArchiveRecords { streams })
 }
 
 pub(crate) fn decompress_paired_into<R: Read, S: PairedRecordSink>(
@@ -1229,12 +1215,12 @@ pub(crate) fn decompress_paired_into<R: Read, S: PairedRecordSink>(
     let mut pairs = 0;
     for record in records {
         let (original_id, group) = record?;
-        match group {
-            AlignedRecordGroup::Paired(first, second) => {
+        match group.sequence {
+            SequenceRecordGroup::Paired(first, second) => {
                 sink.write_pair(original_id, first, second)?;
                 pairs += 1;
             }
-            AlignedRecordGroup::Single(_) => unreachable!(),
+            SequenceRecordGroup::Single(_) => unreachable!(),
         }
     }
     sink.finish()?;
@@ -1252,6 +1238,7 @@ pub(crate) fn decompress_into<R: Read, S: AlignedRecordSink>(
 ) -> Result<AlignedDecompressionMetadata> {
     let decoded = decompress_iter(input, options)?;
     let layout = decoded.layout();
+    let index_streams = decoded.index_streams();
     let mut records = 0;
     for record in decoded {
         let (original_id, group) = record?;
@@ -1262,6 +1249,7 @@ pub(crate) fn decompress_into<R: Read, S: AlignedRecordSink>(
     Ok(AlignedDecompressionMetadata {
         layout,
         streams: layout.streams(),
+        index_streams,
         records,
         output_order: crate::OutputOrder::Original,
     })
@@ -1295,9 +1283,9 @@ pub(crate) fn decompress_iter<R: Read>(
         layout: header.layout,
         preserve_quality: header.flags & 2 != 0,
         indexes: Arc::new(header.indexes),
-        global_whitelist: Arc::new(header.global_whitelist),
         absolute_position_width: header.absolute_position_width,
         delta_position_width: header.delta_position_width,
+        index_streams: header.index_streams,
         original_range: options.original_range.clone(),
         total_chunks: header.chunk_count,
         decoded_chunks: 0,
@@ -1327,6 +1315,10 @@ impl<R: Read> AlignedRecordIter<R> {
 
     pub fn streams(&self) -> usize {
         self.layout.streams()
+    }
+
+    pub fn index_streams(&self) -> usize {
+        self.index_streams
     }
 
     pub fn total_chunks(&self) -> u64 {
@@ -1405,9 +1397,9 @@ impl<R: Read> AlignedRecordIter<R> {
                 let layout = self.layout;
                 let preserve_quality = self.preserve_quality;
                 let indexes = Arc::clone(&self.indexes);
-                let global_whitelist = Arc::clone(&self.global_whitelist);
                 let absolute_position_width = self.absolute_position_width;
                 let delta_position_width = self.delta_position_width;
+                let index_streams = self.index_streams;
                 pool.spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         decode_archive_chunk(
@@ -1417,9 +1409,9 @@ impl<R: Read> AlignedRecordIter<R> {
                             preserve_quality,
                             &reference,
                             &indexes,
-                            &global_whitelist,
                             absolute_position_width,
                             delta_position_width,
+                            index_streams,
                         )
                     }))
                     .unwrap_or_else(|_| Err(Error::InvalidInput("chunk decoder panicked".into())));
@@ -1433,9 +1425,9 @@ impl<R: Read> AlignedRecordIter<R> {
                     self.preserve_quality,
                     &self.reference,
                     &self.indexes,
-                    &self.global_whitelist,
                     self.absolute_position_width,
                     self.delta_position_width,
+                    self.index_streams,
                 );
                 if result.is_ok() {
                     self.decoded_chunks += 1;
@@ -1529,15 +1521,27 @@ impl DecodedArchiveChunk {
             if range.is_some_and(|range| !range.contains(&original_id)) {
                 continue;
             }
+            let id = std::mem::take(&mut self.ids[0][index]);
+            let index_reads = self
+                .index_reads
+                .iter_mut()
+                .map(|stream| {
+                    ReadRecord::new(
+                        id.clone(),
+                        std::mem::take(&mut stream.sequences[index]),
+                        stream.qualities[index].take(),
+                    )
+                })
+                .collect();
             let first = ReadRecord::new(
-                std::mem::take(&mut self.ids[0][index]),
+                id,
                 std::mem::take(&mut self.sequences[0][index]),
                 self.qualities[0][index].take(),
             );
-            let group = if layout == AlignmentLayout::SingleEnd {
-                AlignedRecordGroup::Single(first)
+            let sequence = if layout == AlignmentLayout::SingleEnd {
+                SequenceRecordGroup::Single(first)
             } else {
-                AlignedRecordGroup::Paired(
+                SequenceRecordGroup::Paired(
                     first,
                     ReadRecord::new(
                         std::mem::take(&mut self.ids[1][index]),
@@ -1546,7 +1550,13 @@ impl DecodedArchiveChunk {
                     ),
                 )
             };
-            return Some((original_id, group));
+            return Some((
+                original_id,
+                AlignedRecordGroup {
+                    sequence,
+                    index_reads,
+                },
+            ));
         }
         None
     }
@@ -1616,6 +1626,7 @@ fn read_encoded_archive_chunk<R: Read>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_archive_chunk(
     encoded: EncodedArchiveChunk,
     id_mode: IdMode,
@@ -1623,9 +1634,9 @@ fn decode_archive_chunk(
     preserve_quality: bool,
     reference: &[u8],
     index_descriptors: &[IndexDescriptor],
-    global_whitelist: &Whitelist,
     absolute_position_width: usize,
     delta_position_width: usize,
+    index_stream_count: usize,
 ) -> Result<DecodedArchiveChunk> {
     let raw = decode_chunk_sections(
         &encoded.compressed,
@@ -1652,21 +1663,37 @@ fn decode_archive_chunk(
         preserve_quality,
         layout,
     )?;
-    let sequences = decode_v21_records(
-        &raw[qualities_end..records_end],
-        encoded.record_count,
-        reference,
-        layout,
-        index_descriptors,
-        global_whitelist,
-        absolute_position_width,
-        delta_position_width,
-    )?;
+    let (sequences, index_reads) = {
+        let sections = decode_v21_records(
+            &raw[qualities_end..records_end],
+            encoded.record_count,
+            reference,
+            layout,
+            index_descriptors,
+            preserve_quality,
+            index_stream_count,
+            absolute_position_width,
+            delta_position_width,
+        )?;
+        (sections.biological, sections.index_streams)
+    };
     for mate in 0..layout.streams() {
         for record in 0..encoded.record_count {
             if qualities[mate][record]
                 .as_ref()
                 .is_some_and(|quality| quality.len() != sequences[mate][record].len())
+            {
+                return Err(Error::InvalidFormat(
+                    "reconstructed sequence and quality lengths differ".into(),
+                ));
+            }
+        }
+    }
+    for stream in &index_reads {
+        for record in 0..encoded.record_count {
+            if stream.qualities[record]
+                .as_ref()
+                .is_some_and(|quality| quality.len() != stream.sequences[record].len())
             {
                 return Err(Error::InvalidFormat(
                     "reconstructed sequence and quality lengths differ".into(),
@@ -1680,6 +1707,7 @@ fn decode_archive_chunk(
         ids: decode_ids(&raw[..ids_end], encoded.record_count, id_mode, layout)?,
         qualities,
         sequences,
+        index_reads,
     })
 }
 
@@ -1819,6 +1847,14 @@ impl SpoolPair {
                 .map(|record| SpoolRead::from_record(record, pair.second_hit.clone()))
                 .transpose()?,
             indexes: pair.indexes.clone(),
+            index_reads: pair
+                .index_reads
+                .iter()
+                .map(|record| SpoolIndexRead {
+                    sequence: record.sequence.clone(),
+                    quality: record.quality.clone(),
+                })
+                .collect::<Vec<_>>(),
         })
     }
 
@@ -1839,6 +1875,13 @@ impl SpoolPair {
             first_selection: AlignmentSelection::default(),
             second_selection: AlignmentSelection::default(),
             indexes: self.indexes,
+            index_reads: self
+                .index_reads
+                .iter()
+                .map(|index| {
+                    Ok(ReadRecord::new(Vec::new(), index.sequence.clone(), index.quality.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 }
@@ -1945,6 +1988,7 @@ impl SpoolAlignment {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_chunk(
     reference: &[u8],
     pairs: &[AlignedPair],
@@ -1953,29 +1997,31 @@ fn encode_chunk(
     options: &crate::AlignmentCompressionOptions,
     id_mode: IdMode,
     layout: AlignmentLayout,
-    index_descriptors: &[IndexEncodingDescriptor],
-    global_whitelist: &Whitelist,
+    index_descriptors: &[IndexDescriptor],
 ) -> Result<EncodedChunk> {
     let mut ids = Vec::new();
     write_id_stream(&mut ids, pairs, id_mode, layout)?;
     let mut qualities = Vec::new();
     write_quality_stream(&mut qualities, pairs, index_descriptors, options, layout)?;
-    let records = write_v21_record_stream(
+    let records_stream = write_v21_record_stream(
         reference,
         pairs,
         absolute_position_width,
         delta_position_width,
         layout,
         index_descriptors,
-        global_whitelist,
+        options.preserve_quality,
+        options.index_read_files.len(),
         options.zstd_level,
     )?;
     let ids_compressed = zstd::stream::encode_all(Cursor::new(&ids), options.zstd_level)?;
     let qualities_compressed =
         zstd::stream::encode_all(Cursor::new(&qualities), options.zstd_level)?;
     // `records` already contains independently compressed subsection frames.
-    let records_len = records.len() as u64;
-    let records_compressed = records;
+    let records_len = records_stream.bytes.len() as u64;
+    let records_compressed = records_stream.bytes;
+    let indexes_raw_len = records_stream.indexes_raw_len;
+    let indexes_compressed_len = records_stream.indexes_compressed_len;
     let mut compressed = Vec::with_capacity(
         24 + ids_compressed.len() + qualities_compressed.len() + records_compressed.len(),
     );
@@ -1995,6 +2041,8 @@ fn encode_chunk(
         ids_compressed_len: ids_compressed.len() as u64,
         qualities_compressed_len: qualities_compressed.len() as u64,
         records_compressed_len: records_compressed.len() as u64,
+        indexes_raw_len,
+        indexes_compressed_len,
         compressed,
     })
 }
@@ -2058,7 +2106,7 @@ where
 fn write_quality_stream(
     output: &mut Vec<u8>,
     pairs: &[AlignedPair],
-    descriptors: &[IndexEncodingDescriptor],
+    descriptors: &[IndexDescriptor],
     options: &crate::AlignmentCompressionOptions,
     layout: AlignmentLayout,
 ) -> Result<()> {
@@ -2082,7 +2130,7 @@ fn write_quality_stream(
 fn reconstruct_quality_row(
     pair: &AlignedPair,
     mate: usize,
-    descriptors: &[IndexEncodingDescriptor],
+    descriptors: &[IndexDescriptor],
 ) -> Result<Vec<u8>> {
     if pair.indexes.len() != descriptors.len() {
         return Err(Error::InvalidInput(
@@ -2139,16 +2187,18 @@ fn reconstruct_quality_row(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
     reference: &R,
     pairs: &[AlignedPair],
     absolute_position_width: usize,
     delta_position_width: usize,
     layout: AlignmentLayout,
-    descriptors: &[IndexEncodingDescriptor],
-    _global_whitelist: &Whitelist,
+    descriptors: &[IndexDescriptor],
+    preserve_quality: bool,
+    index_stream_count: usize,
     zstd_level: i32,
-) -> Result<Vec<u8>> {
+) -> Result<EncodedRecordStream> {
     let mut flags = Vec::with_capacity(pairs.len());
     for pair in pairs {
         flags.push(match layout {
@@ -2201,12 +2251,8 @@ fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
                     let first = pair.first_hit.as_ref().ok_or_else(|| {
                         Error::InvalidInput("paired R2 alignment is missing R1 alignment".into())
                     })?;
-                    let first_start = i64::try_from(first.start).map_err(|_| {
-                        Error::InvalidInput("R1 alignment position exceeds signed range".into())
-                    })?;
-                    let second_start = i64::try_from(hit.start).map_err(|_| {
-                        Error::InvalidInput("R2 alignment position exceeds signed range".into())
-                    })?;
+                    let first_start = first.start;
+                    let second_start = hit.start;
                     let delta = second_start.checked_sub(first_start).ok_or_else(|| {
                         Error::InvalidInput("R2 relative alignment position overflow".into())
                     })?;
@@ -2261,20 +2307,73 @@ fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
         }
         sections.push(section);
     }
+    if pairs
+        .iter()
+        .any(|pair| pair.index_stream_count() != index_stream_count)
+    {
+        return Err(Error::InvalidInput(
+            "index read count changed during compression".into(),
+        ));
+    }
+    for stream in 0..index_stream_count {
+        let mut quality_stream = Vec::new();
+        if preserve_quality {
+            let values = pairs
+                .iter()
+                .map(|pair| {
+                    let index = pair
+                        .index_read(stream)
+                        .ok_or_else(|| Error::InvalidInput("index read is missing".into()))?;
+                    index.quality.as_deref().ok_or_else(|| {
+                        Error::InvalidInput("index read quality is missing".into())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            quality_stream = encode_stream_bytes(&values)?;
+        }
+        sections.push(quality_stream);
+        let mut lengths = Vec::with_capacity(pairs.len() * 2);
+        let mut sequences = Vec::new();
+        for pair in pairs {
+            let index = pair
+                .index_read(stream)
+                .ok_or_else(|| Error::InvalidInput("index read is missing".into()))?;
+            write_u16(
+                &mut lengths,
+                u16::try_from(index.sequence.len()).map_err(|_| {
+                    Error::InvalidInput("index read length exceeds u16 capacity".into())
+                })?,
+            )?;
+            sequences.extend_from_slice(&index.sequence);
+        }
+        sections.push(lengths);
+        sections.push(sequences);
+    }
 
+    let index_start = 1 + layout.streams() * V21_MATE_SECTION_COUNT + descriptors.len();
     let mut output = Vec::new();
     write_u32(
         &mut output,
         u32::try_from(sections.len())
             .map_err(|_| Error::InvalidInput("too many record sections".into()))?,
     )?;
-    for section in sections {
-        let compressed = zstd::stream::encode_all(Cursor::new(&section), zstd_level)?;
+    let mut indexes_raw_len = 0u64;
+    let mut indexes_compressed_len = 0u64;
+    for (section_index, section) in sections.iter().enumerate() {
+        let compressed = zstd::stream::encode_all(Cursor::new(section), zstd_level)?;
+        if section_index >= index_start {
+            indexes_raw_len += section.len() as u64;
+            indexes_compressed_len += compressed.len() as u64;
+        }
         write_u64(&mut output, compressed.len() as u64)?;
         write_u64(&mut output, section.len() as u64)?;
         output.extend(compressed);
     }
-    Ok(output)
+    Ok(EncodedRecordStream {
+        bytes: output,
+        indexes_raw_len,
+        indexes_compressed_len,
+    })
 }
 
 fn collect_v21_aligned_fields<R: ReferenceBases + ?Sized>(
@@ -2439,148 +2538,14 @@ fn substitution_base(reference: u8, symbol: u8) -> Result<u8> {
         .ok_or_else(|| Error::InvalidFormat("invalid substitution symbol".into()))
 }
 
-#[cfg(test)]
-fn write_record_stream<R: ReferenceBases + ?Sized>(
-    reference: &R,
-    pairs: &[AlignedPair],
-    layout: AlignmentLayout,
-    descriptors: &[IndexEncodingDescriptor],
-    global_whitelist: &Whitelist,
-) -> Result<Vec<u8>> {
-    if global_whitelist.len() > u16::MAX as usize + 1 {
-        return Err(Error::InvalidInput(
-            "global whitelist exceeds u16 ordinal capacity".into(),
-        ));
-    }
-    let mut output = Vec::new();
-    let mut starts = [0i64; 2];
-    for mate in 0..layout.streams() {
-        let bitmap_len = pairs.len().div_ceil(8);
-        let mut mapped_bitmap = vec![0; bitmap_len];
-        let mut reverse_bitmap = vec![0; bitmap_len];
-        let mut positions = Vec::new();
-        let mut programs = Vec::new();
-        let mut raw_bits = BitWriter::default();
-        let mut mismatch_bits = BitWriter::default();
-        let mut ordinals = Vec::new();
-        let mut mismatch_details = Vec::new();
-        let mut literals = Vec::new();
-        for (index, pair) in pairs.iter().enumerate() {
-            let record = pair.record(mate);
-            let hit = pair.hit(mate);
-            if let Some(hit) = hit {
-                mapped_bitmap[index / 8] |= 1 << (index % 8);
-                let encoded_reverse = if mate == 1 {
-                    pair.first_hit
-                        .as_ref()
-                        .map_or(hit.is_reverse, |first| hit.is_reverse ^ first.is_reverse)
-                } else {
-                    hit.is_reverse
-                };
-                if encoded_reverse {
-                    reverse_bitmap[index / 8] |= 1 << (index % 8);
-                }
-                let base = if mate == 1 {
-                    pair.first_hit
-                        .as_ref()
-                        .map_or(starts[mate], |first| first.start)
-                } else {
-                    starts[mate]
-                };
-                let delta = hit
-                    .start
-                    .checked_sub(base)
-                    .ok_or_else(|| Error::InvalidInput("alignment offset overflow".into()))?;
-                write_varint(&mut positions, zigzag_encode(delta))?;
-                starts[mate] = hit.start;
-                let core = archive_normalize(effective_cigar(hit, record.sequence.len())?)?;
-                let runs = insert_whitelist_runs(
-                    core,
-                    descriptor_boundaries(
-                        descriptors,
-                        mate,
-                        record.sequence.len(),
-                        hit.is_reverse,
-                    )?,
-                    record.sequence.len(),
-                )?;
-                encode_record_columns(
-                    &mut programs,
-                    &mut raw_bits,
-                    &mut mismatch_bits,
-                    &mut ordinals,
-                    &mut mismatch_details,
-                    &mut literals,
-                    &record.sequence,
-                    Some((hit, reference)),
-                    &runs,
-                    &pair.indexes,
-                    descriptors,
-                    global_whitelist,
-                )?;
-            } else {
-                let runs = insert_whitelist_runs(
-                    vec![ArchiveRun {
-                        op: ArchiveOp::Literal,
-                        len: record.sequence.len(),
-                        descriptors: Vec::new(),
-                    }],
-                    descriptor_boundaries(descriptors, mate, record.sequence.len(), false)?,
-                    record.sequence.len(),
-                )?;
-                encode_record_columns(
-                    &mut programs,
-                    &mut raw_bits,
-                    &mut mismatch_bits,
-                    &mut ordinals,
-                    &mut mismatch_details,
-                    &mut literals,
-                    &record.sequence,
-                    None::<(&GenomeAlignment, &R)>,
-                    &runs,
-                    &pair.indexes,
-                    descriptors,
-                    global_whitelist,
-                )?;
-            }
-        }
-        output.extend(mapped_bitmap);
-        output.extend(reverse_bitmap);
-        write_u64(&mut output, positions.len() as u64)?;
-        output.extend(positions);
-        write_u64(&mut output, programs.len() as u64)?;
-        write_u64(&mut output, raw_bits.len() as u64)?;
-        write_u64(&mut output, raw_bits.bytes.len() as u64)?;
-        write_u64(&mut output, mismatch_bits.len() as u64)?;
-        write_u64(&mut output, mismatch_bits.bytes.len() as u64)?;
-        write_u64(&mut output, ordinals.len() as u64)?;
-        write_u64(&mut output, mismatch_details.len() as u64)?;
-        write_u64(&mut output, literals.len() as u64)?;
-        output.extend(programs);
-        output.extend(raw_bits.finish());
-        output.extend(mismatch_bits.finish());
-        output.extend(ordinals);
-        output.extend(mismatch_details);
-        output.extend(literals);
-    }
-    Ok(output)
-}
 
 fn encode_record_columns<R: ReferenceBases + ?Sized>(
     programs: &mut Vec<u8>,
-    raw_bits: &mut BitWriter,
-    mismatch_bits: &mut BitWriter,
-    ordinals: &mut Vec<u8>,
-    mismatch_details: &mut Vec<u8>,
     literals: &mut Vec<u8>,
     sequence: &[u8],
     mapped: Option<(&GenomeAlignment, &R)>,
     runs: &[ArchiveRun],
-    indexes: &[SpoolIndexRead],
-    descriptors: &[IndexEncodingDescriptor],
-    global_whitelist: &Whitelist,
 ) -> Result<()> {
-    let mut classifications = Vec::new();
     let mut oriented = sequence.to_vec();
     let (mut ref_pos, reverse) = if let Some((hit, _)) = mapped {
         (
@@ -2604,15 +2569,7 @@ fn encode_record_columns<R: ReferenceBases + ?Sized>(
     }
     let mut query_pos = 0usize;
     for run in runs {
-        if run.op == ArchiveOp::Whitelist {
-            if run.len != 0 || run.descriptors.is_empty() {
-                return Err(Error::InvalidInput(
-                    "whitelist operation has invalid descriptors".into(),
-                ));
-            }
-            continue;
-        }
-        if run.len == 0 || !run.descriptors.is_empty() {
+        if run.len == 0 {
             return Err(Error::InvalidInput("invalid archive operation run".into()));
         }
         write_varint(programs, run.len as u64)?;
@@ -2658,7 +2615,6 @@ fn encode_record_columns<R: ReferenceBases + ?Sized>(
                     ));
                 }
             }
-            ArchiveOp::Whitelist => unreachable!(),
         }
     }
     if query_pos != oriented.len() {
@@ -2695,91 +2651,10 @@ fn encode_record_columns<R: ReferenceBases + ?Sized>(
             }
             ArchiveOp::Literal => query_pos += run.len,
             ArchiveOp::RefAdvance => ref_pos += run.len,
-            ArchiveOp::Whitelist => {}
         }
     }
 
-    for run in runs.iter().filter(|run| run.op == ArchiveOp::Whitelist) {
-        for &descriptor_index in &run.descriptors {
-            let descriptor = descriptors.get(descriptor_index).ok_or_else(|| {
-                Error::InvalidInput("whitelist descriptor is out of bounds".into())
-            })?;
-            let index = indexes
-                .get(descriptor_index)
-                .ok_or_else(|| Error::InvalidInput("embedded index fragment is missing".into()))?;
-            if index.sequence.len() != descriptor.range.len() {
-                return Err(Error::InvalidInput(
-                    "embedded index sequence length does not match its range".into(),
-                ));
-            }
-            let classification = index_read::classify_with_global(
-                &index.sequence,
-                &descriptor.local_whitelist,
-                global_whitelist,
-            )
-            .map_err(index_encode_error)?;
-            let classification = if descriptor.range.len() > 64
-                && matches!(classification, IndexReadEncoding::OneMismatch { .. })
-            {
-                IndexReadEncoding::CanonicalRaw
-            } else {
-                classification
-            };
-            classifications.push((descriptor_index, classification));
-        }
-    }
-    for (_, classification) in &classifications {
-        raw_bits.write(
-            usize::from(matches!(
-                classification,
-                IndexReadEncoding::CanonicalRaw | IndexReadEncoding::ExceptionalRaw
-            )),
-            1,
-        )?;
-    }
-    for &(descriptor_index, ref classification) in &classifications {
-        let descriptor = &descriptors[descriptor_index];
-        match *classification {
-            IndexReadEncoding::Exact { global_ordinal } => {
-                let ordinal = u16::try_from(global_ordinal)
-                    .map_err(|_| Error::InvalidInput("whitelist ordinal exceeds u16".into()))?;
-                mismatch_bits.write(0, 1)?;
-                ordinals.extend_from_slice(&ordinal.to_le_bytes());
-            }
-            IndexReadEncoding::OneMismatch {
-                global_ordinal,
-                position,
-                original,
-            } => {
-                let selected = global_whitelist.sequence(global_ordinal).ok_or_else(|| {
-                    Error::InvalidInput("whitelist ordinal is out of bounds".into())
-                })?;
-                if descriptor.range.len() > 64
-                    || selected.len() != descriptor.range.len()
-                    || position >= selected.len()
-                {
-                    return Err(Error::InvalidInput(
-                        "whitelist mismatch does not match descriptor".into(),
-                    ));
-                }
-                let original = canonical_bits(original)?;
-                if original == canonical_bits(selected[position])? {
-                    return Err(Error::InvalidInput(
-                        "whitelist replacement does not differ".into(),
-                    ));
-                }
-                let ordinal = u16::try_from(global_ordinal)
-                    .map_err(|_| Error::InvalidInput("whitelist ordinal exceeds u16".into()))?;
-                mismatch_bits.write(1, 1)?;
-                ordinals.extend_from_slice(&ordinal.to_le_bytes());
-                mismatch_details.push(((position as u8) << 2) | original);
-            }
-            IndexReadEncoding::CanonicalRaw | IndexReadEncoding::ExceptionalRaw => {}
-        }
-    }
-
-    let mut classification_index = 0;
-    let mut query_pos = 0;
+    let mut query_pos = 0usize;
     for run in runs {
         match run.op {
             ArchiveOp::Match => {
@@ -2791,31 +2666,7 @@ fn encode_record_columns<R: ReferenceBases + ?Sized>(
                 query_pos = end;
             }
             ArchiveOp::RefAdvance => {}
-            ArchiveOp::Whitelist => {
-                for &descriptor_index in &run.descriptors {
-                    let (_, classification) =
-                        classifications.get(classification_index).ok_or_else(|| {
-                            Error::InvalidInput("missing whitelist classification".into())
-                        })?;
-                    classification_index += 1;
-                    if matches!(
-                        classification,
-                        IndexReadEncoding::CanonicalRaw | IndexReadEncoding::ExceptionalRaw
-                    ) {
-                        let mut fragment = indexes[descriptor_index].sequence.clone();
-                        if reverse {
-                            reverse_complement(&mut fragment);
-                        }
-                        literals.extend(fragment);
-                    }
-                }
-            }
         }
-    }
-    if classification_index != classifications.len() {
-        return Err(Error::InvalidInput(
-            "literal source consumption mismatch".into(),
-        ));
     }
     Ok(())
 }
@@ -2826,25 +2677,13 @@ fn alignment_candidate_core_cost<R: ReferenceBases + ?Sized>(
     runs: &[ArchiveRun],
 ) -> Result<usize> {
     let mut programs = Vec::new();
-    let mut raw_bits = BitWriter::default();
-    let mut mismatch_bits = BitWriter::default();
-    let mut ordinals = Vec::new();
-    let mut mismatch_details = Vec::new();
     let mut literals = Vec::new();
-    let empty_whitelist = index_read::merge_whitelists(&[]).map_err(index_encode_error)?;
     encode_record_columns(
         &mut programs,
-        &mut raw_bits,
-        &mut mismatch_bits,
-        &mut ordinals,
-        &mut mismatch_details,
         &mut literals,
         sequence,
         mapped,
         runs,
-        &[],
-        &[],
-        &empty_whitelist,
     )?;
     Ok(programs.len() + literals.len())
 }
@@ -2860,7 +2699,6 @@ fn alignment_candidate_cost<R: ReferenceBases + ?Sized>(
         vec![ArchiveRun {
             op: ArchiveOp::Literal,
             len: record.sequence.len(),
-            descriptors: Vec::new(),
         }]
     };
     alignment_candidate_core_cost(
@@ -2879,306 +2717,19 @@ fn select_alignment<R: ReferenceBases + ?Sized>(
     aligners::select_minibwa_alignment(record, hits, reference, &alignment_candidate_cost)
 }
 
-#[cfg(test)]
-fn encode_record_body<R: ReferenceBases + ?Sized>(
-    output: &mut Vec<u8>,
-    record: &ReadRecord,
-    hit: &GenomeAlignment,
-    reference: &R,
-) -> Result<()> {
-    let runs = archive_normalize(effective_cigar(hit, record.sequence.len())?)?;
-    let empty_whitelist = index_read::merge_whitelists(&[]).map_err(index_encode_error)?;
-    encode_operation_body(
-        output,
-        &record.sequence,
-        Some((hit, reference)),
-        &runs,
-        &[],
-        &[],
-        &empty_whitelist,
-    )
-}
 
-#[cfg(test)]
-enum WhitelistFragment {
-    Raw(usize),
-    Bases(Vec<u8>),
-}
-
-#[cfg(test)]
-struct RecordProgram {
-    runs: Vec<ArchiveRun>,
-    matched: Vec<Option<Vec<u8>>>,
-    reduced_len: usize,
-    reverse: bool,
-    whitelist_positions: Vec<usize>,
-    group_sizes: Vec<usize>,
-    descriptor_groups: Vec<Vec<usize>>,
-    fragments: Vec<(usize, WhitelistFragment)>,
-}
-
-#[cfg(test)]
-fn decode_record_program(
-    input: &mut Cursor<Vec<u8>>,
-    mapped: Option<(&[u8], usize, bool)>,
-) -> Result<RecordProgram> {
-    let count = usize_from(read_varint(input)?, "archive operation count")?;
-    let packed_len = count.div_ceil(4);
-    let mut packed = vec![0; packed_len];
-    input.read_exact(&mut packed)?;
-    if count % 4 != 0 {
-        let padding_bits = (4 - count % 4) * 2;
-        if packed.last().copied().unwrap_or(0) & ((1 << padding_bits) - 1) != 0 {
-            return Err(Error::InvalidFormat(
-                "nonzero archive operation padding bits".into(),
-            ));
-        }
-    }
-    let mut runs = Vec::with_capacity(count);
-    for index in 0..count {
-        let op = ArchiveOp::from_code((packed[index / 4] >> (6 - index % 4 * 2)) & 3)?;
-        let len = if op == ArchiveOp::Whitelist {
-            0
-        } else {
-            let len = usize_from(read_varint(input)?, "archive operation length")?;
-            if len == 0 {
-                return Err(Error::InvalidFormat("zero-length archive operation".into()));
-            }
-            len
-        };
-        runs.push(ArchiveRun {
-            op,
-            len,
-            descriptors: Vec::new(),
-        });
-    }
-    if mapped.is_none()
-        && runs
-            .iter()
-            .any(|run| matches!(run.op, ArchiveOp::Match | ArchiveOp::RefAdvance))
-    {
-        return Err(Error::InvalidFormat(
-            "unmapped body contains mapped operations".into(),
-        ));
-    }
-    let (mut ref_pos, reverse) = mapped.map_or((0, false), |(_, start, reverse)| (start, reverse));
-    let mut reduced_len = 0usize;
-    let mut matched = (0..runs.len()).map(|_| None).collect::<Vec<_>>();
-    let mut whitelist_positions = Vec::new();
-    let mut group_sizes = Vec::new();
-    for (run_index, run) in runs.iter().enumerate() {
-        match run.op {
-            ArchiveOp::Match => {
-                let reference = mapped.unwrap().0;
-                let end = ref_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidFormat("reference position overflow".into()))?;
-                if end > reference.len() {
-                    return Err(Error::InvalidFormat(
-                        "archive operation exceeds reference".into(),
-                    ));
-                }
-                let mut bases = reference[ref_pos..end].to_vec();
-                let mismatch_count = usize_from(read_varint(input)?, "mismatch count")?;
-                let mut previous: usize = 0;
-                for mismatch in 0..mismatch_count {
-                    let position = previous
-                        .checked_add(usize_from(read_varint(input)?, "mismatch position")?)
-                        .ok_or_else(|| Error::InvalidFormat("mismatch position overflow".into()))?;
-                    if position >= run.len || (mismatch != 0 && position <= previous) {
-                        return Err(Error::InvalidFormat(
-                            "mismatch position out of bounds".into(),
-                        ));
-                    }
-                    bases[position] = read_u8(input)?;
-                    previous = position;
-                }
-                ref_pos = end;
-                reduced_len = reduced_len
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidFormat("reduced query length overflow".into()))?;
-                matched[run_index] = Some(bases);
-            }
-            ArchiveOp::Literal => {
-                reduced_len = reduced_len
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidFormat("reduced query length overflow".into()))?;
-            }
-            ArchiveOp::RefAdvance => {
-                ref_pos = ref_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidFormat("reference position overflow".into()))?;
-                if ref_pos > mapped.unwrap().0.len() {
-                    return Err(Error::InvalidFormat(
-                        "archive operation exceeds reference".into(),
-                    ));
-                }
-            }
-            ArchiveOp::Whitelist => {
-                whitelist_positions.push(reduced_len);
-                group_sizes.push(0);
-            }
-        }
-    }
-    if let Some((reference, _, _)) = mapped {
-        let _ = reference;
-    }
-    Ok(RecordProgram {
-        runs,
-        matched,
-        reduced_len,
-        reverse,
-        whitelist_positions,
-        group_sizes,
-        descriptor_groups: Vec::new(),
-        fragments: Vec::new(),
-    })
-}
-
-#[cfg(test)]
-fn expected_whitelist_groups(
-    reduced_len: usize,
-    descriptors: &[IndexDescriptor],
-    mate: usize,
-    reverse: bool,
-) -> Result<Vec<(usize, Vec<usize>)>> {
-    let mut selected = descriptors
-        .iter()
-        .enumerate()
-        .filter(|(_, descriptor)| descriptor.range.mate.stream() == mate)
-        .collect::<Vec<_>>();
-    selected.sort_by_key(|(_, descriptor)| descriptor.range.start);
-    let mut prior_removed = 0usize;
-    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-    for (index, descriptor) in selected {
-        let boundary = descriptor
-            .range
-            .start
-            .checked_sub(prior_removed)
-            .ok_or_else(|| Error::InvalidFormat("embedded index boundary underflow".into()))?;
-        if boundary > reduced_len {
-            return Err(Error::InvalidFormat(
-                "embedded index boundary exceeds reduced read".into(),
-            ));
-        }
-        if let Some((_, group)) = groups
-            .last_mut()
-            .filter(|(position, _)| *position == boundary)
-        {
-            group.push(index);
-        } else {
-            groups.push((boundary, vec![index]));
-        }
-        prior_removed = prior_removed
-            .checked_add(descriptor.range.len())
-            .ok_or_else(|| Error::InvalidFormat("embedded index length overflow".into()))?;
-    }
-    if reverse {
-        groups.reverse();
-        for (position, group) in &mut groups {
-            *position = reduced_len - *position;
-            group.reverse();
-        }
-    }
-    Ok(groups)
-}
-
-#[cfg(test)]
-fn decode_record_literals(program: &RecordProgram, input: &mut Cursor<Vec<u8>>) -> Result<Vec<u8>> {
-    enum Piece {
-        Bases(Vec<u8>),
-        Literal(usize),
-    }
-    let mut pieces = Vec::new();
-    let mut group_index = 0;
-    for (index, run) in program.runs.iter().enumerate() {
-        match run.op {
-            ArchiveOp::Match => {
-                pieces.push(Piece::Bases(program.matched[index].clone().ok_or_else(
-                    || Error::InvalidFormat("missing matched sequence".into()),
-                )?))
-            }
-            ArchiveOp::Literal => pieces.push(Piece::Literal(run.len)),
-            ArchiveOp::RefAdvance => {}
-            ArchiveOp::Whitelist => {
-                for descriptor_index in &program.descriptor_groups[group_index] {
-                    let (_, fragment) = program
-                        .fragments
-                        .iter()
-                        .find(|(index, _)| index == descriptor_index)
-                        .ok_or_else(|| Error::InvalidFormat("missing whitelist fragment".into()))?;
-                    match fragment {
-                        WhitelistFragment::Raw(length) => pieces.push(Piece::Literal(*length)),
-                        WhitelistFragment::Bases(sequence) => {
-                            pieces.push(Piece::Bases(sequence.clone()))
-                        }
-                    }
-                }
-                group_index += 1;
-            }
-        }
-    }
-    if program.fragments.len()
-        != program
-            .descriptor_groups
-            .iter()
-            .map(Vec::len)
-            .sum::<usize>()
-    {
-        return Err(Error::InvalidFormat("unused whitelist fragment".into()));
-    }
-    let mut sequence = Vec::new();
-    let mut index = 0;
-    while index < pieces.len() {
-        match &pieces[index] {
-            Piece::Bases(bases) => {
-                sequence.extend_from_slice(bases);
-                index += 1;
-            }
-            Piece::Literal(_) => {
-                let start = index;
-                let mut length = 0usize;
-                while index < pieces.len() {
-                    let Piece::Literal(value) = pieces[index] else {
-                        break;
-                    };
-                    length = length.checked_add(value).ok_or_else(|| {
-                        Error::InvalidFormat("literal run length overflow".into())
-                    })?;
-                    index += 1;
-                }
-                let literal = take_literal_bytes(input, length)?;
-                let mut offset = 0usize;
-                for piece in &pieces[start..index] {
-                    let Piece::Literal(source_length) = *piece else {
-                        unreachable!();
-                    };
-                    let end = offset.checked_add(source_length).ok_or_else(|| {
-                        Error::InvalidFormat("literal source length overflow".into())
-                    })?;
-                    sequence.extend_from_slice(&literal[offset..end]);
-                    offset = end;
-                }
-                debug_assert_eq!(offset, literal.len());
-            }
-        }
-    }
-    if program.reverse {
-        reverse_complement(&mut sequence);
-    }
-    Ok(sequence)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn decode_v21_records(
     input: &[u8],
     count: usize,
     reference: &[u8],
     layout: AlignmentLayout,
     descriptors: &[IndexDescriptor],
-    _global_whitelist: &Whitelist,
+    preserve_quality: bool,
+    index_stream_count: usize,
     absolute_position_width: usize,
     delta_position_width: usize,
-) -> Result<Vec<Vec<Vec<u8>>>> {
+) -> Result<DecodedRecordSections> {
     let mut cursor = Cursor::new(input.to_vec());
     let section_count = read_u32(&mut cursor)? as usize;
     let expected_sections = layout
@@ -3186,6 +2737,7 @@ fn decode_v21_records(
         .checked_mul(V21_MATE_SECTION_COUNT)
         .and_then(|value| value.checked_add(1))
         .and_then(|value| value.checked_add(descriptors.len()))
+        .and_then(|value| value.checked_add(index_stream_count.saturating_mul(3)))
         .ok_or_else(|| Error::InvalidFormat("record section count overflow".into()))?;
     if section_count != expected_sections {
         return Err(Error::InvalidFormat("record section count mismatch".into()));
@@ -3229,7 +2781,7 @@ fn decode_v21_records(
             flags,
             mate,
             reference,
-            first_alignment.as_deref(),
+            first_alignment.as_ref(),
             absolute_position_width,
             delta_position_width,
         )?;
@@ -3258,7 +2810,7 @@ fn decode_v21_records(
             .collect::<Vec<_>>();
         index_sections.push(indexes);
     }
-    for mate in 0..layout.streams() {
+    for (mate, sequences) in all.iter_mut().enumerate() {
         let mut selected = descriptors
             .iter()
             .enumerate()
@@ -3266,46 +2818,109 @@ fn decode_v21_records(
             .collect::<Vec<_>>();
         selected.sort_by_key(|(_, descriptor)| descriptor.range.start);
         for record in 0..count {
-            let biological = &all[mate][record];
-            let mut rebuilt = Vec::with_capacity(biological.len());
-            let mut biological_start = 0usize;
-            let mut removed = 0usize;
-            for (descriptor_index, descriptor) in &selected {
-                let boundary = descriptor
-                    .range
-                    .start
-                    .checked_sub(removed)
-                    .ok_or_else(|| Error::InvalidFormat("index insertion underflow".into()))?;
-                if boundary < biological_start || boundary > biological.len() {
-                    return Err(Error::InvalidFormat("index insertion exceeds read".into()));
+            let rebuilt = {
+                let biological = &sequences[record];
+                let mut rebuilt = Vec::with_capacity(biological.len());
+                let mut biological_start = 0usize;
+                let mut removed = 0usize;
+                for (descriptor_index, descriptor) in &selected {
+                    let boundary = descriptor
+                        .range
+                        .start
+                        .checked_sub(removed)
+                        .ok_or_else(|| Error::InvalidFormat("index insertion underflow".into()))?;
+                    if boundary < biological_start || boundary > biological.len() {
+                        return Err(Error::InvalidFormat("index insertion exceeds read".into()));
+                    }
+                    let index = &index_sections[*descriptor_index][record];
+                    if index.len() != descriptor.range.len() {
+                        return Err(Error::InvalidFormat("index read length mismatch".into()));
+                    }
+                    rebuilt.extend_from_slice(&biological[biological_start..boundary]);
+                    rebuilt.extend_from_slice(index);
+                    biological_start = boundary;
+                    removed = removed
+                        .checked_add(descriptor.range.len())
+                        .ok_or_else(|| Error::InvalidFormat("index length overflow".into()))?;
                 }
-                let index = &index_sections[*descriptor_index][record];
-                if index.len() != descriptor.range.len() {
-                    return Err(Error::InvalidFormat("index read length mismatch".into()));
-                }
-                rebuilt.extend_from_slice(&biological[biological_start..boundary]);
-                rebuilt.extend_from_slice(index);
-                biological_start = boundary;
-                removed = removed
-                    .checked_add(descriptor.range.len())
-                    .ok_or_else(|| Error::InvalidFormat("index length overflow".into()))?;
-            }
-            rebuilt.extend_from_slice(&biological[biological_start..]);
-            all[mate][record] = rebuilt;
+                rebuilt.extend_from_slice(&biological[biological_start..]);
+                rebuilt
+            };
+            sequences[record] = rebuilt;
         }
     }
-    Ok(all)
+    let mut index_streams = Vec::with_capacity(index_stream_count);
+    for stream in 0..index_stream_count {
+        let start = 1 + layout.streams() * V21_MATE_SECTION_COUNT + descriptors.len() + stream * 3;
+        let quality_block = &sections[start];
+        let lengths_block = &sections[start + 1];
+        let sequence_block = &sections[start + 2];
+        let qualities = if preserve_quality {
+            decode_stream_bytes(quality_block, count)?
+                .into_iter()
+                .map(Some)
+                .collect()
+        } else {
+            if !quality_block.is_empty() {
+                return Err(Error::InvalidFormat(
+                    "unexpected index quality bytes".into(),
+                ));
+            }
+            vec![None; count]
+        };
+        if lengths_block.len() != count.checked_mul(2).ok_or_else(|| {
+            Error::InvalidFormat("index read length section overflow".into())
+        })? {
+            return Err(Error::InvalidFormat(
+                "index read length section mismatch".into(),
+            ));
+        }
+        let mut lengths_cursor = Cursor::new(lengths_block.clone());
+        let mut offset = 0usize;
+        let mut sequences = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length = read_u16(&mut lengths_cursor)? as usize;
+            if length == 0 {
+                return Err(Error::InvalidFormat(
+                    "index read sequence cannot be empty".into(),
+                ));
+            }
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| Error::InvalidFormat("index read length overflow".into()))?;
+            if end > sequence_block.len() {
+                return Err(Error::InvalidFormat(
+                    "index sequence section mismatch".into(),
+                ));
+            }
+            sequences.push(sequence_block[offset..end].to_vec());
+            offset = end;
+        }
+        if offset != sequence_block.len() {
+            return Err(Error::InvalidFormat("trailing index read bytes".into()));
+        }
+        index_streams.push(DecodedIndexStream {
+            qualities,
+            sequences,
+        });
+    }
+    Ok(DecodedRecordSections {
+        biological: all,
+        index_streams,
+    })
 }
+
+type MateAlignments = Vec<Option<(usize, bool)>>;
 
 fn decode_v21_mate_sections(
     sections: &[Vec<u8>],
     flags: &[u8],
     mate: usize,
     reference: &[u8],
-    first_alignment: Option<&[Option<(usize, bool)>]>,
+    first_alignment: Option<&MateAlignments>,
     absolute_position_width: usize,
     delta_position_width: usize,
-) -> Result<(Vec<Vec<u8>>, Vec<Option<(usize, bool)>>)> {
+) -> Result<(Vec<Vec<u8>>, MateAlignments)> {
     if sections.len() != V21_MATE_SECTION_COUNT || sections[0].len() != flags.len() * 2 {
         return Err(Error::InvalidFormat("read length section mismatch".into()));
     }
@@ -3644,279 +3259,6 @@ fn reconstruct_v21_aligned_read(
     Ok(sequence)
 }
 
-#[cfg(test)]
-fn decode_records(
-    input: &[u8],
-    count: usize,
-    reference: &[u8],
-    layout: AlignmentLayout,
-    descriptors: &[IndexDescriptor],
-    global_whitelist: &Whitelist,
-) -> Result<Vec<Vec<Vec<u8>>>> {
-    let mut cursor = Cursor::new(input.to_vec());
-    let mut starts = [0i64; 2];
-    let mut first_starts = vec![None; count];
-    let mut first_reverses = vec![None; count];
-    let mut all = (0..layout.streams())
-        .map(|_| Vec::with_capacity(count))
-        .collect::<Vec<_>>();
-    for mate in 0..layout.streams() {
-        let bitmap_len = count.div_ceil(8);
-        let mut mapped_bitmap = vec![0; bitmap_len];
-        let mut reverse_bitmap = vec![0; bitmap_len];
-        cursor.read_exact(&mut mapped_bitmap)?;
-        cursor.read_exact(&mut reverse_bitmap)?;
-        if count % 8 != 0 {
-            let padding = (8 - count % 8) as u8;
-            let mask = !((1u8 << (8 - padding)) - 1);
-            if mapped_bitmap.last().copied().unwrap_or(0) & mask != 0
-                || reverse_bitmap.last().copied().unwrap_or(0) & mask != 0
-            {
-                return Err(Error::InvalidFormat(
-                    "nonzero alignment bitmap padding".into(),
-                ));
-            }
-        }
-        let positions_len = usize_from(read_u64(&mut cursor)?, "alignment positions")?;
-        let mut positions = vec![0; positions_len];
-        cursor.read_exact(&mut positions)?;
-        let mut positions = Cursor::new(positions);
-        let mut mapped_values = Vec::with_capacity(count);
-        for ordinal in 0..count {
-            let mapped = mapped_bitmap[ordinal / 8] & (1 << (ordinal % 8)) != 0;
-            let encoded_reverse = reverse_bitmap[ordinal / 8] & (1 << (ordinal % 8)) != 0;
-            if mapped {
-                let delta = zigzag_decode(read_varint(&mut positions)?)?;
-                let base = if mate == 1 {
-                    first_starts[ordinal].unwrap_or(starts[mate])
-                } else {
-                    starts[mate]
-                };
-                let start = base
-                    .checked_add(delta)
-                    .ok_or_else(|| Error::InvalidFormat("alignment offset overflow".into()))?;
-                starts[mate] = start;
-                let reverse = if mate == 1 {
-                    first_reverses[ordinal].map_or(encoded_reverse, |first| encoded_reverse ^ first)
-                } else {
-                    encoded_reverse
-                };
-                if mate == 0 {
-                    first_starts[ordinal] = Some(start);
-                    first_reverses[ordinal] = Some(reverse);
-                }
-                mapped_values.push(Some((start, reverse)));
-            } else {
-                mapped_values.push(None);
-            }
-        }
-        if positions.position() != positions.get_ref().len() as u64 {
-            return Err(Error::InvalidFormat(
-                "trailing alignment position bytes".into(),
-            ));
-        }
-
-        let programs_len = usize_from(read_u64(&mut cursor)?, "record programs")?;
-        let raw_bit_count = usize_from(read_u64(&mut cursor)?, "raw bitmap bit count")?;
-        let raw_byte_len = usize_from(read_u64(&mut cursor)?, "raw bitmap byte length")?;
-        let mismatch_bit_count = usize_from(read_u64(&mut cursor)?, "mismatch bitmap bit count")?;
-        let mismatch_byte_len = usize_from(read_u64(&mut cursor)?, "mismatch bitmap byte length")?;
-        let ordinal_byte_len = usize_from(read_u64(&mut cursor)?, "ordinal column byte length")?;
-        let mismatch_detail_byte_len =
-            usize_from(read_u64(&mut cursor)?, "mismatch detail byte length")?;
-        let literals_len = usize_from(read_u64(&mut cursor)?, "record literals")?;
-        if raw_byte_len != raw_bit_count.div_ceil(8)
-            || mismatch_byte_len != mismatch_bit_count.div_ceil(8)
-        {
-            return Err(Error::InvalidFormat("record bitmap length mismatch".into()));
-        }
-        let payload_len = programs_len
-            .checked_add(raw_byte_len)
-            .and_then(|length| length.checked_add(mismatch_byte_len))
-            .and_then(|length| length.checked_add(ordinal_byte_len))
-            .and_then(|length| length.checked_add(mismatch_detail_byte_len))
-            .and_then(|length| length.checked_add(literals_len))
-            .ok_or_else(|| Error::InvalidFormat("record section length overflow".into()))?;
-        let payload_end = (cursor.position() as usize)
-            .checked_add(payload_len)
-            .ok_or_else(|| Error::InvalidFormat("record section length overflow".into()))?;
-        if payload_end > cursor.get_ref().len() {
-            return Err(Error::InvalidFormat("truncated record section".into()));
-        }
-        let take = |cursor: &mut Cursor<Vec<u8>>, length: usize| -> Result<Vec<u8>> {
-            let start = cursor.position() as usize;
-            let end = start
-                .checked_add(length)
-                .ok_or_else(|| Error::InvalidFormat("record section length overflow".into()))?;
-            if end > cursor.get_ref().len() {
-                return Err(Error::InvalidFormat("truncated record section".into()));
-            }
-            let value = cursor.get_ref()[start..end].to_vec();
-            cursor.set_position(end as u64);
-            Ok(value)
-        };
-        let programs = take(&mut cursor, programs_len)?;
-        let raw_bytes = take(&mut cursor, raw_byte_len)?;
-        let mismatch_bytes = take(&mut cursor, mismatch_byte_len)?;
-        let ordinal_bytes = take(&mut cursor, ordinal_byte_len)?;
-        let mismatch_detail_bytes = take(&mut cursor, mismatch_detail_byte_len)?;
-        let literal_bytes = take(&mut cursor, literals_len)?;
-
-        let mut program_cursor = Cursor::new(programs);
-        let mut decoded = Vec::with_capacity(count);
-        for mapped in &mapped_values {
-            let mapping = match mapped {
-                Some((start, reverse)) => Some((
-                    reference,
-                    nonnegative_usize(*start, "alignment start")?,
-                    *reverse,
-                )),
-                None => None,
-            };
-            decoded.push(decode_record_program(&mut program_cursor, mapping)?);
-        }
-        if program_cursor.position() != program_cursor.get_ref().len() as u64 {
-            return Err(Error::InvalidFormat("trailing record program bytes".into()));
-        }
-        let expected_descriptors = descriptors
-            .iter()
-            .enumerate()
-            .filter(|(_, descriptor)| descriptor.range.mate.stream() == mate)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let expected_occurrences = count
-            .checked_mul(expected_descriptors.len())
-            .ok_or_else(|| Error::InvalidFormat("whitelist occurrence count overflow".into()))?;
-        if raw_bit_count != expected_occurrences {
-            return Err(Error::InvalidFormat("raw bitmap count mismatch".into()));
-        }
-        let mut raw = BitReader::new(&raw_bytes, raw_bit_count)?;
-        let mut mismatch = BitReader::new(&mismatch_bytes, mismatch_bit_count)?;
-        let raw_count = raw_bytes
-            .iter()
-            .map(|byte| byte.count_ones() as usize)
-            .sum::<usize>();
-        let nonraw_count = expected_occurrences
-            .checked_sub(raw_count)
-            .ok_or_else(|| Error::InvalidFormat("raw bitmap count exceeds descriptors".into()))?;
-        if mismatch_bit_count != nonraw_count {
-            return Err(Error::InvalidFormat(
-                "mismatch bitmap count mismatch".into(),
-            ));
-        }
-        let expected_ordinal_bytes = nonraw_count
-            .checked_mul(2)
-            .ok_or_else(|| Error::InvalidFormat("ordinal column length overflow".into()))?;
-        if ordinal_byte_len != expected_ordinal_bytes {
-            return Err(Error::InvalidFormat(
-                "ordinal column length mismatch".into(),
-            ));
-        }
-        let mismatch_count = mismatch_bytes
-            .iter()
-            .map(|byte| byte.count_ones() as usize)
-            .sum::<usize>();
-        if mismatch_detail_byte_len != mismatch_count {
-            return Err(Error::InvalidFormat(
-                "mismatch detail column length mismatch".into(),
-            ));
-        }
-        let mut ordinal_offset = 0usize;
-        let mut detail_offset = 0usize;
-        let mut literal_cursor = Cursor::new(literal_bytes);
-        for program in &mut decoded {
-            let expected_groups =
-                expected_whitelist_groups(program.reduced_len, descriptors, mate, program.reverse)?;
-            if program.whitelist_positions
-                != expected_groups
-                    .iter()
-                    .map(|group| group.0)
-                    .collect::<Vec<_>>()
-                || program.group_sizes.len() != expected_groups.len()
-            {
-                return Err(Error::InvalidFormat(
-                    "whitelist operation group mismatch".into(),
-                ));
-            }
-            program.descriptor_groups = expected_groups.into_iter().map(|group| group.1).collect();
-            for group in &program.descriptor_groups {
-                for &descriptor_index in group {
-                    let descriptor = descriptors.get(descriptor_index).ok_or_else(|| {
-                        Error::InvalidFormat("whitelist descriptor is out of bounds".into())
-                    })?;
-                    let is_raw = raw.read(1)? != 0;
-                    let fragment = if is_raw {
-                        WhitelistFragment::Raw(descriptor.range.len())
-                    } else {
-                        let mode = mismatch.read(1)?;
-                        let ordinal_end = ordinal_offset.checked_add(2).ok_or_else(|| {
-                            Error::InvalidFormat("ordinal column offset overflow".into())
-                        })?;
-                        let ordinal = u16::from_le_bytes(
-                            ordinal_bytes[ordinal_offset..ordinal_end]
-                                .try_into()
-                                .expect("ordinal length was validated"),
-                        ) as usize;
-                        ordinal_offset = ordinal_end;
-                        let mut sequence = global_whitelist
-                            .sequence(ordinal)
-                            .ok_or_else(|| {
-                                Error::InvalidFormat("whitelist ordinal is out of bounds".into())
-                            })?
-                            .to_vec();
-                        if sequence.len() != descriptor.range.len() {
-                            return Err(Error::InvalidFormat(
-                                "whitelist sequence length does not match descriptor".into(),
-                            ));
-                        }
-                        if mode == 1 {
-                            let detail = mismatch_detail_bytes[detail_offset];
-                            detail_offset += 1;
-                            let position = (detail >> 2) as usize;
-                            if position >= sequence.len() {
-                                return Err(Error::InvalidFormat(
-                                    "whitelist mismatch position is out of bounds".into(),
-                                ));
-                            }
-                            let replacement = bits_to_base(detail & 3);
-                            if replacement == sequence[position] {
-                                return Err(Error::InvalidFormat(
-                                    "whitelist replacement does not differ".into(),
-                                ));
-                            }
-                            sequence[position] = replacement;
-                        } else if mode != 0 {
-                            return Err(Error::InvalidFormat(
-                                "invalid whitelist mismatch mode".into(),
-                            ));
-                        }
-                        if program.reverse {
-                            reverse_complement(&mut sequence);
-                        }
-                        WhitelistFragment::Bases(sequence)
-                    };
-                    program.fragments.push((descriptor_index, fragment));
-                }
-            }
-            let sequence = decode_record_literals(program, &mut literal_cursor)?;
-            all[mate].push(sequence);
-        }
-        if raw.remaining() != 0
-            || mismatch.remaining() != 0
-            || ordinal_offset != ordinal_bytes.len()
-            || detail_offset != mismatch_detail_bytes.len()
-        {
-            return Err(Error::InvalidFormat("trailing record column data".into()));
-        }
-        if literal_cursor.position() != literal_cursor.get_ref().len() as u64 {
-            return Err(Error::InvalidFormat("trailing record literal bytes".into()));
-        }
-    }
-    if cursor.position() != cursor.get_ref().len() as u64 {
-        return Err(Error::InvalidFormat("trailing record bytes".into()));
-    }
-    Ok(all)
-}
 
 fn decode_ids(
     input: &[u8],
@@ -4071,817 +3413,14 @@ fn archive_normalize(cigar: impl IntoIterator<Item = CigarOp>) -> Result<Vec<Arc
             runs.push(ArchiveRun {
                 op,
                 len: cigar_op.len as usize,
-                descriptors: Vec::new(),
             });
         }
     }
     Ok(runs)
 }
 
-#[cfg(test)]
-fn descriptor_boundaries(
-    descriptors: &[IndexEncodingDescriptor],
-    mate: usize,
-    reduced_len: usize,
-    reverse: bool,
-) -> Result<Vec<(Vec<usize>, usize)>> {
-    let mut selected = descriptors
-        .iter()
-        .enumerate()
-        .filter(|(_, descriptor)| descriptor.range.mate.stream() == mate)
-        .collect::<Vec<_>>();
-    selected.sort_by_key(|(_, descriptor)| descriptor.range.start);
-    let mut prior_removed = 0usize;
-    let mut boundaries: Vec<(Vec<usize>, usize)> = Vec::with_capacity(selected.len());
-    for (descriptor_index, descriptor) in selected {
-        let forward = descriptor
-            .range
-            .start
-            .checked_sub(prior_removed)
-            .ok_or_else(|| Error::InvalidInput("embedded index boundary underflow".into()))?;
-        if forward > reduced_len {
-            return Err(Error::InvalidInput(
-                "embedded index boundary exceeds reduced read".into(),
-            ));
-        }
-        if let Some((group, _)) = boundaries
-            .last_mut()
-            .filter(|(_, boundary)| *boundary == forward)
-        {
-            group.push(descriptor_index);
-        } else {
-            boundaries.push((vec![descriptor_index], forward));
-        }
-        prior_removed = prior_removed
-            .checked_add(descriptor.range.len())
-            .ok_or_else(|| Error::InvalidInput("embedded index length overflow".into()))?;
-    }
-    if reverse {
-        boundaries.reverse();
-        for (group, boundary) in &mut boundaries {
-            *boundary = reduced_len - *boundary;
-            group.reverse();
-        }
-    }
-    Ok(boundaries)
-}
 
-#[cfg(test)]
-fn insert_whitelist_runs(
-    core: Vec<ArchiveRun>,
-    boundaries: Vec<(Vec<usize>, usize)>,
-    reduced_len: usize,
-) -> Result<Vec<ArchiveRun>> {
-    let mut output = Vec::with_capacity(core.len() + boundaries.len());
-    let mut boundary_index = 0usize;
-    let mut query_pos = 0usize;
-    for run in core {
-        if !run.op.consumes_query() {
-            output.push(run);
-            continue;
-        }
-        let mut remaining = run.len;
-        while boundary_index < boundaries.len()
-            && boundaries[boundary_index].1 <= query_pos + remaining
-        {
-            let (descriptors, boundary) = &boundaries[boundary_index];
-            if *boundary < query_pos {
-                return Err(Error::InvalidInput(
-                    "embedded index boundaries are not ordered".into(),
-                ));
-            }
-            let prefix = *boundary - query_pos;
-            if prefix != 0 {
-                output.push(ArchiveRun {
-                    op: run.op,
-                    len: prefix,
-                    descriptors: Vec::new(),
-                });
-                remaining -= prefix;
-                query_pos = *boundary;
-            }
-            output.push(ArchiveRun {
-                op: ArchiveOp::Whitelist,
-                len: 0,
-                descriptors: descriptors.clone(),
-            });
-            boundary_index += 1;
-        }
-        if remaining != 0 {
-            output.push(ArchiveRun {
-                op: run.op,
-                len: remaining,
-                descriptors: Vec::new(),
-            });
-            query_pos += remaining;
-        }
-    }
-    while boundary_index < boundaries.len() && boundaries[boundary_index].1 == query_pos {
-        output.push(ArchiveRun {
-            op: ArchiveOp::Whitelist,
-            len: 0,
-            descriptors: boundaries[boundary_index].0.clone(),
-        });
-        boundary_index += 1;
-    }
-    if query_pos != reduced_len || boundary_index != boundaries.len() {
-        return Err(Error::InvalidInput(
-            "archive operations do not cover embedded index boundaries".into(),
-        ));
-    }
-    Ok(output)
-}
-
-#[cfg(test)]
-fn encode_operation_body<R: ReferenceBases + ?Sized>(
-    output: &mut Vec<u8>,
-    sequence: &[u8],
-    mapped: Option<(&GenomeAlignment, &R)>,
-    runs: &[ArchiveRun],
-    indexes: &[SpoolIndexRead],
-    descriptors: &[IndexEncodingDescriptor],
-    global_whitelist: &Whitelist,
-) -> Result<()> {
-    if indexes.len() != descriptors.len() {
-        return Err(Error::InvalidInput(
-            "embedded index count does not match metadata".into(),
-        ));
-    }
-    write_varint(output, runs.len() as u64)?;
-    for chunk in runs.chunks(4) {
-        let mut packed = 0u8;
-        for (index, run) in chunk.iter().enumerate() {
-            packed |= (run.op as u8) << (6 - index * 2);
-        }
-        output.push(packed);
-    }
-    for run in runs {
-        if run.op == ArchiveOp::Whitelist {
-            if run.len != 0 || run.descriptors.is_empty() {
-                return Err(Error::InvalidInput(
-                    "whitelist operation has invalid descriptors".into(),
-                ));
-            }
-        } else {
-            if run.len == 0 || !run.descriptors.is_empty() {
-                return Err(Error::InvalidInput("invalid archive operation run".into()));
-            }
-            write_varint(output, run.len as u64)?;
-        }
-    }
-
-    let mut oriented = sequence.to_vec();
-    let (mut ref_pos, reverse) = if let Some((hit, _)) = mapped {
-        (
-            nonnegative_usize(hit.start, "alignment start")?,
-            hit.is_reverse,
-        )
-    } else {
-        (0, false)
-    };
-    if reverse {
-        reverse_complement(&mut oriented);
-    }
-    let mut query_pos = 0usize;
-    for run in runs {
-        match run.op {
-            ArchiveOp::Match => {
-                let (_, reference) = mapped.ok_or_else(|| {
-                    Error::InvalidInput("unmapped body contains a match operation".into())
-                })?;
-                let ref_end = ref_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidInput("reference position overflow".into()))?;
-                let query_end = query_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidInput("query position overflow".into()))?;
-                if ref_end > reference.len() || query_end > oriented.len() {
-                    return Err(Error::InvalidFormat(
-                        "archive operation exceeds bounds".into(),
-                    ));
-                }
-                let mut mismatches = Vec::new();
-                for offset in 0..run.len {
-                    if reference.base(ref_pos + offset) != oriented[query_pos + offset] {
-                        mismatches.push((offset, oriented[query_pos + offset]));
-                    }
-                }
-                write_varint(output, mismatches.len() as u64)?;
-                let mut previous = 0usize;
-                for (position, base) in mismatches {
-                    write_varint(output, (position - previous) as u64)?;
-                    output.push(base);
-                    previous = position;
-                }
-                ref_pos = ref_end;
-                query_pos = query_end;
-            }
-            ArchiveOp::Literal => {
-                let end = query_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidInput("query position overflow".into()))?;
-                if end > oriented.len() {
-                    return Err(Error::InvalidFormat(
-                        "archive operation exceeds query".into(),
-                    ));
-                }
-                query_pos = end;
-            }
-            ArchiveOp::RefAdvance => {
-                if mapped.is_none() {
-                    return Err(Error::InvalidInput(
-                        "unmapped body contains a reference advance".into(),
-                    ));
-                }
-                ref_pos = ref_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidInput("reference position overflow".into()))?;
-                if ref_pos > mapped.unwrap().1.len() {
-                    return Err(Error::InvalidFormat(
-                        "archive operation exceeds reference".into(),
-                    ));
-                }
-            }
-            ArchiveOp::Whitelist => {}
-        }
-    }
-    if query_pos != oriented.len() {
-        return Err(Error::InvalidFormat(
-            "archive operations do not consume reduced query".into(),
-        ));
-    }
-
-    let ordinal_bits = bit_width(global_whitelist.len());
-    let mut classifications = Vec::new();
-    for run in runs.iter().filter(|run| run.op == ArchiveOp::Whitelist) {
-        for &descriptor_index in &run.descriptors {
-            let descriptor = descriptors.get(descriptor_index).ok_or_else(|| {
-                Error::InvalidInput("whitelist descriptor is out of bounds".into())
-            })?;
-            let index = indexes
-                .get(descriptor_index)
-                .ok_or_else(|| Error::InvalidInput("embedded index fragment is missing".into()))?;
-            if index.sequence.len() != descriptor.range.len() {
-                return Err(Error::InvalidInput(
-                    "embedded index sequence length does not match its range".into(),
-                ));
-            }
-            let classification = index_read::classify_with_global(
-                &index.sequence,
-                &descriptor.local_whitelist,
-                global_whitelist,
-            )
-            .map_err(index_encode_error)?;
-            classifications.push((descriptor_index, classification));
-        }
-    }
-
-    let mut bits = BitWriter::default();
-    for (_, classification) in &classifications {
-        bits.write(
-            usize::from(matches!(
-                classification,
-                IndexReadEncoding::CanonicalRaw | IndexReadEncoding::ExceptionalRaw
-            )),
-            1,
-        )?;
-    }
-    for &(descriptor_index, ref classification) in &classifications {
-        let descriptor = &descriptors[descriptor_index];
-        match *classification {
-            IndexReadEncoding::Exact { global_ordinal } => {
-                if global_whitelist
-                    .sequence(global_ordinal)
-                    .is_none_or(|sequence| sequence.len() != descriptor.range.len())
-                {
-                    return Err(Error::InvalidInput(
-                        "whitelist sequence length does not match descriptor".into(),
-                    ));
-                }
-                bits.write(0, 1)?;
-                bits.write(global_ordinal, ordinal_bits)?;
-            }
-            IndexReadEncoding::OneMismatch {
-                global_ordinal,
-                position,
-                original,
-            } => {
-                let selected = global_whitelist.sequence(global_ordinal).ok_or_else(|| {
-                    Error::InvalidInput("whitelist ordinal is out of bounds".into())
-                })?;
-                if selected.len() != descriptor.range.len() || position >= selected.len() {
-                    return Err(Error::InvalidInput(
-                        "whitelist mismatch does not match descriptor".into(),
-                    ));
-                }
-                if canonical_bits(original)? == canonical_bits(selected[position])? {
-                    return Err(Error::InvalidInput(
-                        "whitelist replacement does not differ".into(),
-                    ));
-                }
-                bits.write(1, 1)?;
-                bits.write(global_ordinal, ordinal_bits)?;
-                bits.write(position, bit_width(descriptor.range.len()))?;
-                bits.write(canonical_bits(original)? as usize, 2)?;
-            }
-            IndexReadEncoding::CanonicalRaw | IndexReadEncoding::ExceptionalRaw => {}
-        }
-    }
-    write_varint(output, bits.len() as u64)?;
-    output.extend(bits.finish());
-
-    let mut classification_index = 0usize;
-    let mut query_pos = 0usize;
-    for run in runs {
-        match run.op {
-            ArchiveOp::Match => {
-                query_pos = query_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidInput("query position overflow".into()))?;
-            }
-            ArchiveOp::Literal => {
-                let end = query_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidInput("query position overflow".into()))?;
-                if end > oriented.len() {
-                    return Err(Error::InvalidFormat(
-                        "archive operation exceeds query".into(),
-                    ));
-                }
-                output.extend_from_slice(&oriented[query_pos..end]);
-                query_pos = end;
-            }
-            ArchiveOp::RefAdvance => {}
-            ArchiveOp::Whitelist => {
-                for &descriptor_index in &run.descriptors {
-                    let (classified_descriptor, classification) =
-                        classifications.get(classification_index).ok_or_else(|| {
-                            Error::InvalidInput("missing whitelist classification".into())
-                        })?;
-                    if *classified_descriptor != descriptor_index {
-                        return Err(Error::InvalidInput(
-                            "whitelist classification order mismatch".into(),
-                        ));
-                    }
-                    classification_index += 1;
-                    if matches!(
-                        classification,
-                        IndexReadEncoding::CanonicalRaw | IndexReadEncoding::ExceptionalRaw
-                    ) {
-                        let mut fragment = indexes[descriptor_index].sequence.clone();
-                        if reverse {
-                            reverse_complement(&mut fragment);
-                        }
-                        output.extend(fragment);
-                    }
-                }
-            }
-        }
-    }
-    if query_pos != oriented.len() || classification_index != classifications.len() {
-        return Err(Error::InvalidInput(
-            "literal source consumption mismatch".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn decode_operation_body(
-    input: &mut Cursor<Vec<u8>>,
-    mapped: Option<(&[u8], usize)>,
-    reverse: bool,
-    descriptors: &[IndexDescriptor],
-    mate: usize,
-    global_whitelist: &Whitelist,
-) -> Result<Vec<u8>> {
-    let count = usize_from(read_varint(input)?, "archive operation count")?;
-    let packed_len = count.div_ceil(4);
-    let mut packed = vec![0; packed_len];
-    input.read_exact(&mut packed)?;
-    if count % 4 != 0 {
-        let padding_bits = (4 - count % 4) * 2;
-        if packed.last().copied().unwrap_or(0) & ((1 << padding_bits) - 1) != 0 {
-            return Err(Error::InvalidFormat(
-                "nonzero archive operation padding bits".into(),
-            ));
-        }
-    }
-    let mut runs = Vec::with_capacity(count);
-    for index in 0..count {
-        let code = (packed[index / 4] >> (6 - (index % 4) * 2)) & 3;
-        let op = ArchiveOp::from_code(code)?;
-        let len = if op == ArchiveOp::Whitelist {
-            0
-        } else {
-            let len = usize_from(read_varint(input)?, "archive operation length")?;
-            if len == 0 {
-                return Err(Error::InvalidFormat("zero-length archive operation".into()));
-            }
-            len
-        };
-        runs.push(ArchiveRun {
-            op,
-            len,
-            descriptors: Vec::new(),
-        });
-    }
-    if mapped.is_none()
-        && runs
-            .iter()
-            .any(|run| matches!(run.op, ArchiveOp::Match | ArchiveOp::RefAdvance))
-    {
-        return Err(Error::InvalidFormat(
-            "unmapped body contains mapped operations".into(),
-        ));
-    }
-
-    let mut matched = (0..runs.len()).map(|_| None).collect::<Vec<_>>();
-    let mut ref_pos = mapped.map_or(0, |(_, start)| start);
-    let mut reduced_len = 0usize;
-    let mut whitelist_positions = Vec::new();
-    for (run_index, run) in runs.iter().enumerate() {
-        match run.op {
-            ArchiveOp::Match => {
-                let reference = mapped.unwrap().0;
-                let end = ref_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidFormat("reference position overflow".into()))?;
-                if end > reference.len() {
-                    return Err(Error::InvalidFormat(
-                        "archive operation exceeds reference".into(),
-                    ));
-                }
-                let mut bases = reference[ref_pos..end].to_vec();
-                let mismatch_count = usize_from(read_varint(input)?, "mismatch count")?;
-                let mut previous = 0usize;
-                for mismatch in 0..mismatch_count {
-                    let position = previous
-                        .checked_add(usize_from(read_varint(input)?, "mismatch position")?)
-                        .ok_or_else(|| Error::InvalidFormat("mismatch position overflow".into()))?;
-                    if position >= run.len || (mismatch != 0 && position <= previous) {
-                        return Err(Error::InvalidFormat(
-                            "mismatch position out of bounds".into(),
-                        ));
-                    }
-                    bases[position] = read_u8(input)?;
-                    previous = position;
-                }
-                ref_pos = end;
-                reduced_len = reduced_len
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidFormat("reduced query length overflow".into()))?;
-                matched[run_index] = Some(bases);
-            }
-            ArchiveOp::Literal => {
-                reduced_len = reduced_len
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidFormat("reduced query length overflow".into()))?;
-            }
-            ArchiveOp::RefAdvance => {
-                ref_pos = ref_pos
-                    .checked_add(run.len)
-                    .ok_or_else(|| Error::InvalidFormat("reference position overflow".into()))?;
-                if ref_pos > mapped.unwrap().0.len() {
-                    return Err(Error::InvalidFormat(
-                        "archive operation exceeds reference".into(),
-                    ));
-                }
-            }
-            ArchiveOp::Whitelist => {
-                whitelist_positions.push(reduced_len);
-            }
-        }
-    }
-
-    let mut selected = descriptors
-        .iter()
-        .enumerate()
-        .filter(|(_, descriptor)| descriptor.range.mate.stream() == mate)
-        .collect::<Vec<_>>();
-    selected.sort_by_key(|(_, descriptor)| descriptor.range.start);
-    let mut prior_removed = 0usize;
-    let mut expected_groups: Vec<(usize, Vec<usize>)> = Vec::new();
-    for (descriptor_index, descriptor) in selected {
-        let forward = descriptor
-            .range
-            .start
-            .checked_sub(prior_removed)
-            .ok_or_else(|| Error::InvalidFormat("embedded index boundary underflow".into()))?;
-        if forward > reduced_len {
-            return Err(Error::InvalidFormat(
-                "embedded index boundary exceeds reduced read".into(),
-            ));
-        }
-        if let Some((_, group)) = expected_groups
-            .last_mut()
-            .filter(|(boundary, _)| *boundary == forward)
-        {
-            group.push(descriptor_index);
-        } else {
-            expected_groups.push((forward, vec![descriptor_index]));
-        }
-        prior_removed = prior_removed
-            .checked_add(descriptor.range.len())
-            .ok_or_else(|| Error::InvalidFormat("embedded index length overflow".into()))?;
-    }
-    if reverse {
-        expected_groups.reverse();
-        for (boundary, group) in &mut expected_groups {
-            *boundary = reduced_len - *boundary;
-            group.reverse();
-        }
-    }
-    let expected_positions = expected_groups
-        .iter()
-        .map(|(boundary, _)| *boundary)
-        .collect::<Vec<_>>();
-    if whitelist_positions != expected_positions {
-        return Err(Error::InvalidFormat(
-            "whitelist operation count or order mismatch".into(),
-        ));
-    }
-    for (run, (_, group)) in runs
-        .iter_mut()
-        .filter(|run| run.op == ArchiveOp::Whitelist)
-        .zip(&expected_groups)
-    {
-        run.descriptors = group.clone();
-    }
-
-    let bit_count = usize_from(read_varint(input)?, "whitelist bit count")?;
-    let mut bit_bytes = vec![0; bit_count.div_ceil(8)];
-    input.read_exact(&mut bit_bytes)?;
-    let mut bits = BitReader::new(&bit_bytes, bit_count)?;
-    let ordinal_bits = bit_width(global_whitelist.len());
-    let descriptor_order = expected_groups
-        .iter()
-        .flat_map(|(_, group)| group.iter().copied())
-        .collect::<Vec<_>>();
-    let raw_bitmap = (0..descriptor_order.len())
-        .map(|_| bits.read(1).map(|value| value != 0))
-        .collect::<Result<Vec<_>>>()?;
-
-    enum WhitelistFragment {
-        Raw(usize),
-        Bases(Vec<u8>),
-    }
-    let mut fragments = (0..descriptors.len()).map(|_| None).collect::<Vec<_>>();
-    for (&descriptor_index, raw) in descriptor_order.iter().zip(raw_bitmap) {
-        let descriptor = descriptors
-            .get(descriptor_index)
-            .ok_or_else(|| Error::InvalidFormat("whitelist descriptor is out of bounds".into()))?;
-        let length = descriptor.range.len();
-        let fragment = if raw {
-            WhitelistFragment::Raw(length)
-        } else {
-            let mode = bits.read(1)?;
-            let ordinal = bits.read(ordinal_bits)?;
-            let mut sequence = global_whitelist
-                .sequence(ordinal)
-                .ok_or_else(|| Error::InvalidFormat("whitelist ordinal is out of bounds".into()))?
-                .to_vec();
-            if sequence.len() != length {
-                return Err(Error::InvalidFormat(
-                    "whitelist sequence length does not match descriptor".into(),
-                ));
-            }
-            if mode == 1 {
-                let position = bits.read(bit_width(length))?;
-                if position >= length {
-                    return Err(Error::InvalidFormat(
-                        "whitelist mismatch position is out of bounds".into(),
-                    ));
-                }
-                let original = bits_to_base(bits.read(2)? as u8);
-                if original == sequence[position] {
-                    return Err(Error::InvalidFormat(
-                        "whitelist replacement does not differ".into(),
-                    ));
-                }
-                sequence[position] = original;
-            }
-            if reverse {
-                reverse_complement(&mut sequence);
-            }
-            WhitelistFragment::Bases(sequence)
-        };
-        if fragments[descriptor_index].replace(fragment).is_some() {
-            return Err(Error::InvalidFormat(
-                "duplicate whitelist descriptor".into(),
-            ));
-        }
-    }
-    if bits.remaining() != 0 {
-        return Err(Error::InvalidFormat("trailing whitelist bits".into()));
-    }
-
-    enum Piece {
-        Bases(Vec<u8>),
-        Literal(usize),
-    }
-    let mut pieces = Vec::new();
-    for (run_index, run) in runs.iter().enumerate() {
-        match run.op {
-            ArchiveOp::Match => {
-                pieces.push(Piece::Bases(matched[run_index].take().ok_or_else(
-                    || Error::InvalidFormat("missing matched sequence".into()),
-                )?))
-            }
-            ArchiveOp::Literal => pieces.push(Piece::Literal(run.len)),
-            ArchiveOp::RefAdvance => {}
-            ArchiveOp::Whitelist => {
-                for &descriptor_index in &run.descriptors {
-                    match fragments[descriptor_index]
-                        .take()
-                        .ok_or_else(|| Error::InvalidFormat("missing whitelist fragment".into()))?
-                    {
-                        WhitelistFragment::Raw(length) => pieces.push(Piece::Literal(length)),
-                        WhitelistFragment::Bases(sequence) => pieces.push(Piece::Bases(sequence)),
-                    }
-                }
-            }
-        }
-    }
-    if fragments.into_iter().any(|fragment| fragment.is_some()) {
-        return Err(Error::InvalidFormat("unused whitelist fragment".into()));
-    }
-
-    let mut sequence = Vec::new();
-    let mut piece_index = 0usize;
-    while piece_index < pieces.len() {
-        match &pieces[piece_index] {
-            Piece::Bases(bases) => {
-                sequence.extend_from_slice(bases);
-                piece_index += 1;
-            }
-            Piece::Literal(_) => {
-                let start = piece_index;
-                let mut length = 0usize;
-                while piece_index < pieces.len() {
-                    let Piece::Literal(source_length) = pieces[piece_index] else {
-                        break;
-                    };
-                    length = length.checked_add(source_length).ok_or_else(|| {
-                        Error::InvalidFormat("literal run length overflow".into())
-                    })?;
-                    piece_index += 1;
-                }
-                let literal = take_literal_bytes(input, length)?;
-                let mut offset = 0usize;
-                for piece in &pieces[start..piece_index] {
-                    let Piece::Literal(source_length) = *piece else {
-                        unreachable!();
-                    };
-                    let end = offset.checked_add(source_length).ok_or_else(|| {
-                        Error::InvalidFormat("literal source length overflow".into())
-                    })?;
-                    if end > literal.len() {
-                        return Err(Error::InvalidFormat("truncated literal run".into()));
-                    }
-                    sequence.extend_from_slice(&literal[offset..end]);
-                    offset = end;
-                }
-                if offset != literal.len() {
-                    return Err(Error::InvalidFormat(
-                        "literal source splitting mismatch".into(),
-                    ));
-                }
-            }
-        }
-    }
-    if reverse {
-        reverse_complement(&mut sequence);
-    }
-    Ok(sequence)
-}
-
-#[cfg(test)]
-fn bit_width(values: usize) -> usize {
-    if values <= 1 {
-        0
-    } else {
-        (usize::BITS - (values - 1).leading_zeros()) as usize
-    }
-}
-
-fn canonical_bits(base: u8) -> Result<u8> {
-    match base {
-        b'A' => Ok(0),
-        b'C' => Ok(1),
-        b'G' => Ok(2),
-        b'T' => Ok(3),
-        _ => Err(Error::InvalidInput("noncanonical whitelist base".into())),
-    }
-}
-
-#[cfg(test)]
-fn bits_to_base(bits: u8) -> u8 {
-    b"ACGT"[bits as usize]
-}
-
-#[derive(Default)]
-struct BitWriter {
-    bytes: Vec<u8>,
-    bits: usize,
-}
-
-impl BitWriter {
-    fn write(&mut self, value: usize, width: usize) -> Result<()> {
-        if width < usize::BITS as usize && value >= (1usize << width) {
-            return Err(Error::InvalidInput(
-                "bit field value is out of range".into(),
-            ));
-        }
-        for shift in (0..width).rev() {
-            if self.bits % 8 == 0 {
-                self.bytes.push(0);
-            }
-            let byte = self.bytes.len() - 1;
-            self.bytes[byte] |= (((value >> shift) & 1) as u8) << (7 - self.bits % 8);
-            self.bits += 1;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.bits
-    }
-
-    #[cfg(test)]
-    fn finish(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
-#[cfg(test)]
-struct BitReader<'a> {
-    bytes: &'a [u8],
-    bits: usize,
-    position: usize,
-}
-
-#[cfg(test)]
-impl<'a> BitReader<'a> {
-    fn new(bytes: &'a [u8], bits: usize) -> Result<Self> {
-        if bytes.len() != bits.div_ceil(8) {
-            return Err(Error::InvalidFormat(
-                "whitelist bitstream length mismatch".into(),
-            ));
-        }
-        if bits % 8 != 0 && bytes.last().copied().unwrap_or(0) & ((1 << (8 - bits % 8)) - 1) != 0 {
-            return Err(Error::InvalidFormat(
-                "nonzero whitelist bitstream padding".into(),
-            ));
-        }
-        Ok(Self {
-            bytes,
-            bits,
-            position: 0,
-        })
-    }
-
-    fn read(&mut self, width: usize) -> Result<usize> {
-        if width > self.remaining() {
-            return Err(Error::InvalidFormat("truncated whitelist bitstream".into()));
-        }
-        let mut value = 0usize;
-        for _ in 0..width {
-            value = (value << 1)
-                | ((self.bytes[self.position / 8] >> (7 - self.position % 8)) & 1) as usize;
-            self.position += 1;
-        }
-        Ok(value)
-    }
-
-    fn remaining(&self) -> usize {
-        self.bits - self.position
-    }
-}
-
-#[cfg(test)]
-fn decode_mapped_body(
-    input: &mut Cursor<Vec<u8>>,
-    reference: &[u8],
-    start: i64,
-    is_reverse: bool,
-) -> Result<Vec<u8>> {
-    let whitelist = index_read::merge_whitelists(&[]).map_err(index_decode_error)?;
-    decode_operation_body(
-        input,
-        Some((reference, nonnegative_usize(start, "alignment start")?)),
-        is_reverse,
-        &[],
-        0,
-        &whitelist,
-    )
-}
-
-fn encode_index_metadata(
-    descriptors: &[IndexEncodingDescriptor],
-    global_whitelist: &Whitelist,
-) -> Result<Vec<u8>> {
+fn encode_index_metadata(descriptors: &[IndexDescriptor]) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     write_u64(&mut output, descriptors.len() as u64)?;
     for descriptor in descriptors {
@@ -4895,17 +3434,14 @@ fn encode_index_metadata(
         write_u64(&mut output, descriptor.range.start as u64)?;
         write_u64(&mut output, descriptor.range.len() as u64)?;
     }
-    let whitelist = index_read::encode_whitelist(global_whitelist).map_err(index_encode_error)?;
-    write_u64(&mut output, whitelist.len() as u64)?;
-    output.extend(whitelist);
     Ok(output)
 }
 
 fn decode_index_metadata(
     input: &[u8],
     layout: AlignmentLayout,
-) -> Result<(Vec<IndexDescriptor>, Whitelist)> {
-    if input.len() < 16 {
+) -> Result<Vec<IndexDescriptor>> {
+    if input.len() < 8 {
         return Err(Error::InvalidFormat(
             "embedded index metadata is too short".into(),
         ));
@@ -4914,7 +3450,6 @@ fn decode_index_metadata(
     let count = usize_from(read_u64(&mut input)?, "embedded index range count")?;
     let minimum_descriptors = count
         .checked_mul(17)
-        .and_then(|length| length.checked_add(8))
         .ok_or_else(|| Error::InvalidFormat("embedded index metadata size overflow".into()))?;
     if minimum_descriptors > input.get_ref().len() - input.position() as usize {
         return Err(Error::InvalidFormat(
@@ -4937,20 +3472,6 @@ fn decode_index_metadata(
             range: EmbeddedIndexRange { mate, start, end },
         });
     }
-    let whitelist_len = usize_from(read_u64(&mut input)?, "embedded index whitelist")?;
-    let whitelist_start = input.position() as usize;
-    let whitelist_end = whitelist_start
-        .checked_add(whitelist_len)
-        .ok_or_else(|| Error::InvalidFormat("embedded index whitelist overflow".into()))?;
-    if whitelist_end > input.get_ref().len() {
-        return Err(Error::InvalidFormat(
-            "embedded index whitelist exceeds metadata".into(),
-        ));
-    }
-    let global_whitelist =
-        index_read::decode_whitelist(&input.get_ref()[whitelist_start..whitelist_end])
-            .map_err(index_decode_error)?;
-    input.set_position(whitelist_end as u64);
     if input.position() != input.get_ref().len() as u64 {
         return Err(Error::InvalidFormat(
             "trailing embedded index metadata bytes".into(),
@@ -4966,7 +3487,7 @@ fn decode_index_metadata(
         }
         error => error,
     })?;
-    Ok((descriptors, global_whitelist))
+    Ok(descriptors)
 }
 
 fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
@@ -4985,6 +3506,12 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
     if flags & !0x1f != 0 {
         return Err(Error::InvalidFormat(
             "unknown alignment archive flags".into(),
+        ));
+    }
+    let index_stream_count = usize::from(read_u8(input)?);
+    if index_stream_count > 2 {
+        return Err(Error::InvalidFormat(
+            "index stream count must be at most two".into(),
         ));
     }
     let absolute_position_width = usize::from(read_u8(input)?);
@@ -5019,7 +3546,7 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
     input.read_exact(&mut reference_block)?;
     let mut index_metadata = vec![0; index_metadata_len];
     input.read_exact(&mut index_metadata)?;
-    let (indexes, global_whitelist) = decode_index_metadata(&index_metadata, layout)?;
+    let indexes = decode_index_metadata(&index_metadata, layout)?;
     Ok(ArchiveHeader {
         flags,
         id_mode,
@@ -5027,9 +3554,9 @@ fn read_header<R: Read>(input: &mut R) -> Result<ArchiveHeader> {
         chunk_count: chunks,
         reference: decode_reference(&reference_block)?,
         indexes,
-        global_whitelist,
         absolute_position_width,
         delta_position_width,
+        index_streams: index_stream_count,
     })
 }
 
@@ -5164,23 +3691,6 @@ fn read_packed(input: &mut Cursor<Vec<u8>>) -> Result<PackedSequence> {
             "unknown packed sequence encoding".into(),
         )),
     }
-}
-
-#[cfg(test)]
-fn take_literal_bytes(input: &mut Cursor<Vec<u8>>, length: usize) -> Result<Vec<u8>> {
-    let start = usize::try_from(input.position())
-        .map_err(|_| Error::InvalidFormat("record literal offset is too large".into()))?;
-    let end = start
-        .checked_add(length)
-        .ok_or_else(|| Error::InvalidFormat("record literal length overflow".into()))?;
-    if end > input.get_ref().len() {
-        return Err(Error::InvalidFormat(
-            "truncated record literal bytes".into(),
-        ));
-    }
-    let literal = input.get_ref()[start..end].to_vec();
-    input.set_position(end as u64);
-    Ok(literal)
 }
 
 #[cfg(test)]
@@ -5412,83 +3922,6 @@ fn stage_log(progress: &ProgressBar, message: impl AsRef<str>) {
 mod tests {
     use super::*;
 
-    struct RecordDirectory {
-        start: usize,
-        values: [usize; 8],
-        payload_start: usize,
-    }
-
-    fn record_directory(encoded: &[u8], count: usize) -> RecordDirectory {
-        let mut cursor = Cursor::new(encoded.to_vec());
-        cursor.set_position((count.div_ceil(8) * 2) as u64);
-        let positions_len = read_u64(&mut cursor).unwrap() as usize;
-        cursor.set_position(cursor.position() + positions_len as u64);
-        let start = cursor.position() as usize;
-        let mut values = [0; 8];
-        for value in &mut values {
-            *value = read_u64(&mut cursor).unwrap() as usize;
-        }
-        RecordDirectory {
-            start,
-            values,
-            payload_start: cursor.position() as usize,
-        }
-    }
-
-    fn record_literals(encoded: &[u8], count: usize) -> &[u8] {
-        let directory = record_directory(encoded, count);
-        let literal_start = directory.payload_start
-            + directory.values[0]
-            + directory.values[2]
-            + directory.values[4]
-            + directory.values[5]
-            + directory.values[6];
-        &encoded[literal_start..literal_start + directory.values[7]]
-    }
-
-    fn single_index_record_stream(
-        index_sequence: &[u8],
-        whitelist_sequences: &[Vec<u8>],
-    ) -> (Vec<u8>, Vec<IndexDescriptor>, Whitelist) {
-        let range = EmbeddedIndexRange {
-            mate: EmbeddedIndexMate::R1,
-            start: 0,
-            end: index_sequence.len(),
-        };
-        let mut builder = WhitelistBuilder::new();
-        for sequence in whitelist_sequences {
-            builder.add(sequence).unwrap();
-        }
-        let local = builder.finish().unwrap();
-        let global = index_read::merge_whitelists(&[local.clone()]).unwrap();
-        let encoding = vec![IndexEncodingDescriptor {
-            range: range.clone(),
-            local_whitelist: local,
-        }];
-        let descriptors = vec![IndexDescriptor { range }];
-        let pair = AlignedPair {
-            first: ReadRecord::new("read", b"G".to_vec(), None),
-            second: None,
-            first_hit: None,
-            second_hit: None,
-            first_selection: AlignmentSelection::default(),
-            second_selection: AlignmentSelection::default(),
-            indexes: vec![SpoolIndexRead {
-                sequence: index_sequence.to_vec(),
-                quality: None,
-            }],
-        };
-        let encoded = write_record_stream(
-            b"".as_slice(),
-            &[pair],
-            AlignmentLayout::SingleEnd,
-            &encoding,
-            &global,
-        )
-        .unwrap();
-        (encoded, descriptors, global)
-    }
-
     fn compress_reference_payload(payload: &[u8]) -> Vec<u8> {
         zstd::stream::encode_all(Cursor::new(payload), 1).unwrap()
     }
@@ -5504,21 +3937,6 @@ mod tests {
         }
     }
 
-    fn encoding_descriptors(ranges: &[EmbeddedIndexRange]) -> Vec<IndexEncodingDescriptor> {
-        ranges
-            .iter()
-            .cloned()
-            .map(|range| {
-                let mut builder = WhitelistBuilder::new();
-                builder.add(&vec![b'A'; range.len()]).unwrap();
-                IndexEncodingDescriptor {
-                    range,
-                    local_whitelist: builder.finish().unwrap(),
-                }
-            })
-            .collect()
-    }
-
     fn single_quality_pair(quality: &[u8]) -> AlignedPair {
         AlignedPair {
             first: ReadRecord::new("read", vec![b'A'; quality.len()], Some(quality.to_vec())),
@@ -5528,6 +3946,7 @@ mod tests {
             first_selection: AlignmentSelection::default(),
             second_selection: AlignmentSelection::default(),
             indexes: Vec::new(),
+            index_reads: Vec::new(),
         }
     }
 
@@ -5694,14 +4113,7 @@ mod tests {
         let descriptors = ranges
             .iter()
             .cloned()
-            .map(|range| {
-                let mut builder = WhitelistBuilder::new();
-                builder.add(b"AC").unwrap();
-                IndexEncodingDescriptor {
-                    range,
-                    local_whitelist: builder.finish().unwrap(),
-                }
-            })
+            .map(|range| IndexDescriptor { range })
             .collect::<Vec<_>>();
         let pair = AlignedPair {
             first,
@@ -5711,6 +4123,7 @@ mod tests {
             first_selection: AlignmentSelection::default(),
             second_selection: AlignmentSelection::default(),
             indexes: extracted,
+            index_reads: Vec::new(),
         };
         assert_eq!(
             reconstruct_quality_row(&pair, 0, &descriptors).unwrap(),
@@ -5796,6 +4209,7 @@ mod tests {
             first_selection: AlignmentSelection::default(),
             second_selection: AlignmentSelection::default(),
             indexes: Vec::new(),
+            index_reads: Vec::new(),
         };
         let options = crate::AlignmentCompressionOptions {
             preserve_quality: false,
@@ -5864,7 +4278,7 @@ mod tests {
     }
 
     #[test]
-    fn v20_chunk_round_trips_embedded_indexes() {
+    fn chunk_round_trips_embedded_indexes() {
         for preserve_quality in [false, true] {
             let ranges = vec![
                 EmbeddedIndexRange {
@@ -5886,25 +4300,6 @@ mod tests {
                 Some(original_quality.clone()),
             );
             let indexes = split_pair_indexes(&mut record, None, &ranges, preserve_quality).unwrap();
-            let local_whitelists = ranges
-                .iter()
-                .enumerate()
-                .map(|(index, _)| {
-                    let mut builder = WhitelistBuilder::new();
-                    builder.add(&indexes[index].sequence).unwrap();
-                    builder.finish().unwrap()
-                })
-                .collect::<Vec<_>>();
-            let global_whitelist = index_read::merge_whitelists(&local_whitelists).unwrap();
-            let encoding_descriptors = ranges
-                .iter()
-                .cloned()
-                .zip(local_whitelists)
-                .map(|(range, local_whitelist)| IndexEncodingDescriptor {
-                    range,
-                    local_whitelist,
-                })
-                .collect::<Vec<_>>();
             let descriptors = ranges
                 .into_iter()
                 .map(|range| IndexDescriptor { range })
@@ -5917,6 +4312,7 @@ mod tests {
                 first_selection: AlignmentSelection::default(),
                 second_selection: AlignmentSelection::default(),
                 indexes,
+                index_reads: Vec::new(),
             };
             let options = crate::AlignmentCompressionOptions {
                 preserve_quality,
@@ -5931,8 +4327,7 @@ mod tests {
                 &options,
                 IdMode::Independent,
                 AlignmentLayout::SingleEnd,
-                &encoding_descriptors,
-                &global_whitelist,
+                &descriptors,
             )
             .unwrap();
             let archive_chunk = EncodedArchiveChunk {
@@ -5951,15 +4346,16 @@ mod tests {
                 preserve_quality,
                 &[],
                 &descriptors,
-                &global_whitelist,
                 1,
                 1,
+                0,
             )
             .unwrap();
             let (_, group) = decoded
                 .next_group(AlignmentLayout::SingleEnd, None)
                 .unwrap();
-            let AlignedRecordGroup::Single(record) = group else {
+            assert!(group.index_reads.is_empty());
+            let SequenceRecordGroup::Single(record) = group.sequence else {
                 unreachable!();
             };
             assert_eq!(record.sequence, original_sequence);
@@ -5967,6 +4363,141 @@ mod tests {
                 record.quality,
                 preserve_quality.then_some(original_quality.clone())
             );
+        }
+    }
+
+    #[test]
+    fn index_read_files_round_trip_through_chunks() {
+        for (preserve_ids, preserve_quality) in [(true, true), (true, false), (false, true)] {
+            let pairs = vec![
+                AlignedPair {
+                    first: ReadRecord::new("read0", b"ACGT".to_vec(), Some(b"ABCD".to_vec())),
+                    second: None,
+                    first_hit: None,
+                    second_hit: None,
+                    first_selection: AlignmentSelection::default(),
+                    second_selection: AlignmentSelection::default(),
+                    indexes: Vec::new(),
+                    index_reads: vec![
+                        ReadRecord::new("idx0", b"AACCGG".to_vec(), Some(b"abcdef".to_vec())),
+                        ReadRecord::new("idx1", b"TTGGCC".to_vec(), Some(b"ghijkl".to_vec())),
+                    ],
+                },
+                AlignedPair {
+                    first: ReadRecord::new("read1", b"TTTT".to_vec(), Some(b"EFGH".to_vec())),
+                    second: None,
+                    first_hit: None,
+                    second_hit: None,
+                    first_selection: AlignmentSelection::default(),
+                    second_selection: AlignmentSelection::default(),
+                    indexes: Vec::new(),
+                    index_reads: vec![
+                        ReadRecord::new("idx2", b"ACGTAC".to_vec(), Some(b"mnopqr".to_vec())),
+                        ReadRecord::new("idx3", b"GGTTAC".to_vec(), Some(b"stuvwx".to_vec())),
+                    ],
+                },
+            ];
+            let mode = if preserve_ids {
+                IdMode::Independent
+            } else {
+                IdMode::None
+            };
+            let options = crate::AlignmentCompressionOptions {
+                preserve_ids,
+                id_prefix_chars: if preserve_ids { None } else { Some(0) },
+                preserve_quality,
+                zstd_level: 1,
+                index_read_files: vec![
+                    std::path::PathBuf::from("i1.fastq"),
+                    std::path::PathBuf::from("i2.fastq"),
+                ],
+                ..crate::AlignmentCompressionOptions::default()
+            };
+            let encoded = encode_chunk(
+                &[],
+                &pairs,
+                1,
+                1,
+                &options,
+                mode,
+                AlignmentLayout::SingleEnd,
+                &[],
+            )
+            .unwrap();
+            assert!(encoded.indexes_raw_len > 0);
+            let archive_chunk = EncodedArchiveChunk {
+                first_record: 0,
+                record_count: encoded.pairs as usize,
+                raw_len: encoded.raw_len as usize,
+                ids_len: encoded.ids_len as usize,
+                qualities_len: encoded.qualities_len as usize,
+                records_len: encoded.records_len as usize,
+                compressed: encoded.compressed,
+            };
+            let mut decoded = decode_archive_chunk(
+                archive_chunk,
+                mode,
+                AlignmentLayout::SingleEnd,
+                preserve_quality,
+                &[],
+                &[],
+                1,
+                1,
+                2,
+            )
+            .unwrap();
+            let (_, group) = decoded
+                .next_group(AlignmentLayout::SingleEnd, None)
+                .unwrap();
+            assert_eq!(group.index_reads.len(), 2);
+            let SequenceRecordGroup::Single(record) = group.sequence else {
+                unreachable!();
+            };
+            assert_eq!(record.sequence, b"ACGT");
+            assert_eq!(
+                record.quality,
+                preserve_quality.then_some(b"ABCD".to_vec())
+            );
+            assert_eq!(
+                record.id,
+                if preserve_ids {
+                    &b"read0"[..]
+                } else {
+                    &b""[..]
+                }
+            );
+            assert_eq!(group.index_reads[0].sequence, b"AACCGG");
+            assert_eq!(group.index_reads[1].sequence, b"TTGGCC");
+            assert_eq!(
+                group.index_reads[0].quality,
+                preserve_quality.then_some(b"abcdef".to_vec())
+            );
+            assert_eq!(
+                group.index_reads[0].id,
+                if preserve_ids {
+                    &b"read0"[..]
+                } else {
+                    &b""[..]
+                }
+            );
+            let (_, group) = decoded
+                .next_group(AlignmentLayout::SingleEnd, None)
+                .unwrap();
+            let SequenceRecordGroup::Single(record) = group.sequence else {
+                unreachable!();
+            };
+            assert_eq!(record.sequence, b"TTTT");
+            assert_eq!(group.index_reads[0].sequence, b"ACGTAC");
+            assert_eq!(group.index_reads[1].sequence, b"GGTTAC");
+            assert_eq!(
+                group.index_reads[1].id,
+                if preserve_ids {
+                    &b"read1"[..]
+                } else {
+                    &b""[..]
+                }
+            );
+            assert!(decoded.next_group(AlignmentLayout::SingleEnd, None).is_none());
         }
     }
 
@@ -5979,19 +4510,15 @@ mod tests {
             start: 1,
             end: 3,
         };
-        let mut builder = WhitelistBuilder::new();
-        builder.add(b"CG").unwrap();
-        let local_whitelist = builder.finish().unwrap();
-        let global_whitelist = index_read::merge_whitelists(&[local_whitelist.clone()]).unwrap();
-        let descriptors = vec![IndexEncodingDescriptor {
+        let descriptors = vec![IndexDescriptor {
             range: range.clone(),
-            local_whitelist,
         }];
-        let metadata = encode_index_metadata(&descriptors, &global_whitelist).unwrap();
+        let metadata = encode_index_metadata(&descriptors).unwrap();
         let mut header = Vec::new();
         header.extend(MAGIC);
         write_u32(&mut header, VERSION).unwrap();
         write_u16(&mut header, 4).unwrap();
+        header.push(0);
         header.extend([1, 1]);
         write_u64(&mut header, reference.len() as u64).unwrap();
         write_u64(&mut header, metadata.len() as u64).unwrap();
@@ -6000,319 +4527,9 @@ mod tests {
         header.extend(metadata);
         let decoded = read_header(&mut Cursor::new(header)).unwrap();
         assert_eq!(decoded.chunk_count, 9);
+        assert_eq!(decoded.index_streams, 0);
         assert_eq!(decoded.indexes.len(), 1);
         assert_eq!(decoded.indexes[0].range, range);
-        assert_eq!(
-            index_read::encode_whitelist(&decoded.global_whitelist).unwrap(),
-            index_read::encode_whitelist(&global_whitelist).unwrap()
-        );
-    }
-
-    #[test]
-    fn v20_metadata_serializes_shared_whitelist_entries_once() {
-        let ranges = [
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 0,
-                end: 2,
-            },
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 2,
-                end: 4,
-            },
-        ];
-        let local_whitelists = ranges
-            .iter()
-            .map(|_| {
-                let mut builder = WhitelistBuilder::new();
-                builder.add(b"CG").unwrap();
-                builder.finish().unwrap()
-            })
-            .collect::<Vec<_>>();
-        let global_whitelist = index_read::merge_whitelists(&local_whitelists).unwrap();
-        let descriptors = ranges
-            .into_iter()
-            .zip(local_whitelists)
-            .map(|(range, local_whitelist)| IndexEncodingDescriptor {
-                range,
-                local_whitelist,
-            })
-            .collect::<Vec<_>>();
-
-        let metadata = encode_index_metadata(&descriptors, &global_whitelist).unwrap();
-        let whitelist_payload = index_read::encode_whitelist(&global_whitelist).unwrap();
-        assert_eq!(metadata.len(), 8 + 2 * 17 + 8 + whitelist_payload.len());
-        assert_eq!(
-            metadata.windows(2).filter(|bytes| *bytes == b"CG").count(),
-            1
-        );
-
-        let (decoded, decoded_whitelist) =
-            decode_index_metadata(&metadata, AlignmentLayout::SingleEnd).unwrap();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(
-            index_read::encode_whitelist(&decoded_whitelist).unwrap(),
-            whitelist_payload
-        );
-    }
-
-    #[test]
-    fn v20_empty_index_metadata_includes_an_empty_global_whitelist() {
-        let global_whitelist = index_read::merge_whitelists(&[]).unwrap();
-        let metadata = encode_index_metadata(&[], &global_whitelist).unwrap();
-        assert_eq!(metadata.len(), 17);
-
-        let (descriptors, decoded_whitelist) =
-            decode_index_metadata(&metadata, AlignmentLayout::SingleEnd).unwrap();
-        assert!(descriptors.is_empty());
-        assert_eq!(
-            index_read::encode_whitelist(&decoded_whitelist).unwrap(),
-            index_read::encode_whitelist(&global_whitelist).unwrap()
-        );
-    }
-
-    #[test]
-    fn local_and_global_whitelist_ordinal_differences_round_trip() {
-        let mut first_builder = WhitelistBuilder::new();
-        for sequence in [b"TTTT".as_slice(), b"TTTT", b"AAAA"] {
-            first_builder.add(sequence).unwrap();
-        }
-        let first_local = first_builder.finish().unwrap();
-        let mut second_builder = WhitelistBuilder::new();
-        second_builder.add(b"AAAA").unwrap();
-        let second_local = second_builder.finish().unwrap();
-        let global_whitelist =
-            index_read::merge_whitelists(&[first_local.clone(), second_local.clone()]).unwrap();
-        let encoding_descriptors = vec![
-            IndexEncodingDescriptor {
-                range: EmbeddedIndexRange {
-                    mate: EmbeddedIndexMate::R1,
-                    start: 0,
-                    end: 4,
-                },
-                local_whitelist: first_local,
-            },
-            IndexEncodingDescriptor {
-                range: EmbeddedIndexRange {
-                    mate: EmbeddedIndexMate::R1,
-                    start: 4,
-                    end: 8,
-                },
-                local_whitelist: second_local,
-            },
-        ];
-        let descriptors = encoding_descriptors
-            .iter()
-            .map(|descriptor| IndexDescriptor {
-                range: descriptor.range.clone(),
-            })
-            .collect::<Vec<_>>();
-        let pair = AlignedPair {
-            first: ReadRecord::new("read", b"G".to_vec(), None),
-            second: None,
-            first_hit: None,
-            second_hit: None,
-            first_selection: AlignmentSelection::default(),
-            second_selection: AlignmentSelection::default(),
-            indexes: vec![
-                SpoolIndexRead {
-                    sequence: b"TTTT".to_vec(),
-                    quality: None,
-                },
-                SpoolIndexRead {
-                    sequence: b"AAAA".to_vec(),
-                    quality: None,
-                },
-            ],
-        };
-
-        let encoded = write_record_stream(
-            b"".as_slice(),
-            &[pair],
-            AlignmentLayout::SingleEnd,
-            &encoding_descriptors,
-            &global_whitelist,
-        )
-        .unwrap();
-        let decoded = decode_records(
-            &encoded,
-            1,
-            &[],
-            AlignmentLayout::SingleEnd,
-            &descriptors,
-            &global_whitelist,
-        )
-        .unwrap();
-        assert_eq!(decoded[0][0], b"TTTTAAAAG");
-    }
-
-    #[test]
-    fn v20_record_directory_and_u16_ordinals_are_byte_aligned() {
-        let sequences = (0..257)
-            .map(|mut value| {
-                let mut sequence = vec![b'A'; 5];
-                for position in (0..5).rev() {
-                    sequence[position] = b"ACGT"[value % 4];
-                    value /= 4;
-                }
-                sequence
-            })
-            .collect::<Vec<_>>();
-        let (encoded, descriptors, global) =
-            single_index_record_stream(&sequences[256], &sequences);
-        let directory = record_directory(&encoded, 1);
-        assert_eq!(directory.payload_start - directory.start, 64);
-        assert_eq!(directory.values[1..7], [1, 1, 1, 1, 2, 0]);
-
-        let ordinal_start = directory.payload_start
-            + directory.values[0]
-            + directory.values[2]
-            + directory.values[4];
-        assert_eq!(&encoded[ordinal_start..ordinal_start + 2], &[0x00, 0x01]);
-        assert_eq!(
-            decode_records(
-                &encoded,
-                1,
-                &[],
-                AlignmentLayout::SingleEnd,
-                &descriptors,
-                &global,
-            )
-            .unwrap()[0][0],
-            [sequences[256].as_slice(), b"G"].concat()
-        );
-    }
-
-    #[test]
-    fn v20_decoder_rejects_odd_truncated_and_extra_ordinal_columns() {
-        let sequence = b"AAAA".to_vec();
-        let (encoded, descriptors, global) =
-            single_index_record_stream(&sequence, std::slice::from_ref(&sequence));
-        let directory = record_directory(&encoded, 1);
-        let ordinal_len_offset = directory.start + 5 * 8;
-        let ordinal_start = directory.payload_start
-            + directory.values[0]
-            + directory.values[2]
-            + directory.values[4];
-        let decode = |bytes: Vec<u8>| {
-            decode_records(
-                &bytes,
-                1,
-                &[],
-                AlignmentLayout::SingleEnd,
-                &descriptors,
-                &global,
-            )
-        };
-
-        let mut odd = encoded.clone();
-        odd[ordinal_len_offset..ordinal_len_offset + 8].copy_from_slice(&1u64.to_le_bytes());
-        assert!(decode(odd).is_err());
-
-        let mut truncated = encoded.clone();
-        truncated.remove(ordinal_start + 1);
-        assert!(decode(truncated).is_err());
-
-        let mut extra = encoded;
-        extra[ordinal_len_offset..ordinal_len_offset + 8].copy_from_slice(&4u64.to_le_bytes());
-        assert!(decode(extra).is_err());
-    }
-
-    #[test]
-    fn v20_mismatch_details_use_one_validated_byte() {
-        let whitelist_sequence = b"AAAAA".to_vec();
-        let (encoded, descriptors, global) =
-            single_index_record_stream(b"AATAA", std::slice::from_ref(&whitelist_sequence));
-        let directory = record_directory(&encoded, 1);
-        assert_eq!(directory.values[3..7], [1, 1, 2, 1]);
-        let detail_start = directory.payload_start
-            + directory.values[0]
-            + directory.values[2]
-            + directory.values[4]
-            + directory.values[5];
-        assert_eq!(encoded[detail_start], (2 << 2) | 3);
-        assert_eq!(
-            decode_records(
-                &encoded,
-                1,
-                &[],
-                AlignmentLayout::SingleEnd,
-                &descriptors,
-                &global,
-            )
-            .unwrap()[0][0],
-            b"AATAAG"
-        );
-
-        let decode = |bytes: Vec<u8>| {
-            decode_records(
-                &bytes,
-                1,
-                &[],
-                AlignmentLayout::SingleEnd,
-                &descriptors,
-                &global,
-            )
-        };
-        let mut invalid_position = encoded.clone();
-        invalid_position[detail_start] = (63 << 2) | 3;
-        assert!(decode(invalid_position).is_err());
-        let mut unchanged_base = encoded;
-        unchanged_base[detail_start] = 2 << 2;
-        assert!(decode(unchanged_base).is_err());
-    }
-
-    #[test]
-    fn v20_long_one_mismatch_falls_back_to_raw_before_columns() {
-        let whitelist_sequence = vec![b'A'; 65];
-        let mut index_sequence = whitelist_sequence.clone();
-        index_sequence[64] = b'C';
-        let (encoded, descriptors, global) =
-            single_index_record_stream(&index_sequence, std::slice::from_ref(&whitelist_sequence));
-        let directory = record_directory(&encoded, 1);
-        assert_eq!(directory.values[1..7], [1, 1, 0, 0, 0, 0]);
-        let raw_start = directory.payload_start + directory.values[0];
-        assert_eq!(encoded[raw_start], 0x80);
-        assert_eq!(
-            decode_records(
-                &encoded,
-                1,
-                &[],
-                AlignmentLayout::SingleEnd,
-                &descriptors,
-                &global,
-            )
-            .unwrap()[0][0],
-            [index_sequence.as_slice(), b"G"].concat()
-        );
-    }
-
-    #[test]
-    fn v20_record_bitmap_padding_must_be_zero() {
-        let sequence = b"AAAA".to_vec();
-        let (encoded, descriptors, global) =
-            single_index_record_stream(&sequence, std::slice::from_ref(&sequence));
-        let directory = record_directory(&encoded, 1);
-        let raw_start = directory.payload_start + directory.values[0];
-        let mismatch_start = raw_start + directory.values[2];
-        let decode = |bytes: Vec<u8>| {
-            decode_records(
-                &bytes,
-                1,
-                &[],
-                AlignmentLayout::SingleEnd,
-                &descriptors,
-                &global,
-            )
-        };
-
-        let mut raw_padding = encoded.clone();
-        raw_padding[raw_start] |= 1;
-        assert!(decode(raw_padding).is_err());
-        let mut mismatch_padding = encoded;
-        mismatch_padding[mismatch_start] |= 1;
-        assert!(decode(mismatch_padding).is_err());
     }
 
     #[test]
@@ -6362,655 +4579,20 @@ mod tests {
                 ArchiveRun {
                     op: ArchiveOp::Match,
                     len: 5,
-                    descriptors: Vec::new(),
                 },
                 ArchiveRun {
                     op: ArchiveOp::Literal,
                     len: 3,
-                    descriptors: Vec::new(),
                 },
                 ArchiveRun {
                     op: ArchiveOp::RefAdvance,
                     len: 9,
-                    descriptors: Vec::new(),
                 },
             ]
         );
         assert_eq!(
-            [
-                ArchiveOp::Match,
-                ArchiveOp::Literal,
-                ArchiveOp::RefAdvance,
-                ArchiveOp::Whitelist,
-            ]
-            .map(|op| op as u8),
-            [0, 1, 2, 3]
-        );
-        for code in 0..=3 {
-            assert_eq!(ArchiveOp::from_code(code).unwrap() as u8, code);
-        }
-    }
-
-    #[test]
-    fn adjacent_whitelist_ranges_share_one_operation() {
-        let ranges = (0..5)
-            .map(|start| EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start,
-                end: start + 1,
-            })
-            .collect::<Vec<_>>();
-        let descriptors = encoding_descriptors(&ranges);
-        let runs = insert_whitelist_runs(
-            vec![ArchiveRun {
-                op: ArchiveOp::Literal,
-                len: 1,
-                descriptors: Vec::new(),
-            }],
-            descriptor_boundaries(&descriptors, 0, 1, false).unwrap(),
-            1,
-        )
-        .unwrap();
-
-        assert_eq!(
-            runs,
-            vec![
-                ArchiveRun {
-                    op: ArchiveOp::Whitelist,
-                    len: 0,
-                    descriptors: vec![0, 1, 2, 3, 4],
-                },
-                ArchiveRun {
-                    op: ArchiveOp::Literal,
-                    len: 1,
-                    descriptors: Vec::new(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn nonadjacent_whitelist_ranges_remain_separate_operations() {
-        let ranges = vec![
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 0,
-                end: 1,
-            },
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 2,
-                end: 3,
-            },
-        ];
-        let descriptors = encoding_descriptors(&ranges);
-        let runs = insert_whitelist_runs(
-            vec![ArchiveRun {
-                op: ArchiveOp::Literal,
-                len: 2,
-                descriptors: Vec::new(),
-            }],
-            descriptor_boundaries(&descriptors, 0, 2, false).unwrap(),
-            2,
-        )
-        .unwrap();
-
-        assert_eq!(
-            runs.iter()
-                .filter(|run| run.op == ArchiveOp::Whitelist)
-                .map(|run| run.descriptors.as_slice())
-                .collect::<Vec<_>>(),
-            vec![&[0][..], &[1][..]]
-        );
-    }
-
-    #[test]
-    fn reverse_adjacent_whitelist_group_reverses_descriptor_order() {
-        let ranges = (0..5)
-            .map(|start| EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start,
-                end: start + 1,
-            })
-            .collect::<Vec<_>>();
-        let descriptors = encoding_descriptors(&ranges);
-
-        assert_eq!(
-            descriptor_boundaries(&descriptors, 0, 1, true).unwrap(),
-            vec![(vec![4, 3, 2, 1, 0], 1)]
-        );
-    }
-
-    #[test]
-    fn archive_opcode_padding_must_be_zero() {
-        let mut body = Vec::new();
-        write_varint(&mut body, 1).unwrap();
-        body.push(1);
-        write_varint(&mut body, 1).unwrap();
-        write_varint(&mut body, 0).unwrap();
-        write_varint(&mut body, 0).unwrap();
-        write_varint(&mut body, 0).unwrap();
-        let whitelist = index_read::merge_whitelists(&[]).unwrap();
-        assert!(matches!(
-            decode_operation_body(
-                &mut Cursor::new(body),
-                Some((b"A", 0)),
-                false,
-                &[],
-                0,
-                &whitelist,
-            ),
-            Err(Error::InvalidFormat(message))
-                if message == "nonzero archive operation padding bits"
-        ));
-    }
-
-    #[test]
-    fn whitelist_modes_and_adjacent_unmapped_ranges_round_trip() {
-        let ranges = [
-            (0, 4, b"ACGT".as_slice(), b"ACGT".as_slice()),
-            (4, 8, b"ACGA".as_slice(), b"ACGT".as_slice()),
-            (8, 12, b"TTAA".as_slice(), b"CCCC".as_slice()),
-            (12, 16, b"ANNT".as_slice(), b"GGGG".as_slice()),
-            (16, 20, b"AGGA".as_slice(), b"ACGT".as_slice()),
-        ];
-        let mut encoding = Vec::new();
-        let mut indexes = Vec::new();
-        let mut locals = Vec::new();
-        let mut original = Vec::new();
-        for &(start, end, sequence, whitelist_sequence) in &ranges {
-            let mut builder = WhitelistBuilder::new();
-            builder.add(whitelist_sequence).unwrap();
-            let local = builder.finish().unwrap();
-            locals.push(local.clone());
-            encoding.push(IndexEncodingDescriptor {
-                range: EmbeddedIndexRange {
-                    mate: EmbeddedIndexMate::R1,
-                    start,
-                    end,
-                },
-                local_whitelist: local,
-            });
-            indexes.push(SpoolIndexRead {
-                sequence: sequence.to_vec(),
-                quality: None,
-            });
-            original.extend_from_slice(sequence);
-        }
-        original.push(b'G');
-        let global = index_read::merge_whitelists(&locals).unwrap();
-        let descriptors = encoding
-            .iter()
-            .map(|descriptor| IndexDescriptor {
-                range: descriptor.range.clone(),
-            })
-            .collect::<Vec<_>>();
-        let pair = AlignedPair {
-            first: ReadRecord::new("read", b"G".to_vec(), None),
-            second: None,
-            first_hit: None,
-            second_hit: None,
-            first_selection: AlignmentSelection::default(),
-            second_selection: AlignmentSelection::default(),
-            indexes,
-        };
-        let encoded = write_record_stream(
-            b"".as_slice(),
-            &[pair],
-            AlignmentLayout::SingleEnd,
-            &encoding,
-            &global,
-        )
-        .unwrap();
-        assert_eq!(record_literals(&encoded, 1), b"TTAAANNTAGGAG");
-        let decoded = decode_records(
-            &encoded,
-            1,
-            &[],
-            AlignmentLayout::SingleEnd,
-            &descriptors,
-            &global,
-        )
-        .unwrap();
-        assert_eq!(decoded[0][0], original);
-    }
-
-    #[test]
-    fn whitelist_placement_round_trips_forward_and_reverse_mapped_reads() {
-        let ranges = vec![
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 1,
-                end: 3,
-            },
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 5,
-                end: 7,
-            },
-        ];
-        let original = b"ACGTACTGAA";
-        for reverse in [false, true] {
-            let mut record = ReadRecord::new("read", original.to_vec(), Some(vec![b'I'; 10]));
-            let indexes = split_pair_indexes(&mut record, None, &ranges, false).unwrap();
-            let mut locals = Vec::new();
-            for index in &indexes {
-                let mut builder = WhitelistBuilder::new();
-                builder.add(&index.sequence).unwrap();
-                locals.push(builder.finish().unwrap());
-            }
-            let global = index_read::merge_whitelists(&locals).unwrap();
-            let encoding = ranges
-                .iter()
-                .cloned()
-                .zip(locals)
-                .map(|(range, local_whitelist)| IndexEncodingDescriptor {
-                    range,
-                    local_whitelist,
-                })
-                .collect::<Vec<_>>();
-            let descriptors = ranges
-                .iter()
-                .cloned()
-                .map(|range| IndexDescriptor { range })
-                .collect::<Vec<_>>();
-            let mut reference = record.sequence.clone();
-            if reverse {
-                reverse_complement(&mut reference);
-            }
-            let hit = GenomeAlignment {
-                start: 0,
-                query_start: 0,
-                query_end: record.sequence.len() as i32,
-                is_reverse: reverse,
-                cigar: vec![CigarOp {
-                    kind: CigarKind::Match,
-                    len: record.sequence.len() as u32,
-                }],
-            };
-            let pair = AlignedPair {
-                first: record,
-                second: None,
-                first_hit: Some(hit),
-                second_hit: None,
-                first_selection: AlignmentSelection::default(),
-                second_selection: AlignmentSelection::default(),
-                indexes,
-            };
-            let encoded = write_record_stream(
-                reference.as_slice(),
-                &[pair],
-                AlignmentLayout::SingleEnd,
-                &encoding,
-                &global,
-            )
-            .unwrap();
-            let decoded = decode_records(
-                &encoded,
-                1,
-                &reference,
-                AlignmentLayout::SingleEnd,
-                &descriptors,
-                &global,
-            )
-            .unwrap();
-            assert_eq!(decoded[0][0], original);
-        }
-    }
-
-    #[test]
-    fn whitelist_decoder_rejects_bad_ordinal_position_padding_and_count() {
-        let range = EmbeddedIndexRange {
-            mate: EmbeddedIndexMate::R1,
-            start: 0,
-            end: 3,
-        };
-        let mut builder = WhitelistBuilder::new();
-        builder.add(b"ACG").unwrap();
-        builder.add(b"TGC").unwrap();
-        builder.add(b"GAT").unwrap();
-        let whitelist = builder.finish().unwrap();
-        let descriptors = vec![IndexDescriptor { range }];
-        let decode = |mode_bits: &[u8], bit_count: usize, op_count: usize| {
-            let mut body = Vec::new();
-            write_varint(&mut body, op_count as u64).unwrap();
-            if op_count != 0 {
-                body.push(0xc0);
-            }
-            write_varint(&mut body, bit_count as u64).unwrap();
-            body.extend_from_slice(mode_bits);
-            decode_operation_body(
-                &mut Cursor::new(body),
-                None,
-                false,
-                &descriptors,
-                0,
-                &whitelist,
-            )
-        };
-        assert!(decode(&[0b0011_0000], 4, 1).is_err());
-        assert!(decode(&[0b0100_1110], 8, 1).is_err());
-        assert!(decode(&[0b0000_0001], 4, 1).is_err());
-        assert!(decode(&[], 0, 1).is_err());
-        assert!(decode(&[0], 1, 1).is_err());
-        assert!(decode(&[], 0, 0).is_err());
-    }
-
-    #[test]
-    fn literal_and_raw_whitelist_sources_share_one_payload_across_ref_advance() {
-        let ranges = vec![
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 1,
-                end: 3,
-            },
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 3,
-                end: 5,
-            },
-        ];
-        let mut locals = Vec::new();
-        for _ in &ranges {
-            let mut builder = WhitelistBuilder::new();
-            builder.add(b"AA").unwrap();
-            locals.push(builder.finish().unwrap());
-        }
-        let global = index_read::merge_whitelists(&locals).unwrap();
-        let encoding = ranges
-            .iter()
-            .cloned()
-            .zip(locals)
-            .map(|(range, local_whitelist)| IndexEncodingDescriptor {
-                range,
-                local_whitelist,
-            })
-            .collect::<Vec<_>>();
-        let descriptors = ranges
-            .into_iter()
-            .map(|range| IndexDescriptor { range })
-            .collect::<Vec<_>>();
-        let indexes = vec![
-            SpoolIndexRead {
-                sequence: b"CC".to_vec(),
-                quality: None,
-            },
-            SpoolIndexRead {
-                sequence: b"NN".to_vec(),
-                quality: None,
-            },
-        ];
-        let runs = vec![
-            ArchiveRun {
-                op: ArchiveOp::Literal,
-                len: 1,
-                descriptors: Vec::new(),
-            },
-            ArchiveRun {
-                op: ArchiveOp::Whitelist,
-                len: 0,
-                descriptors: vec![0, 1],
-            },
-            ArchiveRun {
-                op: ArchiveOp::RefAdvance,
-                len: 1,
-                descriptors: Vec::new(),
-            },
-            ArchiveRun {
-                op: ArchiveOp::Literal,
-                len: 1,
-                descriptors: Vec::new(),
-            },
-        ];
-        let hit = GenomeAlignment {
-            start: 0,
-            query_start: 0,
-            query_end: 2,
-            cigar: Vec::new(),
-            is_reverse: false,
-        };
-        let mut body = Vec::new();
-        encode_operation_body(
-            &mut body,
-            b"GT",
-            Some((&hit, b"A".as_slice())),
-            &runs,
-            &indexes,
-            &encoding,
-            &global,
-        )
-        .unwrap();
-
-        let mut parsed = Cursor::new(body.clone());
-        let operation_count = read_varint(&mut parsed).unwrap() as usize;
-        assert_eq!(operation_count, 4);
-        let mut packed = vec![0; operation_count.div_ceil(4)];
-        parsed.read_exact(&mut packed).unwrap();
-        for index in 0..operation_count {
-            let code = (packed[index / 4] >> (6 - index % 4 * 2)) & 3;
-            if ArchiveOp::from_code(code).unwrap() != ArchiveOp::Whitelist {
-                read_varint(&mut parsed).unwrap();
-            }
-        }
-        let bit_count = read_varint(&mut parsed).unwrap() as usize;
-        assert_eq!(bit_count, 2);
-        let mut bit_bytes = vec![0; bit_count.div_ceil(8)];
-        parsed.read_exact(&mut bit_bytes).unwrap();
-        assert_eq!(bit_bytes, [0b1100_0000]);
-        let literal_start = parsed.position() as usize;
-        assert_eq!(&parsed.get_ref()[literal_start..], b"GCCNNT");
-        parsed.set_position(parsed.get_ref().len() as u64);
-        assert_eq!(parsed.position(), parsed.get_ref().len() as u64);
-
-        assert_eq!(
-            decode_operation_body(
-                &mut Cursor::new(body),
-                Some((b"A", 0)),
-                false,
-                &descriptors,
-                0,
-                &global,
-            )
-            .unwrap(),
-            b"GCCNNT"
-        );
-    }
-
-    #[test]
-    fn exact_and_mismatch_whitelist_fragments_split_mixed_literal_runs() {
-        let ranges = (0..5)
-            .map(|index| EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 1 + index * 2,
-                end: 3 + index * 2,
-            })
-            .collect::<Vec<_>>();
-        let mut locals = Vec::new();
-        for _ in &ranges {
-            let mut builder = WhitelistBuilder::new();
-            builder.add(b"AA").unwrap();
-            locals.push(builder.finish().unwrap());
-        }
-        let global = index_read::merge_whitelists(&locals).unwrap();
-        let encoding = ranges
-            .iter()
-            .cloned()
-            .zip(locals)
-            .map(|(range, local_whitelist)| IndexEncodingDescriptor {
-                range,
-                local_whitelist,
-            })
-            .collect::<Vec<_>>();
-        let descriptors = ranges
-            .into_iter()
-            .map(|range| IndexDescriptor { range })
-            .collect::<Vec<_>>();
-        let indexes = [b"CC".as_slice(), b"AA", b"NN", b"AC", b"GG"]
-            .into_iter()
-            .map(|sequence| SpoolIndexRead {
-                sequence: sequence.to_vec(),
-                quality: None,
-            })
-            .collect::<Vec<_>>();
-        let runs = vec![
-            ArchiveRun {
-                op: ArchiveOp::Literal,
-                len: 1,
-                descriptors: Vec::new(),
-            },
-            ArchiveRun {
-                op: ArchiveOp::Whitelist,
-                len: 0,
-                descriptors: vec![0, 1, 2, 3, 4],
-            },
-            ArchiveRun {
-                op: ArchiveOp::Literal,
-                len: 1,
-                descriptors: Vec::new(),
-            },
-        ];
-        let mut body = Vec::new();
-        encode_operation_body(
-            &mut body,
-            b"GT",
-            None::<(&GenomeAlignment, &[u8])>,
-            &runs,
-            &indexes,
-            &encoding,
-            &global,
-        )
-        .unwrap();
-
-        let mut parsed = Cursor::new(body.clone());
-        assert_eq!(read_varint(&mut parsed).unwrap(), 3);
-        let mut packed = [0];
-        parsed.read_exact(&mut packed).unwrap();
-        read_varint(&mut parsed).unwrap();
-        read_varint(&mut parsed).unwrap();
-        let bit_count = read_varint(&mut parsed).unwrap() as usize;
-        assert_eq!(bit_count, 10);
-        let mut bit_bytes = vec![0; bit_count.div_ceil(8)];
-        parsed.read_exact(&mut bit_bytes).unwrap();
-        let literal_start = parsed.position() as usize;
-        assert_eq!(&parsed.get_ref()[literal_start..], b"GCCNNGGT");
-        parsed.set_position(parsed.get_ref().len() as u64);
-        assert_eq!(parsed.position(), parsed.get_ref().len() as u64);
-
-        assert_eq!(
-            decode_operation_body(
-                &mut Cursor::new(body),
-                None,
-                false,
-                &descriptors,
-                0,
-                &global,
-            )
-            .unwrap(),
-            b"GCCAANNACGGT"
-        );
-    }
-
-    #[test]
-    fn reverse_raw_whitelist_fragments_use_oriented_literal_bytes() {
-        let ranges = vec![
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 1,
-                end: 3,
-            },
-            EmbeddedIndexRange {
-                mate: EmbeddedIndexMate::R1,
-                start: 3,
-                end: 5,
-            },
-        ];
-        let mut locals = Vec::new();
-        for _ in &ranges {
-            let mut builder = WhitelistBuilder::new();
-            builder.add(b"AA").unwrap();
-            locals.push(builder.finish().unwrap());
-        }
-        let global = index_read::merge_whitelists(&locals).unwrap();
-        let encoding = ranges
-            .iter()
-            .cloned()
-            .zip(locals)
-            .map(|(range, local_whitelist)| IndexEncodingDescriptor {
-                range,
-                local_whitelist,
-            })
-            .collect::<Vec<_>>();
-        let descriptors = ranges
-            .into_iter()
-            .map(|range| IndexDescriptor { range })
-            .collect::<Vec<_>>();
-        let indexes = vec![
-            SpoolIndexRead {
-                sequence: b"CC".to_vec(),
-                quality: None,
-            },
-            SpoolIndexRead {
-                sequence: b"NN".to_vec(),
-                quality: None,
-            },
-        ];
-        let runs = vec![
-            ArchiveRun {
-                op: ArchiveOp::Literal,
-                len: 1,
-                descriptors: Vec::new(),
-            },
-            ArchiveRun {
-                op: ArchiveOp::Whitelist,
-                len: 0,
-                descriptors: vec![1, 0],
-            },
-            ArchiveRun {
-                op: ArchiveOp::Literal,
-                len: 1,
-                descriptors: Vec::new(),
-            },
-        ];
-        let hit = GenomeAlignment {
-            start: 0,
-            query_start: 0,
-            query_end: 2,
-            cigar: Vec::new(),
-            is_reverse: true,
-        };
-        let mut body = Vec::new();
-        encode_operation_body(
-            &mut body,
-            b"GT",
-            Some((&hit, b"".as_slice())),
-            &runs,
-            &indexes,
-            &encoding,
-            &global,
-        )
-        .unwrap();
-        let mut parsed = Cursor::new(body.clone());
-        let operation_count = read_varint(&mut parsed).unwrap() as usize;
-        parsed.set_position(parsed.position() + operation_count.div_ceil(4) as u64);
-        for index in 0..operation_count {
-            if !matches!(index, 1) {
-                read_varint(&mut parsed).unwrap();
-            }
-        }
-        let bit_count = read_varint(&mut parsed).unwrap() as usize;
-        parsed.set_position(parsed.position() + bit_count.div_ceil(8) as u64);
-        assert_eq!(&parsed.get_ref()[parsed.position() as usize..], b"ANNGGC");
-        assert_eq!(
-            decode_operation_body(
-                &mut Cursor::new(body),
-                Some((b"", 0)),
-                true,
-                &descriptors,
-                0,
-                &global,
-            )
-            .unwrap(),
-            b"GCCNNT"
+            [ArchiveOp::Match, ArchiveOp::Literal, ArchiveOp::RefAdvance].map(|op| op as u8),
+            [0, 1, 2]
         );
     }
 
@@ -7152,22 +4734,6 @@ mod tests {
                     }]
                 );
 
-                let mut sequence = compact.clone();
-                if reverse {
-                    reverse_complement(&mut sequence);
-                }
-                let record = ReadRecord::new("read", sequence.clone(), None);
-                let mut encoded = Vec::new();
-                encode_record_body(&mut encoded, &record, &transformed, compact.as_slice())
-                    .unwrap();
-                let decoded = decode_mapped_body(
-                    &mut Cursor::new(encoded),
-                    &compact,
-                    transformed.start,
-                    reverse,
-                )
-                .unwrap();
-                assert_eq!(decoded, sequence);
             }
         }
     }
@@ -7238,15 +4804,6 @@ mod tests {
             .unwrap();
         assert_eq!(overlapping.start, 3);
 
-        for (sequence, hit) in [(b"AAAGGG".as_slice(), skipped), (b"CCCC", overlapping)] {
-            let record = ReadRecord::new("read", sequence.to_vec(), None);
-            let mut encoded = Vec::new();
-            encode_record_body(&mut encoded, &record, &hit, compact.as_slice()).unwrap();
-            assert_eq!(
-                decode_mapped_body(&mut Cursor::new(encoded), &compact, hit.start, false).unwrap(),
-                sequence
-            );
-        }
     }
 
     #[test]
@@ -7323,6 +4880,7 @@ mod tests {
                 first_selection: AlignmentSelection::default(),
                 second_selection: AlignmentSelection::default(),
                 indexes: Vec::new(),
+                index_reads: Vec::new(),
             };
             let mut encoded = Vec::new();
             write_id_stream(&mut encoded, &[pair], mode, AlignmentLayout::PairedEnd).unwrap();
@@ -7333,165 +4891,7 @@ mod tests {
     }
 
     #[test]
-    fn v20_literal_column_is_unframed_raw_source_bytes() {
-        let whitelist = index_read::merge_whitelists(&[]).unwrap();
-        for sequence in [b"ACGTAC".as_slice(), b"ACNTac".as_slice()] {
-            let pair = AlignedPair {
-                first: ReadRecord::new("read", sequence.to_vec(), None),
-                second: None,
-                first_hit: None,
-                second_hit: None,
-                first_selection: AlignmentSelection::default(),
-                second_selection: AlignmentSelection::default(),
-                indexes: Vec::new(),
-            };
-            let encoded = write_record_stream(
-                b"".as_slice(),
-                &[pair],
-                AlignmentLayout::SingleEnd,
-                &[],
-                &whitelist,
-            )
-            .unwrap();
-            assert_eq!(record_literals(&encoded, 1), sequence);
-            assert_eq!(
-                decode_records(
-                    &encoded,
-                    1,
-                    &[],
-                    AlignmentLayout::SingleEnd,
-                    &[],
-                    &whitelist,
-                )
-                .unwrap()[0][0],
-                sequence
-            );
-        }
-    }
-
-    #[test]
-    fn v20_mapped_literal_and_raw_whitelist_bytes_use_alignment_orientation() {
-        let range = EmbeddedIndexRange {
-            mate: EmbeddedIndexMate::R1,
-            start: 1,
-            end: 3,
-        };
-        let mut builder = WhitelistBuilder::new();
-        builder.add(b"AA").unwrap();
-        let local = builder.finish().unwrap();
-        let global = index_read::merge_whitelists(std::slice::from_ref(&local)).unwrap();
-        let encoding = vec![IndexEncodingDescriptor {
-            range: range.clone(),
-            local_whitelist: local,
-        }];
-        let descriptors = vec![IndexDescriptor { range }];
-
-        for (reverse, reference, expected_literals) in [
-            (false, b"A".as_slice(), b"GCCC".as_slice()),
-            (true, b"T", b"GGGC"),
-        ] {
-            let hit = GenomeAlignment {
-                start: 0,
-                query_start: 0,
-                query_end: 3,
-                is_reverse: reverse,
-                cigar: vec![
-                    CigarOp {
-                        kind: CigarKind::Ins,
-                        len: 1,
-                    },
-                    CigarOp {
-                        kind: CigarKind::Match,
-                        len: 1,
-                    },
-                    CigarOp {
-                        kind: CigarKind::Ins,
-                        len: 1,
-                    },
-                ],
-            };
-            let pair = AlignedPair {
-                first: ReadRecord::new("read", b"GAC".to_vec(), None),
-                second: None,
-                first_hit: Some(hit),
-                second_hit: None,
-                first_selection: AlignmentSelection::default(),
-                second_selection: AlignmentSelection::default(),
-                indexes: vec![SpoolIndexRead {
-                    sequence: b"CC".to_vec(),
-                    quality: None,
-                }],
-            };
-            let encoded = write_record_stream(
-                reference,
-                &[pair],
-                AlignmentLayout::SingleEnd,
-                &encoding,
-                &global,
-            )
-            .unwrap();
-            assert_eq!(record_literals(&encoded, 1), expected_literals);
-            assert_eq!(
-                decode_records(
-                    &encoded,
-                    1,
-                    reference,
-                    AlignmentLayout::SingleEnd,
-                    &descriptors,
-                    &global,
-                )
-                .unwrap()[0][0],
-                b"GCCAC"
-            );
-        }
-    }
-
-    #[test]
-    fn v20_decoder_rejects_truncated_and_extra_literal_columns() {
-        let whitelist = index_read::merge_whitelists(&[]).unwrap();
-        let pair = AlignedPair {
-            first: ReadRecord::new("read", b"ACGN".to_vec(), None),
-            second: None,
-            first_hit: None,
-            second_hit: None,
-            first_selection: AlignmentSelection::default(),
-            second_selection: AlignmentSelection::default(),
-            indexes: Vec::new(),
-        };
-        let encoded = write_record_stream(
-            b"".as_slice(),
-            &[pair],
-            AlignmentLayout::SingleEnd,
-            &[],
-            &whitelist,
-        )
-        .unwrap();
-        let directory = record_directory(&encoded, 1);
-        let literal_len_offset = directory.start + 7 * 8;
-        let literal_start = encoded.len() - directory.values[7];
-        let decode = |bytes: &[u8]| {
-            decode_records(bytes, 1, &[], AlignmentLayout::SingleEnd, &[], &whitelist)
-        };
-
-        let mut truncated = encoded.clone();
-        truncated[literal_len_offset..literal_len_offset + 8].copy_from_slice(&3u64.to_le_bytes());
-        truncated.remove(literal_start + 3);
-        assert!(matches!(
-            decode(&truncated),
-            Err(Error::InvalidFormat(message)) if message == "truncated record literal bytes"
-        ));
-
-        let mut extra = encoded;
-        extra[literal_len_offset..literal_len_offset + 8].copy_from_slice(&5u64.to_le_bytes());
-        extra.push(b'X');
-        assert!(matches!(
-            decode(&extra),
-            Err(Error::InvalidFormat(message)) if message == "trailing record literal bytes"
-        ));
-    }
-
-    #[test]
-    fn v20_alignment_cost_counts_raw_literal_bytes() {
+    fn alignment_cost_counts_raw_literal_bytes() {
         assert_eq!(
             alignment_candidate_core_cost(
                 b"ACGTNN",
@@ -7499,7 +4899,6 @@ mod tests {
                 &[ArchiveRun {
                     op: ArchiveOp::Literal,
                     len: 6,
-                    descriptors: Vec::new(),
                 }],
             )
             .unwrap(),
@@ -7720,6 +5119,7 @@ mod tests {
                 first_selection: AlignmentSelection::default(),
                 second_selection: AlignmentSelection::default(),
                 indexes: Vec::new(),
+                index_reads: Vec::new(),
             },
             AlignedPair {
                 first: ReadRecord::new("b/1", b"NNNN".to_vec(), None),
@@ -7729,9 +5129,9 @@ mod tests {
                 first_selection: AlignmentSelection::default(),
                 second_selection: AlignmentSelection::default(),
                 indexes: Vec::new(),
+                index_reads: Vec::new(),
             },
         ];
-        let whitelist = index_read::merge_whitelists(&[]).unwrap();
         let encoded = write_v21_record_stream(
             reference.as_slice(),
             &pairs,
@@ -7739,10 +5139,12 @@ mod tests {
             1,
             AlignmentLayout::PairedEnd,
             &[],
-            &whitelist,
+            true,
+            0,
             1,
         )
-        .unwrap();
+        .unwrap()
+        .bytes;
         let mut cursor = Cursor::new(encoded.clone());
         let section_count = 1 + 2 * V21_MATE_SECTION_COUNT;
         assert_eq!(read_u32(&mut cursor).unwrap(), section_count as u32);
@@ -7757,17 +5159,22 @@ mod tests {
             );
         }
         assert_eq!(cursor.position(), encoded.len() as u64);
-        let decoded = decode_v21_records(
-            &encoded,
-            pairs.len(),
-            reference,
-            AlignmentLayout::PairedEnd,
-            &[],
-            &whitelist,
-            1,
-            1,
-        )
-        .unwrap();
+        let (decoded, index_streams) = {
+            let sections = decode_v21_records(
+                &encoded,
+                pairs.len(),
+                reference,
+                AlignmentLayout::PairedEnd,
+                &[],
+                true,
+                0,
+                1,
+                1,
+            )
+            .unwrap();
+            (sections.biological, sections.index_streams)
+        };
+        assert!(index_streams.is_empty());
         assert_eq!(decoded[0][0], b"AACC");
         assert_eq!(decoded[1][0], b"NNNN");
         assert_eq!(decoded[0][1], b"NNNN");
@@ -7796,6 +5203,7 @@ mod tests {
                 first_selection: AlignmentSelection::default(),
                 second_selection: AlignmentSelection::default(),
                 indexes: Vec::new(),
+                index_reads: Vec::new(),
             },
             AlignedPair {
                 first: ReadRecord::new("b/1", b"CCAA".to_vec(), None),
@@ -7805,9 +5213,9 @@ mod tests {
                 first_selection: AlignmentSelection::default(),
                 second_selection: AlignmentSelection::default(),
                 indexes: Vec::new(),
+                index_reads: Vec::new(),
             },
         ];
-        let whitelist = index_read::merge_whitelists(&[]).unwrap();
         let encoded = write_v21_record_stream(
             reference.as_slice(),
             &pairs,
@@ -7815,10 +5223,12 @@ mod tests {
             1,
             AlignmentLayout::PairedEnd,
             &[],
-            &whitelist,
+            true,
+            0,
             1,
         )
-        .unwrap();
+        .unwrap()
+        .bytes;
         let mut cursor = Cursor::new(encoded.clone());
         let section_count = read_u32(&mut cursor).unwrap() as usize;
         let mut sections = Vec::with_capacity(section_count);
@@ -7834,17 +5244,22 @@ mod tests {
         assert_eq!(sections[10], [7, 7]);
         assert_eq!(sections[15], [0, 1]);
 
-        let decoded = decode_v21_records(
-            &encoded,
-            pairs.len(),
-            reference,
-            AlignmentLayout::PairedEnd,
-            &[],
-            &whitelist,
-            1,
-            1,
-        )
-        .unwrap();
+        let (decoded, index_streams) = {
+            let sections = decode_v21_records(
+                &encoded,
+                pairs.len(),
+                reference,
+                AlignmentLayout::PairedEnd,
+                &[],
+                true,
+                0,
+                1,
+                1,
+            )
+            .unwrap();
+            (sections.biological, sections.index_streams)
+        };
+        assert!(index_streams.is_empty());
         assert_eq!(decoded[0][0], b"CCAA");
         assert_eq!(decoded[1][0], b"AACC");
         assert_eq!(decoded[0][1], b"CCAA");
@@ -7965,65 +5380,4 @@ mod tests {
         assert!(selected.selection.rejected_alignment);
     }
 
-    #[test]
-    fn record_stream_round_trips_mate_relative_coordinates() {
-        let reference =
-            b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
-        let first_sequence = reference[10..30].to_vec();
-        let mut second_sequence = reference[40..60].to_vec();
-        reverse_complement(&mut second_sequence);
-        let alignment = |start, reverse| GenomeAlignment {
-            start,
-            query_start: 0,
-            query_end: 20,
-            cigar: vec![CigarOp {
-                kind: CigarKind::Match,
-                len: 20,
-            }],
-            is_reverse: reverse,
-        };
-        let pairs = vec![
-            AlignedPair {
-                first: ReadRecord::new("pair0/1", first_sequence.clone(), None),
-                second: Some(ReadRecord::new("pair0/2", second_sequence.clone(), None)),
-                first_hit: Some(alignment(10, false)),
-                second_hit: Some(alignment(40, true)),
-                first_selection: AlignmentSelection::default(),
-                second_selection: AlignmentSelection::default(),
-                indexes: Vec::new(),
-            },
-            AlignedPair {
-                first: ReadRecord::new("pair1/1", b"ACGTNCGT".to_vec(), None),
-                second: Some(ReadRecord::new("pair1/2", b"NNNNNNNN".to_vec(), None)),
-                first_hit: None,
-                second_hit: None,
-                first_selection: AlignmentSelection::default(),
-                second_selection: AlignmentSelection::default(),
-                indexes: Vec::new(),
-            },
-        ];
-        let reference_slice = reference.as_slice();
-        let whitelist = index_read::merge_whitelists(&[]).unwrap();
-        let encoded = write_record_stream(
-            reference_slice,
-            &pairs,
-            AlignmentLayout::PairedEnd,
-            &[],
-            &whitelist,
-        )
-        .unwrap();
-        let decoded = decode_records(
-            &encoded,
-            pairs.len(),
-            reference,
-            AlignmentLayout::PairedEnd,
-            &[],
-            &whitelist,
-        )
-        .unwrap();
-        assert_eq!(decoded[0][0], first_sequence);
-        assert_eq!(decoded[1][0], second_sequence);
-        assert_eq!(decoded[0][1], b"ACGTNCGT");
-        assert_eq!(decoded[1][1], b"NNNNNNNN");
-    }
 }

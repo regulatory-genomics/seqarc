@@ -285,6 +285,7 @@ pub(crate) fn read_paired_into<R: Read, S: crate::PairedRecordSink>(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_payload_records<
     R: Read,
     F: FnMut(usize, u64, ReadRecord) -> Result<()>,
@@ -408,7 +409,7 @@ fn decode_payload_group<R: Read, F: FnMut(usize, u64, ReadRecord) -> Result<()>>
     let kind = payload.u8()?;
     let singleton = expected_kind == 2;
     if (singleton && !(kind == 1 || kind == 2 || kind == 3))
-        || (!singleton && !(kind == 0 || kind == 4))
+        || !(singleton || kind == 0 || kind == 4)
     {
         return Err(Error::InvalidFormat(format!(
             "invalid RS4 section group kind {kind} (expected {expected_kind})"
@@ -874,8 +875,8 @@ impl RunMerger {
         for path in paths {
             readers.push(RunReader::open(path)?);
         }
-        for run in 0..readers.len() {
-            if let Some((original_id, record)) = readers[run].next()? {
+        for (run, reader) in readers.iter_mut().enumerate() {
+            if let Some((original_id, record)) = reader.next()? {
                 heap.push(HeapEntry {
                     original_id,
                     run,
@@ -952,6 +953,7 @@ fn compact_run_set(set: &mut RunSet, workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_paired_runs<S: crate::PairedRecordSink>(
     mut first_set: RunSet,
     mut second_set: RunSet,
@@ -1078,7 +1080,6 @@ pub fn write_reordered_store_profiled<W: Write>(
     return Ok(result);
     #[allow(unreachable_code)]
     {
-        let temp_dir = temp_dir.as_ref();
         std::fs::create_dir_all(temp_dir)?;
         let assignment_start = std::time::Instant::now();
         let assignments = [
@@ -1471,9 +1472,9 @@ fn write_prepared_profiled_v2<W: Write>(
         qualities: [qualities0, qualities1],
     };
     let sections = [0usize, 1].map(|mate| -> Result<PreparedMateSection> {
-        let mut reader = SequenceSpoolReader::open(&spool_paths[mate])?;
+        let reader = SequenceSpoolReader::open(&spool_paths[mate])?;
         let mut reads = Vec::new();
-        while let Some(read) = reader.next() {
+        for read in reader {
             reads.push(read?);
         }
         let (tx, rx) = crossbeam_channel::bounded(reads.len().max(1));
@@ -1800,6 +1801,7 @@ struct SingletonTailCounts {
     keys: Vec<(u32, bool)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_singleton_tail_section<R: Read + Seek, W: Write>(
     input: &mut R,
     output: &mut W,
@@ -2321,6 +2323,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_sorted_clusters<W, I, E>(
     payload: &mut W,
     sorted: I,
@@ -3073,6 +3076,8 @@ fn reverse_complement_in_place(sequence: &mut [u8]) {
 
 type SingletonSequence = (u64, PackedSequence);
 
+type PartitionedClusters = (Vec<u8>, u32, Vec<SingletonSequence>, Vec<(u64, OrderEntry)>);
+
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 struct OrderEntry {
@@ -3081,9 +3086,7 @@ struct OrderEntry {
     singleton: bool,
 }
 
-fn partition_clusters_v8(
-    clusters: &[ConsensusCluster],
-) -> Result<(Vec<u8>, u32, Vec<SingletonSequence>, Vec<(u64, OrderEntry)>)> {
+fn partition_clusters_v8(clusters: &[ConsensusCluster]) -> Result<PartitionedClusters> {
     let mut multi_bytes = Vec::new();
     let mut multi_cluster_count = 0u32;
     let mut singletons = Vec::new();
@@ -3195,6 +3198,7 @@ fn write_group_descriptor<W: Write>(writer: &mut W, group: &ConsensusCluster) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn copy_group_descriptors<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,

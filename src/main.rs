@@ -7,7 +7,7 @@ use seqarc::{
     decompress_aligned_iter, open_fastx_reader, truncate_read_id, AlignedRecordGroup,
     AlignedRecordSink, AlignerKind, AlignmentCompressionOptions, DecompressionOptions,
     EmbeddedIndexMate, EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions,
-    QualityMode, ReadRecord, Result,
+    QualityMode, ReadRecord, Result, SequenceRecordGroup,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -106,6 +106,12 @@ struct CompressArgs {
     /// Extract an embedded index using one-based inclusive MATE:START:END coordinates.
     #[arg(long = "index-range", value_parser = parse_index_range)]
     index_ranges: Vec<EmbeddedIndexRange>,
+    /// Optional plain, gzip, or zstd index-read FASTQ (I1).
+    #[arg(long = "index-read-1")]
+    index_read_1: Option<PathBuf>,
+    /// Optional plain, gzip, or zstd index-read FASTQ (I2). Requires --index-read-1.
+    #[arg(long = "index-read-2", requires = "index_read_1")]
+    index_read_2: Option<PathBuf>,
     /// Output .seqarc archive.
     #[arg(short, long)]
     output: PathBuf,
@@ -166,6 +172,12 @@ struct DecompressArgs {
     /// Optional mate-2 output. Required for paired archives.
     #[arg(short = '2', long)]
     mate_2: Option<PathBuf>,
+    /// Optional index-read output for I1. Required when the archive stores index reads.
+    #[arg(long = "index-output-1")]
+    index_output_1: Option<PathBuf>,
+    /// Optional index-read output for I2. Requires --index-output-1.
+    #[arg(long = "index-output-2", requires = "index_output_1")]
+    index_output_2: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Fastq)]
     format: OutputFormat,
     /// Force gzip output regardless of output suffix.
@@ -197,6 +209,12 @@ struct ValidateArgs {
     /// Original plain, gzip, or zstd mate-2 FASTQ for byte comparison.
     #[arg(short = '2', long, requires = "mate_1")]
     mate_2: Option<PathBuf>,
+    /// Optional original index-read FASTQ (I1) for byte comparison.
+    #[arg(long = "index-read-1")]
+    index_read_1: Option<PathBuf>,
+    /// Optional original index-read FASTQ (I2) for byte comparison. Requires --index-read-1.
+    #[arg(long = "index-read-2", requires = "index_read_1")]
+    index_read_2: Option<PathBuf>,
     /// Apply the compression-time identifier prefix before comparison.
     #[arg(long, requires = "mate_1")]
     id_prefix_chars: Option<usize>,
@@ -372,34 +390,58 @@ impl RecordWriter {
 struct OutputSink {
     first: Option<RecordWriter>,
     second: Option<RecordWriter>,
+    index: Vec<Option<RecordWriter>>,
     format: Format,
 }
 
 impl AlignedRecordSink for OutputSink {
     fn write_group(&mut self, _original_id: u64, group: AlignedRecordGroup) -> Result<()> {
-        match group {
-            AlignedRecordGroup::Single(record) => {
+        match group.sequence {
+            SequenceRecordGroup::Single(record) => {
                 if self.second.is_some() {
                     return Err(Error::InvalidInput(
                         "single-end archive received two output paths".into(),
                     ));
                 }
-                write_record(self.first.as_mut().unwrap(), &record, self.format)
+                write_record(self.first.as_mut().unwrap(), &record, self.format)?;
             }
-            AlignedRecordGroup::Paired(first, second) => {
+            SequenceRecordGroup::Paired(first, second) => {
                 let second_writer = self.second.as_mut().ok_or_else(|| {
                     Error::InvalidInput("paired archive requires a second output path".into())
                 })?;
                 write_record(self.first.as_mut().unwrap(), &first, self.format)?;
-                write_record(second_writer, &second, self.format)
+                write_record(second_writer, &second, self.format)?;
             }
         }
+        if group.index_reads.len() != self.index.len() {
+            return Err(Error::InvalidInput(format!(
+                "archive contains {} index reads per record but {} index output paths were provided",
+                group.index_reads.len(),
+                self.index.len()
+            )));
+        }
+        for (writer, index_record) in self.index.iter_mut().zip(&group.index_reads) {
+            write_record(
+                writer
+                    .as_mut()
+                    .expect("index output writer is required"),
+                index_record,
+                self.format,
+            )?;
+        }
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
         self.first.take().unwrap().finish()?;
         if let Some(second) = self.second.take() {
             second.finish()?;
+        }
+        for writer in self.index.iter_mut() {
+            writer
+                .take()
+                .ok_or_else(|| Error::InvalidInput("index output writer is missing".into()))?
+                .finish()?;
         }
         Ok(())
     }
@@ -453,6 +495,7 @@ type OriginalReader = FastxReader<Box<dyn std::io::BufRead + Send>>;
 struct ComparisonSink {
     first: OriginalReader,
     second: Option<OriginalReader>,
+    index: Vec<OriginalReader>,
     id_prefix_chars: Option<usize>,
     records: u64,
 }
@@ -503,8 +546,8 @@ impl ComparisonSink {
 
 impl AlignedRecordSink for ComparisonSink {
     fn write_group(&mut self, original_id: u64, group: AlignedRecordGroup) -> Result<()> {
-        match group {
-            AlignedRecordGroup::Single(record) => {
+        match group.sequence {
+            SequenceRecordGroup::Single(record) => {
                 if self.second.is_some() {
                     return Err(Error::InvalidInput(
                         "single-end archive received two original files".into(),
@@ -517,7 +560,7 @@ impl AlignedRecordSink for ComparisonSink {
                     original_id,
                 )?;
             }
-            AlignedRecordGroup::Paired(first, second) => {
+            SequenceRecordGroup::Paired(first, second) => {
                 let second_reader = self.second.as_mut().ok_or_else(|| {
                     Error::InvalidInput("paired archive requires two original files".into())
                 })?;
@@ -535,6 +578,21 @@ impl AlignedRecordSink for ComparisonSink {
                 )?;
             }
         }
+        if group.index_reads.len() != self.index.len() {
+            return Err(Error::InvalidInput(format!(
+                "archive contains {} index reads per record but {} index originals were provided",
+                group.index_reads.len(),
+                self.index.len()
+            )));
+        }
+        for (reader, actual) in self.index.iter_mut().zip(&group.index_reads) {
+            Self::compare(
+                actual,
+                Self::expected(reader, self.id_prefix_chars)?,
+                "index read",
+                original_id,
+            )?;
+        }
         self.records += 1;
         Ok(())
     }
@@ -545,6 +603,7 @@ impl AlignedRecordSink for ComparisonSink {
                 .second
                 .as_mut()
                 .is_some_and(|reader| reader.next().is_some())
+            || self.index.iter_mut().any(|reader| reader.next().is_some())
         {
             return Err(Error::InvalidInput(
                 "original FASTQ contains extra records".into(),
@@ -650,6 +709,10 @@ fn run(cli: Cli) -> Result<()> {
                 quality_mode: quality_mode(&args)?,
                 zstd_level: args.zstd_level,
                 embedded_index_ranges: args.index_ranges.clone(),
+                index_read_files: [args.index_read_1, args.index_read_2]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
                 ..AlignmentCompressionOptions::default()
             };
             let output = AtomicPath::new(args.output, args.force)?;
@@ -712,6 +775,10 @@ fn run(cli: Cli) -> Result<()> {
                     profile.records_compressed_bytes
                 );
                 eprintln!(
+                    "index reads: {} raw, {} compressed bytes",
+                    profile.indexes_raw_bytes, profile.indexes_compressed_bytes
+                );
+                eprintln!(
                     "mapping: {} mapped, {} raw ({} no-hit, {} not-compressible), {} candidates, {} non-first",
                     profile.mapped_reads,
                     profile.raw_reads,
@@ -736,24 +803,50 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
     if args.threads == 0 {
         return Err(Error::InvalidInput("--threads must be nonzero".into()));
     }
-    if args
-        .mate_2
-        .as_ref()
-        .is_some_and(|path| path == &args.mate_1)
-    {
-        return Err(Error::InvalidInput(
-            "mate output paths must be different".into(),
-        ));
+    let output_paths = [
+        Some(&args.mate_1),
+        args.mate_2.as_ref(),
+        args.index_output_1.as_ref(),
+        args.index_output_2.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    for (index, path) in output_paths.iter().enumerate() {
+        for other in &output_paths[index + 1..] {
+            if path == other {
+                return Err(Error::InvalidInput(
+                    "output paths must be different".into(),
+                ));
+            }
+        }
     }
     let first_path = AtomicPath::new(args.mate_1, args.force)?;
     let second_path = args
         .mate_2
         .map(|path| AtomicPath::new(path, args.force))
         .transpose()?;
+    let index_paths = [args.index_output_1, args.index_output_2]
+        .into_iter()
+        .flatten()
+        .map(|path| AtomicPath::new(path, args.force))
+        .collect::<Result<Vec<_>>>()?;
     let gzip_first = output_is_gzip(&first_path.final_path, args.gzip, args.plain);
     let gzip_second = second_path
         .as_ref()
         .map(|path| output_is_gzip(&path.final_path, args.gzip, args.plain));
+    let gzip_index = index_paths
+        .iter()
+        .map(|path| output_is_gzip(&path.final_path, args.gzip, args.plain))
+        .collect::<Vec<_>>();
+    let mut index_writers = Vec::with_capacity(index_paths.len());
+    for (path, gzip) in index_paths.iter().zip(&gzip_index) {
+        index_writers.push(Some(RecordWriter::create(
+            path.partial(),
+            *gzip,
+            args.gzip_level,
+        )?));
+    }
     let mut sink = OutputSink {
         first: Some(RecordWriter::create(
             first_path.partial(),
@@ -765,6 +858,7 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
             .zip(gzip_second)
             .map(|(path, gzip)| RecordWriter::create(path.partial(), gzip, args.gzip_level))
             .transpose()?,
+        index: index_writers,
         format: args.format.into(),
     };
     let options = DecompressionOptions {
@@ -776,6 +870,13 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
         BufReader::with_capacity(16 * 1024 * 1024, File::open(args.archive)?),
         &options,
     )?;
+    let index_streams = records.index_streams();
+    if index_streams != sink.index.len() {
+        return Err(Error::InvalidInput(format!(
+            "archive declares {index_streams} index streams but {} index output paths were provided",
+            sink.index.len()
+        )));
+    }
     let layout = records.layout();
     let total_chunks = records.total_chunks();
     let progress = decompression_progress(total_chunks);
@@ -802,6 +903,9 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
     first_path.commit()?;
     if let Some(second_path) = second_path {
         second_path.commit()?;
+    }
+    for index_path in index_paths {
+        index_path.commit()?;
     }
     eprintln!("decompressed {} records ({:?})", record_count, layout);
     Ok(())
@@ -838,6 +942,14 @@ fn validate_command(args: ValidateArgs) -> Result<()> {
                     open_fastx_reader(second).map(|reader| FastxReader::new(reader, Format::Fastq))
                 })
                 .transpose()?,
+            index: [args.index_read_1, args.index_read_2]
+                .into_iter()
+                .flatten()
+                .map(|path| {
+                    open_fastx_reader(path)
+                        .map(|reader| FastxReader::new(reader, Format::Fastq))
+                })
+                .collect::<Result<Vec<_>>>()?,
             id_prefix_chars: args.id_prefix_chars,
             records: 0,
         };

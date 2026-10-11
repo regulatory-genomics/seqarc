@@ -639,9 +639,9 @@ fn split_record_indexes(
             .checked_add(range.len())
             .ok_or_else(|| Error::InvalidInput("embedded index length overflow".into()))
     })?;
-    if removed >= record.sequence.len() {
+    if removed > record.sequence.len() {
         return Err(Error::InvalidInput(
-            "embedded index ranges leave an empty biological read".into(),
+            "embedded index ranges exceed the biological read length".into(),
         ));
     }
     let quality = record.quality.as_ref().ok_or_else(|| {
@@ -675,7 +675,9 @@ fn split_record_indexes(
             .expect("quality was validated")
             .drain(range.start..range.end);
     }
-    record.validate(true)?;
+    // The biological read may be empty when the embedded index ranges consume
+    // the entire read; only the sequence/quality length agreement is required.
+    record.validate(true, true)?;
     Ok(indexes)
 }
 
@@ -847,7 +849,7 @@ fn compress_with_index<I2: AsRef<Path>>(
                     }
                 }
                 for record in records.iter_mut() {
-                    record.validate(true)?;
+                    record.validate(true, false)?;
                     prepare_identifier(record)?;
                     if mapper_options.preserve_quality {
                         apply_quality(record, &mapper_options.quality_mode);
@@ -1877,6 +1879,99 @@ pub fn verify_aligned_archive<R: Read>(input: &mut R) -> Result<VerifyReport> {
     Ok(report)
 }
 
+/// Compressed and decompressed byte totals for one archive section.
+///
+/// `compressed` is what the section occupies on disk; `raw` is the total
+/// length after decompression when the section stores compressed data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SectionSizes {
+    pub compressed: u64,
+    pub raw: u64,
+}
+
+impl std::ops::AddAssign for SectionSizes {
+    fn add_assign(&mut self, rhs: Self) {
+        self.compressed += rhs.compressed;
+        self.raw += rhs.raw;
+    }
+}
+
+/// The eight per-mate record subsections, in on-disk order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MateSubsectionSizes {
+    pub lengths: SectionSizes,
+    pub positions: SectionSizes,
+    pub noise_positions: SectionSizes,
+    pub noise: SectionSizes,
+    pub reference_skips: SectionSizes,
+    pub emits: SectionSizes,
+    pub reverses: SectionSizes,
+    pub unaligned_sequences: SectionSizes,
+}
+
+/// The three record subsections per declared index-read stream, in on-disk
+/// order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexStreamSubsectionSizes {
+    pub qualities: SectionSizes,
+    pub lengths: SectionSizes,
+    pub sequences: SectionSizes,
+}
+
+/// Per-subsection record section sizes, in on-disk order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordSubsectionSizes {
+    pub flags: SectionSizes,
+    /// One entry per biological stream (one for single-end, two for paired).
+    pub mates: Vec<MateSubsectionSizes>,
+    /// One entry per embedded index range, in declaration order.
+    pub embedded_index_ranges: Vec<SectionSizes>,
+    /// One entry per declared index-read stream, in I1, I2 order.
+    pub index_streams: Vec<IndexStreamSubsectionSizes>,
+}
+
+/// Aggregated on-disk storage sizes for every archive section.
+///
+/// Collected by [`read_archive_info_with_breakdown`] by walking chunk payload
+/// directories; no payload is ever decompressed. The fixed preamble, chunk
+/// headers, and reference/index-metadata blocks are included so the totals
+/// reconcile with the archive file size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SectionBreakdown {
+    /// Fixed framing before the first chunk: the preamble fields plus the
+    /// preamble CRC.
+    pub preamble: u64,
+    /// Chunk framing overhead: the 44 header fields plus the CRC per chunk.
+    pub chunk_headers: u64,
+    /// The 24-byte compressed section directory per chunk payload.
+    pub payload_directories: u64,
+    pub ids: SectionSizes,
+    pub qualities: SectionSizes,
+    /// `compressed` is the verbatim record section bytes on disk; `raw` is
+    /// the sum of the decompressed subsection lengths.
+    pub records: SectionSizes,
+    /// Compressed size of the embedded reference block.
+    pub reference_block: u64,
+    /// Size of the embedded index metadata block.
+    pub index_metadata: u64,
+    pub subsections: RecordSubsectionSizes,
+}
+
+impl SectionBreakdown {
+    /// Total on-disk bytes covered by the breakdown. For a complete,
+    /// untruncated archive this equals the file size.
+    pub fn accounted_bytes(&self) -> u64 {
+        self.preamble
+            + self.chunk_headers
+            + self.payload_directories
+            + self.ids.compressed
+            + self.qualities.compressed
+            + self.records.compressed
+            + self.reference_block
+            + self.index_metadata
+    }
+}
+
 /// High-level archive summary readable without decoding chunk payloads.
 ///
 /// The preamble (including its CRC) and every chunk header are read, but
@@ -1912,22 +2007,47 @@ pub struct ArchiveInfo {
     pub truncated: bool,
     /// True when bytes follow the declared final chunk.
     pub trailing_bytes: bool,
+    /// Per-section storage sizes, collected only by
+    /// [`read_archive_info_with_breakdown`].
+    pub breakdown: Option<SectionBreakdown>,
 }
 
 /// Read archive metadata from the header and chunk headers without decoding
 /// any chunk payloads.
 pub fn read_archive_info<R: Read + Seek>(input: &mut R) -> Result<ArchiveInfo> {
+    read_archive_info_with_breakdown(input, false)
+}
+
+/// Like [`read_archive_info`], additionally walking each chunk payload's
+/// section directory and the record section's subsection directory to
+/// aggregate per-section storage sizes. Payloads are skipped with seeks and
+/// never decompressed, so the extra cost is a handful of small reads per
+/// chunk.
+pub fn read_archive_info_with_breakdown<R: Read + Seek>(
+    input: &mut R,
+    collect_breakdown: bool,
+) -> Result<ArchiveInfo> {
     let parsed = parse_preamble(input)?;
-    let embedded_indexes = decode_index_metadata(&parsed.index_metadata, parsed.layout)?
-        .into_iter()
-        .map(|descriptor| descriptor.range)
-        .collect();
+    let descriptors = decode_index_metadata(&parsed.index_metadata, parsed.layout)?;
+    let embedded_indexes = descriptors.iter().map(|d| d.range.clone()).collect();
     let id_mode = match parsed.id_mode {
         IdMode::None => "none",
         IdMode::Independent => "independent",
         IdMode::IdenticalMates => "identical-mates",
         IdMode::SlashMate => "slash-mate",
     };
+    let breakdown = collect_breakdown.then(|| SectionBreakdown {
+        preamble: (PREAMBLE_BYTES + 4) as u64,
+        reference_block: parsed.reference_block.len() as u64,
+        index_metadata: parsed.index_metadata.len() as u64,
+        subsections: RecordSubsectionSizes {
+            mates: vec![MateSubsectionSizes::default(); parsed.layout.streams()],
+            embedded_index_ranges: vec![SectionSizes::default(); descriptors.len()],
+            index_streams: vec![IndexStreamSubsectionSizes::default(); parsed.index_streams],
+            ..RecordSubsectionSizes::default()
+        },
+        ..SectionBreakdown::default()
+    });
     let mut info = ArchiveInfo {
         version_major: parsed.version_major,
         version_minor: parsed.version_minor,
@@ -1946,6 +2066,7 @@ pub fn read_archive_info<R: Read + Seek>(input: &mut R) -> Result<ArchiveInfo> {
         index_metadata_bytes: parsed.index_metadata.len() as u64,
         truncated: false,
         trailing_bytes: false,
+        breakdown,
     };
     // Walk the chunk headers, skipping each payload with a seek. Chunk
     // checksums are not verified here; `verify` covers that.
@@ -1962,19 +2083,151 @@ pub fn read_archive_info<R: Read + Seek>(input: &mut R) -> Result<ArchiveInfo> {
         info.scanned_chunks += 1;
         // A corrupt length that cannot be used as a seek offset leaves the
         // framing unusable; stop and report what was scanned.
-        match i64::try_from(chunk_header.compressed_len) {
-            Ok(offset) => {
-                input.seek(SeekFrom::Current(offset))?;
-            }
-            Err(_) => {
+        let Ok(offset) = i64::try_from(chunk_header.compressed_len) else {
+            info.truncated = true;
+            break;
+        };
+        let payload = if let Some(breakdown) = info.breakdown.as_mut() {
+            read_chunk_payload_sizes(
+                input,
+                &chunk_header,
+                parsed.layout,
+                descriptors.len(),
+                parsed.index_streams,
+                breakdown,
+            )
+        } else {
+            input
+                .seek(SeekFrom::Current(offset))
+                .map(|_| ())
+                .map_err(Error::Io)
+        };
+        match payload {
+            Ok(()) => {}
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                 info.truncated = true;
                 break;
             }
+            Err(error) => return Err(error),
         }
     }
     let mut trailing = [0u8; 1];
     info.trailing_bytes = input.read(&mut trailing)? > 0;
     Ok(info)
+}
+
+/// Aggregate one chunk's on-disk section sizes into `breakdown`.
+///
+/// Reads the chunk's 24-byte payload directory and the record section's
+/// subsection directory, skipping every compressed frame with a seek. The
+/// reader must be positioned at the start of the chunk payload.
+fn read_chunk_payload_sizes<R: Read + Seek>(
+    input: &mut R,
+    header: &ChunkHeader,
+    layout: AlignmentLayout,
+    descriptor_count: usize,
+    index_stream_count: usize,
+    breakdown: &mut SectionBreakdown,
+) -> Result<()> {
+    let ids_compressed = read_u64(input)?;
+    let qualities_compressed = read_u64(input)?;
+    let records_compressed = read_u64(input)?;
+    let directory_total = 24u64
+        .checked_add(ids_compressed)
+        .and_then(|value| value.checked_add(qualities_compressed))
+        .and_then(|value| value.checked_add(records_compressed))
+        .ok_or_else(|| Error::InvalidFormat("compressed section size overflow".into()))?;
+    if directory_total != header.compressed_len as u64 {
+        return Err(Error::InvalidFormat(
+            "chunk payload section sizes do not match the chunk header".into(),
+        ));
+    }
+    // The record section is stored verbatim; the payload directory and the
+    // chunk header must agree on its length.
+    if records_compressed != header.records_len as u64 {
+        return Err(Error::InvalidFormat(
+            "record section length disagrees with the chunk header".into(),
+        ));
+    }
+    breakdown.chunk_headers += 48;
+    breakdown.payload_directories += 24;
+    breakdown.ids.compressed += ids_compressed;
+    breakdown.ids.raw += header.ids_len as u64;
+    breakdown.qualities.compressed += qualities_compressed;
+    breakdown.qualities.raw += header.qualities_len as u64;
+    breakdown.records.compressed += records_compressed;
+    skip_forward(input, ids_compressed)?;
+    skip_forward(input, qualities_compressed)?;
+
+    // The record section is a directory of independently compressed
+    // subsection frames; read only each length pair and skip its frame.
+    let subsection_count = read_u32(input)? as usize;
+    let expected_subsections =
+        1 + layout.streams() * V21_MATE_SECTION_COUNT + descriptor_count + index_stream_count * 3;
+    if subsection_count != expected_subsections {
+        return Err(Error::InvalidFormat(
+            "record subsection count mismatch".into(),
+        ));
+    }
+    let subsections = &mut breakdown.subsections;
+    let embedded_start = 1 + layout.streams() * V21_MATE_SECTION_COUNT;
+    let index_stream_start = embedded_start + descriptor_count;
+    let mut subsection_compressed = 0u64;
+    let mut subsection_raw = 0u64;
+    for index in 0..subsection_count {
+        let compressed_len = read_u64(input)?;
+        let raw_len = read_u64(input)?;
+        subsection_compressed += compressed_len;
+        subsection_raw += raw_len;
+        let sizes = SectionSizes {
+            compressed: compressed_len,
+            raw: raw_len,
+        };
+        if index == 0 {
+            subsections.flags += sizes;
+        } else if index < embedded_start {
+            let entry = &mut subsections.mates[(index - 1) / V21_MATE_SECTION_COUNT];
+            match (index - 1) % V21_MATE_SECTION_COUNT {
+                0 => entry.lengths += sizes,
+                1 => entry.positions += sizes,
+                2 => entry.noise_positions += sizes,
+                3 => entry.noise += sizes,
+                4 => entry.reference_skips += sizes,
+                5 => entry.emits += sizes,
+                6 => entry.reverses += sizes,
+                _ => entry.unaligned_sequences += sizes,
+            }
+        } else if index < index_stream_start {
+            subsections.embedded_index_ranges[index - embedded_start] += sizes;
+        } else {
+            let entry = &mut subsections.index_streams[(index - index_stream_start) / 3];
+            match (index - index_stream_start) % 3 {
+                0 => entry.qualities += sizes,
+                1 => entry.lengths += sizes,
+                _ => entry.sequences += sizes,
+            }
+        }
+        skip_forward(input, compressed_len)?;
+    }
+    // The directory and its frames must consume the record section exactly.
+    let subsection_total = 4u64 + subsection_count as u64 * 16 + subsection_compressed;
+    if subsection_total != records_compressed {
+        return Err(Error::InvalidFormat(
+            "record subsection directory does not consume the record section".into(),
+        ));
+    }
+    breakdown.records.raw += subsection_raw;
+    Ok(())
+}
+
+/// Seek forward over `count` payload bytes without reading them. Seeking past
+/// EOF is permitted on files; the next chunk header read then reports the
+/// truncation.
+fn skip_forward<R: Read + Seek>(input: &mut R, count: u64) -> Result<()> {
+    let offset = i64::try_from(count)
+        .map_err(|_| Error::InvalidFormat("payload section size exceeds seek range".into()))?;
+    input.seek(SeekFrom::Current(offset))?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4604,6 +4857,53 @@ mod tests {
     }
 
     #[test]
+    fn embedded_indexes_may_consume_the_entire_read() {
+        let ranges = vec![EmbeddedIndexRange {
+            mate: EmbeddedIndexMate::R1,
+            start: 0,
+            end: 10,
+        }];
+        validate_index_ranges(&ranges, AlignmentLayout::SingleEnd).unwrap();
+        let original_sequence = b"ACGTACGTAA".to_vec();
+        let original_quality = b"ABCDEFGHIJ".to_vec();
+        let mut record = ReadRecord::new(
+            "read",
+            original_sequence.clone(),
+            Some(original_quality.clone()),
+        );
+        let extracted = split_pair_indexes(&mut record, None, &ranges, true).unwrap();
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].sequence, original_sequence);
+        assert_eq!(
+            extracted[0].quality.as_deref(),
+            Some(original_quality.as_slice())
+        );
+        assert!(record.sequence.is_empty());
+        assert!(record.quality.as_ref().is_some_and(Vec::is_empty));
+
+        let descriptors = ranges
+            .iter()
+            .cloned()
+            .map(|range| IndexDescriptor { range })
+            .collect::<Vec<_>>();
+        let pair = AlignedPair {
+            first: record,
+            second: None,
+            first_hit: None,
+            second_hit: None,
+            first_selection: AlignmentSelection::default(),
+            second_selection: AlignmentSelection::default(),
+            indexes: extracted,
+            index_reads: Vec::new(),
+        };
+        assert_eq!(
+            reconstruct_quality_row(&pair, 0, &descriptors).unwrap(),
+            original_quality
+        );
+    }
+
+    #[test]
     fn aligned_quality_stream_round_trips_one_fixed_width_raw_run() {
         let pairs = [single_quality_pair(b"AB"), single_quality_pair(b"CD")];
         let options = crate::AlignmentCompressionOptions {
@@ -4768,6 +5068,214 @@ mod tests {
                 Some(original_quality.clone()),
             );
             let indexes = split_pair_indexes(&mut record, None, &ranges, preserve_quality).unwrap();
+            let descriptors = ranges
+                .into_iter()
+                .map(|range| IndexDescriptor { range })
+                .collect::<Vec<_>>();
+            let pair = AlignedPair {
+                first: record,
+                second: None,
+                first_hit: None,
+                second_hit: None,
+                first_selection: AlignmentSelection::default(),
+                second_selection: AlignmentSelection::default(),
+                indexes,
+                index_reads: Vec::new(),
+            };
+            let options = crate::AlignmentCompressionOptions {
+                preserve_quality,
+                zstd_level: 1,
+                ..crate::AlignmentCompressionOptions::default()
+            };
+            let encoded = encode_chunk(
+                &[],
+                &[pair],
+                1,
+                1,
+                &options,
+                IdMode::Independent,
+                AlignmentLayout::SingleEnd,
+                &descriptors,
+            )
+            .unwrap();
+            let archive_chunk = EncodedArchiveChunk {
+                first_record: 0,
+                record_count: encoded.pairs as usize,
+                raw_len: encoded.raw_len as usize,
+                ids_len: encoded.ids_len as usize,
+                qualities_len: encoded.qualities_len as usize,
+                records_len: encoded.records_len as usize,
+                compressed: encoded.compressed,
+            };
+            let mut decoded = decode_archive_chunk(
+                archive_chunk,
+                IdMode::Independent,
+                AlignmentLayout::SingleEnd,
+                preserve_quality,
+                &[],
+                &descriptors,
+                1,
+                1,
+                0,
+            )
+            .unwrap();
+            let (_, group) = decoded
+                .next_group(AlignmentLayout::SingleEnd, None)
+                .unwrap();
+            assert!(group.index_reads.is_empty());
+            let SequenceRecordGroup::Single(record) = group.sequence else {
+                unreachable!();
+            };
+            assert_eq!(record.sequence, original_sequence);
+            assert_eq!(
+                record.quality,
+                preserve_quality.then_some(original_quality.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn breakdown_aggregates_subsections_across_chunks() {
+        let directory = tempfile::tempdir().unwrap();
+        let fasta = directory.path().join("genome.fa");
+        let index_path = directory.path().join("genome.seqarc-index");
+        let reference: Vec<u8> = b"ACGT".iter().copied().cycle().take(300).collect();
+        std::fs::write(
+            &fasta,
+            [b">chr1\n".as_slice(), reference.as_slice(), b"\n"].concat(),
+        )
+        .unwrap();
+        crate::build_alignment_index(
+            &fasta,
+            &index_path,
+            &crate::aligners::GenomeIndexBuildOptions::default(),
+        )
+        .unwrap();
+
+        let first_path = directory.path().join("reads.1.fastq");
+        let second_path = directory.path().join("reads.2.fastq");
+        let archive_path = directory.path().join("reads.seqarc");
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for index in 0..6u8 {
+            let start = usize::from(index) * 8;
+            // Pairs 0-2 align to the reference; pairs 3-5 (poly-G, absent from
+            // the reference) do not.
+            let (first_sequence, second_sequence) = if index < 3 {
+                (
+                    reference[start..start + 12].to_vec(),
+                    reference[start + 100..start + 112].to_vec(),
+                )
+            } else {
+                (vec![b'A'; 12], vec![b'G'; 12])
+            };
+            for (buffer, mate, sequence) in [
+                (&mut first, b"/1".as_slice(), &first_sequence),
+                (&mut second, b"/2".as_slice(), &second_sequence),
+            ] {
+                buffer.extend_from_slice(b"@r");
+                buffer.push(b'0' + index);
+                buffer.extend_from_slice(mate);
+                buffer.extend_from_slice(b"\n");
+                buffer.extend_from_slice(sequence);
+                buffer.extend_from_slice(b"\n+\n");
+                buffer.extend(std::iter::repeat_n(b'I', sequence.len()));
+                buffer.extend_from_slice(b"\n");
+            }
+        }
+        std::fs::write(&first_path, &first).unwrap();
+        std::fs::write(&second_path, &second).unwrap();
+
+        let options = crate::AlignmentCompressionOptions {
+            threads: 1,
+            chunk_records: 3,
+            // The whole R1 read is embedded index, mirroring barcode layouts.
+            embedded_index_ranges: vec![EmbeddedIndexRange {
+                mate: EmbeddedIndexMate::R1,
+                start: 0,
+                end: 12,
+            }],
+            ..crate::AlignmentCompressionOptions::default()
+        };
+        compress_paired_fastq_files_with_index(
+            &index_path,
+            &first_path,
+            &second_path,
+            &archive_path,
+            &options,
+        )
+        .unwrap();
+
+        let mut archive = File::open(&archive_path).unwrap();
+        let info = read_archive_info_with_breakdown(&mut archive, true).unwrap();
+        assert_eq!(info.records, 6);
+        assert_eq!(info.declared_chunks, 2);
+        let breakdown = info.breakdown.as_ref().unwrap();
+        let subsections = &breakdown.subsections;
+
+        // Six records across two chunks: one flags byte and one u16 length
+        // per record per mate, and 12 index bases per record.
+        assert_eq!(subsections.flags.raw, 6);
+        assert_eq!(subsections.mates[0].lengths.raw, 12);
+        assert_eq!(subsections.mates[1].lengths.raw, 12);
+        // R1 is fully consumed by the index, so it stores no sequences.
+        assert_eq!(subsections.mates[0].unaligned_sequences.raw, 0);
+        assert_eq!(subsections.mates[0].positions.raw, 0);
+        assert_eq!(subsections.embedded_index_ranges.len(), 1);
+        assert_eq!(subsections.embedded_index_ranges[0].raw, 72);
+
+        // Every subsection's sizes must sum to the record-section totals,
+        // which include the subsection directory framing.
+        let mut compressed_sum = subsections.flags.compressed;
+        let mut raw_sum = subsections.flags.raw;
+        for mate in &subsections.mates {
+            for sizes in [
+                mate.lengths,
+                mate.positions,
+                mate.noise_positions,
+                mate.noise,
+                mate.reference_skips,
+                mate.emits,
+                mate.reverses,
+                mate.unaligned_sequences,
+            ] {
+                compressed_sum += sizes.compressed;
+                raw_sum += sizes.raw;
+            }
+        }
+        for sizes in &subsections.embedded_index_ranges {
+            compressed_sum += sizes.compressed;
+            raw_sum += sizes.raw;
+        }
+        for stream in &subsections.index_streams {
+            for sizes in [stream.qualities, stream.lengths, stream.sequences] {
+                compressed_sum += sizes.compressed;
+                raw_sum += sizes.raw;
+            }
+        }
+        let subsection_count = 1 + 2 * V21_MATE_SECTION_COUNT + 1;
+        let framing = info.declared_chunks * (4 + 16 * subsection_count as u64);
+        assert_eq!(compressed_sum + framing, breakdown.records.compressed);
+        assert_eq!(raw_sum, breakdown.records.raw);
+    }
+
+    #[test]
+    fn chunk_round_trips_fully_consumed_reads() {
+        for preserve_quality in [false, true] {
+            let ranges = vec![EmbeddedIndexRange {
+                mate: EmbeddedIndexMate::R1,
+                start: 0,
+                end: 10,
+            }];
+            let original_sequence = b"ACGTACGTAA".to_vec();
+            let original_quality = b"ABCDEFGHIJ".to_vec();
+            let mut record = ReadRecord::new(
+                "read",
+                original_sequence.clone(),
+                Some(original_quality.clone()),
+            );
+            let indexes = split_pair_indexes(&mut record, None, &ranges, preserve_quality).unwrap();
+            assert!(record.sequence.is_empty());
             let descriptors = ranges
                 .into_iter()
                 .map(|range| IndexDescriptor { range })

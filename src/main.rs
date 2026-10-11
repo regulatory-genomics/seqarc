@@ -4,11 +4,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use seqarc::{
     build_alignment_index, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
-    decompress_aligned_iter, open_fastx_reader, read_archive_info, select_id_field,
+    decompress_aligned_iter, open_fastx_reader, read_archive_info_with_breakdown, select_id_field,
     truncate_read_id, verify_aligned_archive, AlignedRecordGroup, AlignedRecordSink, AlignerKind,
-    AlignmentCompressionOptions, AlignmentLayout, DecompressionOptions, EmbeddedIndexMate,
-    EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode,
-    ReadRecord, Result, SequenceRecordGroup,
+    AlignmentCompressionOptions, AlignmentLayout, ArchiveInfo, DecompressionOptions,
+    EmbeddedIndexMate, EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions,
+    QualityMode, ReadRecord, Result, SectionBreakdown, SequenceRecordGroup,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -225,6 +225,9 @@ struct VerifyArgs {
 struct InfoArgs {
     /// Input aligned .seqarc archive.
     archive: PathBuf,
+    /// Break down on-disk storage by archive section and record subsection.
+    #[arg(long)]
+    breakdown: bool,
 }
 
 #[derive(Args)]
@@ -1075,7 +1078,7 @@ fn verify_command(args: VerifyArgs) -> Result<()> {
 
 fn info_command(args: InfoArgs) -> Result<()> {
     let mut archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(&args.archive)?);
-    let info = read_archive_info(&mut archive)?;
+    let info = read_archive_info_with_breakdown(&mut archive, args.breakdown)?;
     let file_size = std::fs::metadata(&args.archive)?.len();
     println!("archive: {}", args.archive.display());
     println!(
@@ -1124,6 +1127,9 @@ fn info_command(args: InfoArgs) -> Result<()> {
     );
     println!("index metadata: {} bytes", info.index_metadata_bytes);
     println!("file size: {} bytes", file_size);
+    if let Some(breakdown) = &info.breakdown {
+        print_storage_breakdown(&info, breakdown, file_size);
+    }
     println!("note: chunk checksums are not checked; use `seqarc verify` for that");
     if info.truncated {
         eprintln!(
@@ -1135,6 +1141,181 @@ fn info_command(args: InfoArgs) -> Result<()> {
         eprintln!("warning: archive contains trailing bytes after the final chunk");
     }
     Ok(())
+}
+
+/// Print the per-section storage table produced by `info --breakdown`.
+///
+/// Percentages are relative to the archive file size; sections storing
+/// compressed data also show their decompressed size and ratio. The
+/// `accounted` line sums every on-disk contribution, so for a complete
+/// archive it equals the file size.
+fn print_storage_breakdown(info: &ArchiveInfo, breakdown: &SectionBreakdown, file_size: u64) {
+    let rows = vec![
+        ("preamble:".to_owned(), breakdown.preamble, None),
+        ("chunk headers:".to_owned(), breakdown.chunk_headers, None),
+        (
+            "payload directories:".to_owned(),
+            breakdown.payload_directories,
+            None,
+        ),
+        (
+            "identifiers:".to_owned(),
+            breakdown.ids.compressed,
+            Some(breakdown.ids.raw),
+        ),
+        (
+            "qualities:".to_owned(),
+            breakdown.qualities.compressed,
+            Some(breakdown.qualities.raw),
+        ),
+        (
+            "records:".to_owned(),
+            breakdown.records.compressed,
+            Some(breakdown.records.raw),
+        ),
+        (
+            "reference block:".to_owned(),
+            breakdown.reference_block,
+            None,
+        ),
+        ("index metadata:".to_owned(), breakdown.index_metadata, None),
+    ];
+    let subsections = subsection_rows(info, breakdown);
+    let width = rows
+        .iter()
+        .map(|(label, _, _)| label.len())
+        .chain(subsections.iter().map(|(label, _, _)| label.len()))
+        .max()
+        .unwrap_or(0);
+    println!("storage breakdown:");
+    for (label, compressed, raw) in &rows {
+        println!(
+            "  {label:<width$} {:>13} {}{}",
+            display_bytes(*compressed),
+            percent_of(*compressed, file_size),
+            raw.map(|value| raw_note(value, *compressed))
+                .unwrap_or_default()
+        );
+    }
+    for (label, compressed, raw) in &subsections {
+        println!(
+            "    {label:<width$} {:>13} {}{}",
+            display_bytes(*compressed),
+            percent_of(*compressed, file_size),
+            raw_note(*raw, *compressed)
+        );
+    }
+    println!(
+        "  {:<width$} {} of {} bytes",
+        "accounted:",
+        display_bytes(breakdown.accounted_bytes()),
+        display_bytes(file_size)
+    );
+}
+
+/// Flatten the record subsection breakdown into labeled rows in on-disk
+/// order: flags, the per-mate subsections, one row per embedded index range,
+/// and the index-read stream subsections.
+fn subsection_rows(info: &ArchiveInfo, breakdown: &SectionBreakdown) -> Vec<(String, u64, u64)> {
+    let subsections = &breakdown.subsections;
+    let mut rows = vec![(
+        "flags:".to_owned(),
+        subsections.flags.compressed,
+        subsections.flags.raw,
+    )];
+    let names = [
+        "lengths",
+        "positions",
+        "noise positions",
+        "noise",
+        "reference skips",
+        "emits",
+        "reverses",
+        "unaligned sequences",
+    ];
+    let paired = info.layout == AlignmentLayout::PairedEnd;
+    for (mate, entry) in subsections.mates.iter().enumerate() {
+        let prefix = if paired {
+            format!("R{} ", mate + 1)
+        } else {
+            String::new()
+        };
+        let sizes = [
+            entry.lengths,
+            entry.positions,
+            entry.noise_positions,
+            entry.noise,
+            entry.reference_skips,
+            entry.emits,
+            entry.reverses,
+            entry.unaligned_sequences,
+        ];
+        for (name, size) in names.iter().zip(sizes) {
+            rows.push((format!("{prefix}{name}:"), size.compressed, size.raw));
+        }
+    }
+    for (range, sizes) in info
+        .embedded_indexes
+        .iter()
+        .zip(&subsections.embedded_index_ranges)
+    {
+        rows.push((
+            format!(
+                "index range {:?}:{}:{}:",
+                range.mate,
+                range.start + 1,
+                range.end
+            ),
+            sizes.compressed,
+            sizes.raw,
+        ));
+    }
+    for (stream, entry) in subsections.index_streams.iter().enumerate() {
+        for (name, sizes) in [
+            ("qualities", entry.qualities),
+            ("lengths", entry.lengths),
+            ("sequences", entry.sequences),
+        ] {
+            rows.push((
+                format!("I{} {name}:", stream + 1),
+                sizes.compressed,
+                sizes.raw,
+            ));
+        }
+    }
+    rows
+}
+
+/// Format a byte count with thousands separators.
+fn display_bytes(bytes: u64) -> String {
+    let digits = bytes.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    grouped
+}
+
+/// Format a byte count as a percentage of `total`.
+fn percent_of(bytes: u64, total: u64) -> String {
+    let percent = 100.0 * bytes as f64 / total.max(1) as f64;
+    format!("({percent:5.1}%)")
+}
+
+/// Suffix showing the decompressed size and compression ratio, if any.
+fn raw_note(raw: u64, compressed: u64) -> String {
+    if raw == 0 {
+        return String::new();
+    }
+    let ratio = if compressed > 0 {
+        format!(" ({:.1}x)", raw as f64 / compressed as f64)
+    } else {
+        String::new()
+    };
+    format!("  raw {} bytes{}", display_bytes(raw), ratio)
 }
 
 #[allow(clippy::too_many_arguments)]

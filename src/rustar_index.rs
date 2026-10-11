@@ -143,13 +143,15 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
     };
 
     let sa_section = required(&sections, "SA")?;
-    let sa_map = map_section(&file, sa_section, 0)?;
-    advise_random(&sa_map);
+    let sa_bytes = read_section(&mut file, sa_section)?;
     let gstrand_bit = SuffixArray::calculate_gstrand_bit(n_genome);
     let word_length = gstrand_bit + 1;
     let sa_length = packed_length(sa_section.length, word_length)?;
     let suffix_array = SuffixArray {
-        data: PackedArray::from_mmap(word_length, sa_length, sa_map),
+        // Read the suffix array into owned memory: the bulk of the index is
+        // accessed randomly, and demand paging a multi-GB mmap with
+        // MADV_RANDOM semantics turns the first pass into I/O stalls.
+        data: PackedArray::from_bytes(word_length, sa_length, sa_bytes),
         gstrand_bit,
         gstrand_mask: (1u64 << gstrand_bit) - 1,
     };
@@ -176,8 +178,11 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
         .chunks_exact(8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .collect::<Vec<_>>();
-    let sai_map = map_section(&file, sai_section, header_len)?;
-    advise_random(&sai_map);
+    let sai_data = {
+        let mut sai_bytes = read_section(&mut file, sai_section)?;
+        sai_bytes.drain(..usize_from(header_len, "rustar SAindex header")?);
+        sai_bytes
+    };
     let sai_word_length = gstrand_bit + 3;
     let num_indices = SaIndex::calculate_num_indices(nbases);
     let expected_sai_len = PackedArray::data_byte_len_for(
@@ -192,10 +197,12 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
     let sa_index = SaIndex {
         nbases,
         genome_sa_index_start,
-        data: PackedArray::from_mmap(
+        // Owned memory, like the suffix array above: SAindex lookups are the
+        // hottest random accesses during seeding.
+        data: PackedArray::from_bytes(
             sai_word_length,
             usize_from(num_indices, "rustar SAindex entries")?,
-            sai_map,
+            sai_data,
         ),
         word_length: sai_word_length,
         gstrand_bit,

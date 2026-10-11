@@ -73,7 +73,7 @@ selected by the output file suffix (or forced with `--gzip`/`--plain`).
 | `decompress` | Decompress an archive back into FASTQ (or FASTA) files |
 | `validate` | Fully decode an archive and optionally byte-compare it against the original FASTQ files |
 | `verify` | Scan chunk checksums and framing without decompressing |
-| `info` | Print archive metadata (version, layout, options, chunk and record counts) without decoding records |
+| `info` | Print archive metadata (version, layout, options, chunk and record counts) without decoding records; `--breakdown` adds a per-section storage size breakdown |
 
 ### Useful options
 
@@ -83,7 +83,9 @@ selected by the output file suffix (or forced with `--gzip`/`--plain`).
   thresholding (configured with `--binary-threshold/high/low`).
 - `--index-read-1` / `--index-read-2` — store separate index reads (I1/I2).
 - `--index-range R1:START:END` — extract a read region (e.g., a UMI) into an
-  embedded index before alignment and reinsert it on decompression.
+  embedded index before alignment and reinsert it on decompression. The range
+  may cover the entire read, in which case the stored biological read is empty
+  (unaligned) until the index is reinserted on decompression.
 - `--range START:END` — decompress only a range of logical records.
 - `--best-effort` — skip chunks that fail their checksum and recover records
   from all undamaged chunks.

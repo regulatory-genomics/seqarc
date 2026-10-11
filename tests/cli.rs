@@ -618,8 +618,53 @@ fn info_reports_archive_metadata() {
                 ))
                 .and(predicate::str::contains("quality: preserved"))
                 .and(predicate::str::contains("file size: "))
-                .and(predicate::str::contains("use `seqarc verify`")),
+                .and(predicate::str::contains("use `seqarc verify`"))
+                // The storage breakdown only appears with --breakdown.
+                .and(predicate::str::contains("storage breakdown:").not()),
         );
+
+    // The breakdown reconciles every on-disk section with the file size.
+    let output = Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("info")
+        .arg(&archive_path)
+        .arg("--breakdown")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "storage breakdown:",
+        "preamble",
+        "chunk headers",
+        "payload directories",
+        "identifiers:",
+        "qualities:",
+        "records:",
+        "    flags:",
+        "    lengths:",
+        "    positions:",
+        "    noise positions:",
+        "    noise:",
+        "    reference skips:",
+        "    emits:",
+        "    reverses:",
+        "    unaligned sequences:",
+        "reference block:",
+        "index metadata:",
+        "  accounted:",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+    // Single-end subsections carry no mate prefix.
+    assert!(!stdout.contains("R1 lengths"));
+    let file_size = std::fs::metadata(&archive_path).unwrap().len();
+    let (accounted, total) = parse_accounted(&stdout);
+    assert_eq!(accounted, file_size);
+    assert_eq!(total, file_size);
 
     // A truncated chunk header is reported without failing the command.
     // The preamble spans 46 + reference(27) + metadata(8) = 81 bytes; keep
@@ -635,6 +680,150 @@ fn info_reports_archive_metadata() {
         .success()
         .stdout(predicate::str::contains("chunks: 0/1 scanned"))
         .stderr(predicate::str::contains("archive is truncated"));
+
+    // The breakdown tolerates truncation the same way, aggregating only the
+    // chunks that were scanned.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("info")
+        .arg(&truncated_path)
+        .arg("--breakdown")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("chunks: 0/1 scanned"))
+        .stderr(predicate::str::contains("archive is truncated"));
+
+    // A corrupt payload section directory is rejected: the 24-byte directory
+    // starts right after the preamble (81 bytes) and chunk header (48 bytes).
+    let mut corrupt = archive.clone();
+    corrupt[81 + 48] ^= 0xff;
+    let corrupt_path = directory.path().join("corrupt.seqarc");
+    std::fs::write(&corrupt_path, &corrupt).unwrap();
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("info")
+        .arg(&corrupt_path)
+        .arg("--breakdown")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "chunk payload section sizes do not match the chunk header",
+        ));
+}
+
+/// Parse the `accounted  X of Y bytes` line from an `info --breakdown` run.
+fn parse_accounted(stdout: &str) -> (u64, u64) {
+    let line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("accounted:"))
+        .expect("accounted line missing");
+    let body = line.trim().trim_start_matches("accounted:").trim();
+    let (accounted, total) = body.split_once(" of ").expect("accounted format");
+    let accounted: u64 = accounted.replace(',', "").parse().unwrap();
+    let total: u64 = total
+        .trim_end_matches(" bytes")
+        .replace(',', "")
+        .parse()
+        .unwrap();
+    (accounted, total)
+}
+
+#[test]
+fn info_breakdown_reports_paired_subsections() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let second_path = directory.path().join("reads.2.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let first_sequence = &reference[20..60];
+    let second_sequence: Vec<u8> = first_sequence
+        .iter()
+        .rev()
+        .map(|base| match base {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => unreachable!(),
+        })
+        .collect();
+    let first_fastq = format!(
+        "@pair0/1\n{}\n+\n{}\n@pair1/1\n{}\n+\n{}\n",
+        String::from_utf8_lossy(first_sequence),
+        "I".repeat(first_sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    let second_fastq = format!(
+        "@pair0/2\n{}\n+\n{}\n@pair1/2\n{}\n+\n{}\n",
+        String::from_utf8_lossy(&second_sequence),
+        "J".repeat(second_sequence.len()),
+        "N".repeat(40),
+        "$".repeat(40),
+    );
+    std::fs::write(&first_path, first_fastq.as_bytes()).unwrap();
+    std::fs::write(&second_path, second_fastq.as_bytes()).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("info")
+        .arg(&archive_path)
+        .arg("--breakdown")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Paired archives group the eight subsections per mate.
+    for expected in [
+        "    R1 lengths:",
+        "    R1 positions:",
+        "    R1 noise:",
+        "    R1 unaligned sequences:",
+        "    R2 lengths:",
+        "    R2 positions:",
+        "    R2 noise:",
+        "    R2 unaligned sequences:",
+        // The unaligned second read contributes raw sequence bytes.
+        "raw",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+    let file_size = std::fs::metadata(&archive_path).unwrap().len();
+    let (accounted, total) = parse_accounted(&stdout);
+    assert_eq!(accounted, file_size);
+    assert_eq!(total, file_size);
 }
 
 #[test]
@@ -1039,6 +1228,70 @@ fn embedded_index_ranges_round_trip_across_mates() {
 
     assert_eq!(std::fs::read(&decoded_first).unwrap(), first_fastq);
     assert_eq!(std::fs::read(&decoded_second).unwrap(), second_fastq);
+}
+
+#[test]
+fn embedded_index_range_may_consume_the_entire_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+    let decoded_first = directory.path().join("decoded.1.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let first_fastq = b"@read0\nAAAACCCCGGGGTTTTACGT\n+\nABCDEFGHIJKLMNOPQRST\n";
+    std::fs::write(&first_path, first_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--index-range")
+        .arg("R1:1:20")
+        .arg("--chunk-records")
+        .arg("1")
+        .arg("--output")
+        .arg(&archive_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&decoded_first)
+        .arg("--threads")
+        .arg("2")
+        .assert()
+        .success();
+
+    assert_eq!(std::fs::read(&decoded_first).unwrap(), first_fastq);
 }
 
 #[test]

@@ -10,7 +10,6 @@ pub mod minibwa;
 mod packed_sequence;
 mod quality;
 mod reference_free;
-#[cfg(feature = "rustar")]
 mod rustar_index;
 
 use std::collections::BTreeMap;
@@ -26,7 +25,9 @@ pub use aligners::{
     AlignerKind, GenomeAlignment, GenomeIndexBuildOptions,
 };
 pub use alignment_archive::{
-    read_archive_info, verify_aligned_archive, AlignedRecordIter, ArchiveInfo, VerifyReport,
+    read_archive_info, read_archive_info_with_breakdown, verify_aligned_archive, AlignedRecordIter,
+    ArchiveInfo, IndexStreamSubsectionSizes, MateSubsectionSizes, RecordSubsectionSizes,
+    SectionBreakdown, SectionSizes, VerifyReport,
 };
 pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
 pub use reference_free::record_store::{PairStore, StoreStats};
@@ -92,8 +93,8 @@ impl ReadRecord {
         }
     }
 
-    pub(crate) fn validate(&self, preserve_quality: bool) -> Result<()> {
-        if self.sequence.is_empty() {
+    pub(crate) fn validate(&self, preserve_quality: bool, allow_empty: bool) -> Result<()> {
+        if self.sequence.is_empty() && !allow_empty {
             return Err(Error::InvalidInput("read sequence cannot be empty".into()));
         }
         if preserve_quality {
@@ -583,8 +584,8 @@ pub fn compress_reordered_paired_fastq_files_profiled(
                         match (first.next(), second.next()) {
                             (None, None) => break,
                             (Some(Ok(mut first)), Some(Ok(mut second))) => {
-                                first.validate(true)?;
-                                second.validate(true)?;
+                                first.validate(true, false)?;
+                                second.validate(true, false)?;
                                 if producer_options.preserve_quality {
                                     apply_quality(&mut first, &producer_options.quality_mode);
                                     apply_quality(&mut second, &producer_options.quality_mode);

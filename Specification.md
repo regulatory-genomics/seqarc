@@ -162,8 +162,10 @@ u64 length
 ```
 
 Ranges use coordinates in the original biological read. Ranges on the same mate
-must be nonempty and non-overlapping. The CLI accepts one-based inclusive
-coordinates and converts them to the stored zero-based start and length.
+must be nonempty and non-overlapping, but they may cover the entire read,
+leaving an empty biological read (see Biological Subsections). The CLI accepts
+one-based inclusive coordinates and converts them to the stored zero-based
+start and length.
 
 The metadata block ends immediately after the last descriptor.
 
@@ -361,6 +363,12 @@ Each biological stream has eight independently compressed subsections:
    are absolute orientation values. For a record with both mates aligned, the
    R2 flag is `1` when R2 has the same orientation as R1 and `0` otherwise.
 8. Unaligned sequences: concatenated raw bytes; read lengths determine boundaries.
+
+A read length of zero is valid when embedded index ranges consume the entire
+read: the biological read is stored unaligned (flags `3` for single-end and
+paired records) with an empty unaligned-sequence body, and decoders reconstruct
+the original read by splicing the embedded index fragments back in ascending
+`START` order.
 
 Noise-position deltas are measured from the query cursor after the preceding
 event. Exact reference bases between events are copied implicitly. For paired

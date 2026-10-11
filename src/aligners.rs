@@ -73,7 +73,6 @@ struct AlignmentCandidate {
 
 pub(crate) enum AlignmentIndex {
     Minibwa(Index),
-    #[cfg(feature = "rustar")]
     Rustar(Box<crate::rustar_index::RustarIndex>),
 }
 
@@ -151,18 +150,9 @@ impl AlignmentIndex {
         let mut magic = [0; 8];
         let is_rustar = File::open(path)?.read_exact(&mut magic).is_ok() && magic == *b"SRSTAR01";
         if is_rustar {
-            #[cfg(feature = "rustar")]
-            {
-                return crate::rustar_index::load(path)
-                    .map(Box::new)
-                    .map(Self::Rustar);
-            }
-            #[cfg(not(feature = "rustar"))]
-            {
-                return Err(Error::InvalidInput(
-                    "this index requires building SeqArc with --features rustar".into(),
-                ));
-            }
+            return crate::rustar_index::load(path)
+                .map(Box::new)
+                .map(Self::Rustar);
         }
         Index::load(path, false)
             .map(Self::Minibwa)
@@ -172,7 +162,6 @@ impl AlignmentIndex {
     pub(crate) fn reference_len(&self) -> usize {
         match self {
             Self::Minibwa(index) => index.reference_len(),
-            #[cfg(feature = "rustar")]
             Self::Rustar(index) => index.reference_len(),
         }
     }
@@ -187,7 +176,6 @@ impl ReferenceBases for AlignmentIndex {
     fn base(&self, position: usize) -> u8 {
         match self {
             Self::Minibwa(index) => index.reference_base_at(position),
-            #[cfg(feature = "rustar")]
             Self::Rustar(index) => index.reference_base_at(position),
         }
     }
@@ -270,19 +258,7 @@ pub fn build_alignment_index(
         AlignerKind::Minibwa => {
             build_genome_index_with_options(genome_fasta, index_file, options).map(|_| ())
         }
-        AlignerKind::Rustar => {
-            #[cfg(feature = "rustar")]
-            {
-                crate::rustar_index::build(genome_fasta, index_file, options)
-            }
-            #[cfg(not(feature = "rustar"))]
-            {
-                let _ = (genome_fasta, index_file);
-                Err(Error::InvalidInput(
-                    "rustar support requires building with --features rustar".into(),
-                ))
-            }
-        }
+        AlignerKind::Rustar => crate::rustar_index::build(genome_fasta, index_file, options),
     }
 }
 
@@ -545,11 +521,51 @@ pub(crate) fn map_records<F>(
 where
     F: Fn(&ReadRecord, Option<&GenomeAlignment>, &AlignmentIndex) -> Result<usize> + Sync,
 {
+    // Reads fully consumed by embedded index ranges have empty biological
+    // sequences, which aligners reject; treat them as unmapped instead.
+    let mappable = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| !record.sequence.is_empty())
+        .collect::<Vec<_>>();
+    if mappable.len() == records.len() {
+        return map_index_records(index, records, mapping_pool, candidate_cost);
+    }
+    let mapped = map_index_records(
+        index,
+        &mappable.iter().map(|(_, record)| **record).collect::<Vec<_>>(),
+        mapping_pool,
+        candidate_cost,
+    )?;
+    let mut selected: Vec<Option<SelectedAlignment>> =
+        (0..records.len()).map(|_| None).collect();
+    for ((position, _), alignment) in mappable.into_iter().zip(mapped) {
+        selected[position] = Some(alignment);
+    }
+    Ok(selected
+        .into_iter()
+        .map(|selected| {
+            selected.unwrap_or(SelectedAlignment {
+                hit: None,
+                selection: AlignmentSelection::default(),
+            })
+        })
+        .collect())
+}
+
+fn map_index_records<F>(
+    index: &AlignmentIndex,
+    records: &[&ReadRecord],
+    mapping_pool: &rayon::ThreadPool,
+    candidate_cost: &F,
+) -> Result<Vec<SelectedAlignment>>
+where
+    F: Fn(&ReadRecord, Option<&GenomeAlignment>, &AlignmentIndex) -> Result<usize> + Sync,
+{
     match index {
         AlignmentIndex::Minibwa(raw_index) => {
             map_minibwa_records(raw_index, index, records, mapping_pool, candidate_cost)
         }
-        #[cfg(feature = "rustar")]
         AlignmentIndex::Rustar(raw_index) => {
             map_rustar_records(raw_index, index, records, mapping_pool, candidate_cost)
         }
@@ -619,7 +635,6 @@ where
         })
 }
 
-#[cfg(feature = "rustar")]
 fn map_rustar_records<F>(
     index: &crate::rustar_index::RustarIndex,
     reference: &AlignmentIndex,
@@ -665,7 +680,6 @@ where
     })
 }
 
-#[cfg(feature = "rustar")]
 fn rustar_read_name(id: &[u8]) -> String {
     if let Ok(id) = std::str::from_utf8(id) {
         return id.to_owned();
@@ -680,7 +694,6 @@ fn rustar_read_name(id: &[u8]) -> String {
     name
 }
 
-#[cfg(feature = "rustar")]
 fn rustar_candidate(
     transcript: rustar_aligner::align::Transcript,
     read_len: usize,
@@ -1040,17 +1053,6 @@ mod tests {
         assert!(!alignments[0].as_ref().unwrap().cigar.is_empty());
         assert!(alignments[1].as_ref().unwrap().is_reverse);
         assert!(alignments[2].is_none());
-    }
-
-    #[cfg(not(feature = "rustar"))]
-    #[test]
-    fn rustar_index_reports_disabled_feature() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), b"SRSTAR01").unwrap();
-        let error = AlignmentIndex::load(file.path()).err().unwrap();
-        assert!(error
-            .to_string()
-            .contains("requires building SeqArc with --features rustar"));
     }
 
     #[test]

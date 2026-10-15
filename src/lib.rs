@@ -13,6 +13,11 @@ mod qvz;
 mod reference_free;
 mod rustar_index;
 
+/// mimalloc reduces allocator overhead in the decode path, where chunks of
+/// per-record allocations are freed while large section buffers churn.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Write};

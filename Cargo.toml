@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"
 flate2 = "1"
 indicatif = "0.17"
+mimalloc = "0.1"
 minibwa-rs = { git = "https://github.com/henriksson-lab/minibwa-rs", rev = "0f4b719b46c8c232ea25ea22f628e4632d037277" }
 memmap2 = "0.9"
 noodles = { version = "0.113", features = ["sam"] }

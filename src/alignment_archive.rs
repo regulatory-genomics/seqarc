@@ -253,7 +253,7 @@ fn write_position(output: &mut Vec<u8>, value: u64, width: usize) -> Result<()> 
     Ok(())
 }
 
-fn read_position(input: &mut Cursor<Vec<u8>>, width: usize) -> Result<u64> {
+fn read_position<T: AsRef<[u8]>>(input: &mut Cursor<T>, width: usize) -> Result<u64> {
     let mut value = 0u64;
     for byte in 0..width {
         value |= u64::from(read_u8(input)?) << (byte * 8);
@@ -302,6 +302,9 @@ pub struct AlignedRecordIter<R: Read> {
     outstanding_jobs: usize,
     target_jobs: usize,
     max_resident_chunks: usize,
+    resident_bytes: u64,
+    max_resident_bytes: u64,
+    resident_estimates: BTreeMap<u64, u64>,
     pending: BTreeMap<u64, Result<DecodedArchiveChunk>>,
     skipped_chunks: BTreeMap<u64, u64>,
     skipped_chunk_total: u64,
@@ -1367,6 +1370,11 @@ pub(crate) fn decompress_iter<R: Read>(
         } else {
             decoder_threads.saturating_mul(2)
         },
+        resident_bytes: 0,
+        // Resident decoded chunks are bounded by memory rather than a chunk
+        // count so that adding decoder threads does not inflate peak RSS.
+        max_resident_bytes: 3 * 1024 * 1024 * 1024,
+        resident_estimates: BTreeMap::new(),
         pending: BTreeMap::new(),
         skipped_chunks: BTreeMap::new(),
         skipped_chunk_total: 0,
@@ -1412,6 +1420,25 @@ impl<R: Read> AlignedRecordIter<R> {
         self.outstanding_jobs + self.pending.len() + usize::from(self.current.is_some())
     }
 
+    /// Records the memory estimate of a decoded chunk (in flight or pending).
+    fn register_chunk_bytes(&mut self, chunk_index: u64, estimate: u64) {
+        self.resident_bytes = self.resident_bytes.saturating_add(estimate);
+        self.resident_estimates.insert(chunk_index, estimate);
+    }
+
+    /// Releases the memory estimate once a chunk has been fully consumed.
+    fn release_chunk_bytes(&mut self, chunk_index: u64) {
+        if let Some(estimate) = self.resident_estimates.remove(&chunk_index) {
+            self.resident_bytes = self.resident_bytes.saturating_sub(estimate);
+        }
+    }
+
+    /// Drops all residency accounting after pending chunks are discarded.
+    fn drop_resident_state(&mut self) {
+        self.resident_bytes = 0;
+        self.resident_estimates.clear();
+    }
+
     fn stop_input_with_error(&mut self, chunk_index: u64, error: Error) {
         self.pending.insert(chunk_index, Err(error));
         self.terminal_chunk = chunk_index + 1;
@@ -1441,6 +1468,7 @@ impl<R: Read> AlignedRecordIter<R> {
         while !self.input_finished
             && self.outstanding_jobs < self.target_jobs
             && self.resident_chunks() < self.max_resident_chunks
+            && self.resident_bytes < self.max_resident_bytes
         {
             if self.chunks_remaining == 0 {
                 self.finish_input();
@@ -1480,6 +1508,12 @@ impl<R: Read> AlignedRecordIter<R> {
             let ids_len = header.ids_len;
             let qualities_len = header.qualities_len;
             let records_len = header.records_len;
+            // Account for the chunk's decoded footprint (per-record Vec
+            // materialization roughly quadruples the raw stream size).
+            let estimate = u64::try_from(raw_len)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(4)
+                .saturating_add(u64::try_from(compressed.len()).unwrap_or(u64::MAX));
             let encoded = EncodedArchiveChunk {
                 first_record,
                 record_count,
@@ -1502,6 +1536,7 @@ impl<R: Read> AlignedRecordIter<R> {
             self.next_submit_chunk += 1;
             self.next_submit_record = next_record;
             self.chunks_remaining -= 1;
+            self.register_chunk_bytes(chunk_index, estimate);
             if let (Some(pool), Some(sender)) = (&self.pool, &self.result_tx) {
                 self.outstanding_jobs += 1;
                 let sender = sender.clone();
@@ -1691,6 +1726,7 @@ impl<R: Read> Iterator for AlignedRecordIter<R> {
                 self.done = true;
                 self.current = None;
                 self.pending.clear();
+                self.drop_resident_state();
                 return Some(Err(error));
             }
             if let Some(current) = &mut self.current {
@@ -1698,7 +1734,9 @@ impl<R: Read> Iterator for AlignedRecordIter<R> {
                 {
                     return Some(Ok(record));
                 }
+                let exhausted_chunk = self.next_yield_chunk - 1;
                 self.current = None;
+                self.release_chunk_bytes(exhausted_chunk);
                 debug_assert!(self.resident_chunks() <= self.max_resident_chunks);
             }
             match self.load_next_chunk() {
@@ -1711,6 +1749,7 @@ impl<R: Read> Iterator for AlignedRecordIter<R> {
                     self.done = true;
                     self.current = None;
                     self.pending.clear();
+                    self.drop_resident_state();
                     return Some(Err(error));
                 }
             }
@@ -2242,7 +2281,7 @@ fn decode_archive_chunk(
     delta_position_width: usize,
     index_stream_count: usize,
 ) -> Result<DecodedArchiveChunk> {
-    let raw = decode_chunk_sections(
+    let (raw, records_section) = decode_chunk_sections(
         &encoded.compressed,
         encoded.ids_len,
         encoded.qualities_len,
@@ -2253,14 +2292,13 @@ fn decode_archive_chunk(
         .checked_add(encoded.qualities_len)
         .and_then(|length| length.checked_add(encoded.records_len))
         .ok_or_else(|| Error::InvalidFormat("chunk block size overflow".into()))?;
-    if raw.len() != encoded.raw_len || expected_raw_len != raw.len() {
+    if expected_raw_len != encoded.raw_len {
         return Err(Error::InvalidFormat(
             "chunk block sizes do not match".into(),
         ));
     }
     let ids_end = encoded.ids_len;
     let qualities_end = ids_end + encoded.qualities_len;
-    let records_end = qualities_end + encoded.records_len;
     let qualities = decode_qualities(
         &raw[ids_end..qualities_end],
         encoded.record_count,
@@ -2269,7 +2307,7 @@ fn decode_archive_chunk(
     )?;
     let (sequences, index_reads) = {
         let sections = decode_v21_records(
-            &raw[qualities_end..records_end],
+            records_section,
             encoded.record_count,
             reference,
             layout,
@@ -2315,16 +2353,53 @@ fn decode_archive_chunk(
     })
 }
 
+thread_local! {
+    /// Reused zstd decompression context per worker thread, avoiding context
+    /// reallocation for every decoded section.
+    static DECOMPRESSOR: std::cell::RefCell<zstd::zstd_safe::DCtx<'static>> =
+        std::cell::RefCell::new(zstd::zstd_safe::DCtx::create());
+}
+
+/// Decompresses a single zstd frame into `destination` without intermediate
+/// allocations. Frames carrying an embedded content size (all frames written
+/// by the current encoder) are decoded one-shot; legacy streaming frames
+/// without one fall back to the streaming decoder.
+fn decompress_frame_into(source: &[u8], destination: &mut [u8]) -> Result<()> {
+    DECOMPRESSOR.with(|context| {
+        let mut context = context.borrow_mut();
+        let content_size = zstd::zstd_safe::get_frame_content_size(source)
+            .map_err(|_| Error::InvalidFormat("invalid zstd frame header".into()))?;
+        if content_size == Some(destination.len() as u64) {
+            context
+                .decompress(destination, source)
+                .map_err(|error| Error::InvalidFormat(format!("zstd decompression failed: {error}")))?;
+            Ok(())
+        } else {
+            let decoded = zstd::stream::decode_all(Cursor::new(source))?;
+            if decoded.len() != destination.len() {
+                return Err(Error::InvalidFormat("zstd frame length mismatch".into()));
+            }
+            destination.copy_from_slice(&decoded);
+            Ok(())
+        }
+    })
+}
+
+/// Decompresses the chunk ID and quality sections in place and returns them
+/// alongside a borrowed view of the (already framed) record subsections. The
+/// returned buffer holds ids followed by qualities; the record section is not
+/// copied.
 fn decode_chunk_sections(
     compressed: &[u8],
     ids_len: usize,
     qualities_len: usize,
     records_len: usize,
-) -> Result<Vec<u8>> {
-    let mut input = Cursor::new(compressed.to_vec());
-    let ids_compressed_len = usize_from(read_u64(&mut input)?, "compressed ID section")?;
-    let qualities_compressed_len = usize_from(read_u64(&mut input)?, "compressed quality section")?;
-    let records_compressed_len = usize_from(read_u64(&mut input)?, "compressed record section")?;
+) -> Result<(Vec<u8>, &[u8])> {
+    let mut header = Cursor::new(compressed);
+    let ids_compressed_len = usize_from(read_u64(&mut header)?, "compressed ID section")?;
+    let qualities_compressed_len =
+        usize_from(read_u64(&mut header)?, "compressed quality section")?;
+    let records_compressed_len = usize_from(read_u64(&mut header)?, "compressed record section")?;
     let expected = 24usize
         .checked_add(ids_compressed_len)
         .and_then(|value| value.checked_add(qualities_compressed_len))
@@ -2335,29 +2410,18 @@ fn decode_chunk_sections(
             "compressed section sizes do not match".into(),
         ));
     }
-    let mut decode_section = |compressed_len: usize, raw_len: usize| -> Result<Vec<u8>> {
-        let mut section = vec![0; compressed_len];
-        input.read_exact(&mut section)?;
-        let raw = zstd::stream::decode_all(Cursor::new(section))?;
-        if raw.len() != raw_len {
-            return Err(Error::InvalidFormat("chunk section length mismatch".into()));
-        }
-        Ok(raw)
-    };
-    let ids = decode_section(ids_compressed_len, ids_len)?;
-    let qualities = decode_section(qualities_compressed_len, qualities_len)?;
-    let mut records = vec![0; records_compressed_len];
-    input.read_exact(&mut records)?;
-    if records.len() != records_len {
+    let ids_source = &compressed[24..24 + ids_compressed_len];
+    let qualities_source = &compressed[24 + ids_compressed_len..expected - records_len];
+    let records_source = &compressed[expected - records_len..];
+    if records_source.len() != records_len {
         return Err(Error::InvalidFormat(
             "chunk record section length mismatch".into(),
         ));
     }
-    let mut raw = Vec::with_capacity(ids_len + qualities_len + records_len);
-    raw.extend(ids);
-    raw.extend(qualities);
-    raw.extend(records);
-    Ok(raw)
+    let mut raw = vec![0u8; ids_len + qualities_len];
+    decompress_frame_into(ids_source, &mut raw[..ids_len])?;
+    decompress_frame_into(qualities_source, &mut raw[ids_len..])?;
+    Ok((raw, records_source))
 }
 
 fn map_pairs(
@@ -2622,9 +2686,8 @@ fn encode_chunk(
         options.index_read_files.len(),
         options.zstd_level,
     )?;
-    let ids_compressed = zstd::stream::encode_all(Cursor::new(&ids), options.zstd_level)?;
-    let qualities_compressed =
-        zstd::stream::encode_all(Cursor::new(&qualities), options.zstd_level)?;
+    let ids_compressed = zstd::bulk::compress(&ids, options.zstd_level)?;
+    let qualities_compressed = zstd::bulk::compress(&qualities, options.zstd_level)?;
     // `records` already contains independently compressed subsection frames.
     let records_len = records_stream.bytes.len() as u64;
     let records_compressed = records_stream.bytes;
@@ -2987,7 +3050,7 @@ fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
     let mut indexes_raw_len = 0u64;
     let mut indexes_compressed_len = 0u64;
     for (section_index, section) in sections.iter().enumerate() {
-        let compressed = zstd::stream::encode_all(Cursor::new(section), zstd_level)?;
+        let compressed = zstd::bulk::compress(section, zstd_level)?;
         if section_index >= index_start {
             indexes_raw_len += section.len() as u64;
             indexes_compressed_len += compressed.len() as u64;
@@ -3349,7 +3412,7 @@ fn decode_v21_records(
     absolute_position_width: usize,
     delta_position_width: usize,
 ) -> Result<DecodedRecordSections> {
-    let mut cursor = Cursor::new(input.to_vec());
+    let mut cursor = Cursor::new(input);
     let section_count = read_u32(&mut cursor)? as usize;
     let expected_sections = layout
         .streams()
@@ -3365,14 +3428,16 @@ fn decode_v21_records(
     for _ in 0..section_count {
         let compressed_len = usize_from(read_u64(&mut cursor)?, "record subsection")?;
         let raw_len = usize_from(read_u64(&mut cursor)?, "record subsection")?;
-        let mut compressed = vec![0; compressed_len];
-        cursor.read_exact(&mut compressed)?;
-        let raw = zstd::stream::decode_all(Cursor::new(compressed))?;
-        if raw.len() != raw_len {
-            return Err(Error::InvalidFormat(
-                "record subsection length mismatch".into(),
-            ));
+        let compressed_start = cursor.position() as usize;
+        let compressed_end = compressed_start
+            .checked_add(compressed_len)
+            .ok_or_else(|| Error::InvalidFormat("record subsection overflow".into()))?;
+        if compressed_end > input.len() {
+            return Err(Error::InvalidFormat("record subsection out of bounds".into()));
         }
+        cursor.set_position(compressed_end as u64);
+        let mut raw = vec![0u8; raw_len];
+        decompress_frame_into(&input[compressed_start..compressed_end], &mut raw)?;
         sections.push(raw);
     }
     if cursor.position() != cursor.get_ref().len() as u64 {
@@ -3560,35 +3625,35 @@ fn decode_v21_mate_sections(
             "aligned metadata section mismatch".into(),
         ));
     }
-    let noise_rows = newline_rows(&sections[3], aligned_count, true, "noise")?;
-    let emit_count = noise_rows
-        .iter()
-        .map(|row| row.iter().filter(|&&symbol| symbol == b'5').count())
-        .sum();
-    let emit_rows = newline_rows(&sections[5], emit_count, false, "emit")?;
-    let event_count = noise_rows.iter().map(|row| row.len()).sum::<usize>();
+    let noise_payload = validated_newline_rows(&sections[3], aligned_count, true, "noise")?;
+    let mut emit_count = 0usize;
+    let mut event_count = 0usize;
+    let mut skip_count = 0usize;
+    for row in noise_payload.split(|&byte| byte == b'\n') {
+        event_count += row.len();
+        skip_count += row.iter().filter(|&&symbol| symbol == b'4').count();
+        emit_count += row.iter().filter(|&&symbol| symbol == b'5').count();
+    }
     if sections[2].len() != event_count * 2 {
         return Err(Error::InvalidFormat(
             "noise position section mismatch".into(),
         ));
     }
-    let skip_count = noise_rows
-        .iter()
-        .map(|row| row.iter().filter(|&&symbol| symbol == b'4').count())
-        .sum::<usize>();
     if sections[4].len() != skip_count * 8 {
         return Err(Error::InvalidFormat(
             "reference skip section mismatch".into(),
         ));
     }
-    let mut lengths = Cursor::new(sections[0].clone());
-    let mut positions = Cursor::new(sections[1].clone());
-    let mut noise_positions = Cursor::new(sections[2].clone());
-    let mut skips = Cursor::new(sections[4].clone());
-    let mut reverses = Cursor::new(sections[6].clone());
-    let mut unaligned = Cursor::new(sections[7].clone());
-    let mut noise_row = 0usize;
-    let mut emit_row = 0usize;
+    let emit_payload = validated_newline_rows(&sections[5], emit_count, false, "emit")?;
+    let mut noise_rows = noise_payload.split(|&byte| byte == b'\n');
+    let mut emit_rows = emit_payload.split(|&byte| byte == b'\n');
+    let mut lengths = Cursor::new(&sections[0][..]);
+    let mut positions = Cursor::new(&sections[1][..]);
+    let mut noise_positions = Cursor::new(&sections[2][..]);
+    let mut skips = Cursor::new(&sections[4][..]);
+    let mut reverses = Cursor::new(&sections[6][..]);
+    let mut unaligned = Cursor::new(&sections[7][..]);
+    let mut noise_row_index = 0usize;
     let mut sequences = Vec::with_capacity(flags.len());
     let mut alignments = vec![None; flags.len()];
     for (record_index, &flag) in flags.iter().enumerate() {
@@ -3645,9 +3710,12 @@ fn decode_v21_mate_sections(
             } else {
                 encoded_reverse != 0
             };
-            let mut events = Vec::with_capacity(noise_rows[noise_row].len());
+            let noise_row = noise_rows
+                .next()
+                .ok_or_else(|| Error::InvalidFormat("noise row count mismatch".into()))?;
+            let mut events = Vec::with_capacity(noise_row.len());
             let mut emits = Vec::new();
-            for &encoded_symbol in noise_rows[noise_row] {
+            for &encoded_symbol in noise_row {
                 if !(b'0'..=b'5').contains(&encoded_symbol) {
                     return Err(Error::InvalidFormat("unknown noise symbol".into()));
                 }
@@ -3659,8 +3727,10 @@ fn decode_v21_mate_sections(
                     0
                 };
                 if symbol == 5 {
-                    emits.push(emit_rows[emit_row].to_vec());
-                    emit_row += 1;
+                    let emit_row = emit_rows
+                        .next()
+                        .ok_or_else(|| Error::InvalidFormat("emit row count mismatch".into()))?;
+                    emits.push(emit_row);
                 }
                 events.push(V21NoiseEvent {
                     delta,
@@ -3668,7 +3738,7 @@ fn decode_v21_mate_sections(
                     skip,
                 });
             }
-            noise_row += 1;
+            noise_row_index += 1;
             sequences.push(reconstruct_v21_aligned_read(
                 reference, length, start, reverse, &events, &emits,
             )?);
@@ -3685,8 +3755,7 @@ fn decode_v21_mate_sections(
         || skips.position() != skips.get_ref().len() as u64
         || reverses.position() != reverses.get_ref().len() as u64
         || unaligned.position() != unaligned.get_ref().len() as u64
-        || noise_row != noise_rows.len()
-        || emit_row != emit_rows.len()
+        || noise_row_index != aligned_count
     {
         return Err(Error::InvalidFormat(
             "trailing read subsection bytes".into(),
@@ -3695,15 +3764,18 @@ fn decode_v21_mate_sections(
     Ok((sequences, alignments))
 }
 
-fn newline_rows<'a>(
+/// Validates that `input` holds exactly `expected` newline-separated rows and
+/// returns the payload between the outer newlines. Callers iterate rows
+/// lazily with `split` instead of materializing a row vector per section.
+fn validated_newline_rows<'a>(
     input: &'a [u8],
     expected: usize,
     allow_empty: bool,
     name: &str,
-) -> Result<Vec<&'a [u8]>> {
+) -> Result<&'a [u8]> {
     if expected == 0 {
         return if input.is_empty() {
-            Ok(Vec::new())
+            Ok(&[])
         } else {
             Err(Error::InvalidFormat(format!("unexpected {name} rows")))
         };
@@ -3711,13 +3783,17 @@ fn newline_rows<'a>(
     if input.last() != Some(&b'\n') {
         return Err(Error::InvalidFormat(format!("unterminated {name} rows")));
     }
-    let rows = input[..input.len() - 1]
-        .split(|&byte| byte == b'\n')
-        .collect::<Vec<_>>();
-    if rows.len() != expected || (!allow_empty && rows.iter().any(|row| row.is_empty())) {
+    let payload = &input[..input.len() - 1];
+    let mut rows = 0usize;
+    let mut all_nonempty = true;
+    for row in payload.split(|&byte| byte == b'\n') {
+        rows += 1;
+        all_nonempty &= !row.is_empty();
+    }
+    if rows != expected || (!allow_empty && !all_nonempty) {
         return Err(Error::InvalidFormat(format!("{name} row count mismatch")));
     }
-    Ok(rows)
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -3784,7 +3860,7 @@ fn decode_v21_aligned_read(reference: &[u8], length: usize, input: &[u8]) -> Res
         start,
         reverse != 0,
         &events,
-        &emits.iter().map(|emit| emit.to_vec()).collect::<Vec<_>>(),
+        &emits,
     )
 }
 
@@ -3794,39 +3870,63 @@ fn reconstruct_v21_aligned_read(
     start: usize,
     reverse: bool,
     events: &[V21NoiseEvent],
-    emits: &[Vec<u8>],
+    emits: &[&[u8]],
 ) -> Result<Vec<u8>> {
-    let mut sequence = vec![0; length];
+    // Fast path: without noise events the read is a contiguous reference
+    // slice (the general path below writes every byte exactly once, so the
+    // zero-initialized buffer it replaced was pure overhead).
+    if events.is_empty() {
+        if !emits.is_empty() {
+            return Err(Error::InvalidFormat(
+                "aligned read length mismatch".into(),
+            ));
+        }
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| Error::InvalidFormat("final reference span overflow".into()))?;
+        if end > reference.len() {
+            return Err(Error::InvalidFormat(
+                "final reference span exceeds reference".into(),
+            ));
+        }
+        let mut sequence = reference[start..end].to_vec();
+        if reverse {
+            reverse_complement(&mut sequence);
+        }
+        return Ok(sequence);
+    }
+    // The construction is strictly left-to-right: reference gaps, event
+    // effects, and the tail all extend the sequence monotonically, so the
+    // sequence is built by extending a capacity-reserved buffer instead of
+    // writing into a zero-initialized one.
+    let mut sequence = Vec::with_capacity(length);
     let mut ref_pos = start;
-    let mut query_pos = 0usize;
     let mut emit_index = 0usize;
     for event in events {
-        let target = query_pos
-            .checked_add(event.delta as usize)
-            .ok_or_else(|| Error::InvalidFormat("noise position overflow".into()))?;
         let reference_end = ref_pos
             .checked_add(event.delta as usize)
             .ok_or_else(|| Error::InvalidFormat("reference position overflow".into()))?;
+        let target = sequence
+            .len()
+            .checked_add(event.delta as usize)
+            .ok_or_else(|| Error::InvalidFormat("noise position overflow".into()))?;
         if target > length || reference_end > reference.len() {
             return Err(Error::InvalidFormat(format!(
-                "aligned read event exceeds bounds: query={query_pos} delta={} target={target} length={length} reference={ref_pos} reference_target={reference_end} reference_length={} symbol={}",
+                "aligned read event exceeds bounds: query={} delta={} target={target} length={length} reference={ref_pos} reference_target={reference_end} reference_length={} symbol={}",
+                sequence.len(),
                 event.delta,
                 reference.len(),
                 event.symbol
             )));
         }
-        for position in query_pos..target {
-            sequence[position] = reference[ref_pos + position - query_pos];
-        }
-        query_pos = target;
+        sequence.extend_from_slice(&reference[ref_pos..reference_end]);
         ref_pos = reference_end;
         match event.symbol {
             0..=3 => {
-                if query_pos >= length || ref_pos >= reference.len() {
+                if sequence.len() >= length || ref_pos >= reference.len() {
                     return Err(Error::InvalidFormat("substitution exceeds bounds".into()));
                 }
-                sequence[query_pos] = substitution_base(reference[ref_pos], event.symbol)?;
-                query_pos += 1;
+                sequence.push(substitution_base(reference[ref_pos], event.symbol)?);
                 ref_pos += 1;
             }
             4 => {
@@ -3840,9 +3940,10 @@ fn reconstruct_v21_aligned_read(
                 }
             }
             5 => {
-                let emit = &emits[emit_index];
+                let emit = emits[emit_index];
                 emit_index += 1;
-                let end = query_pos
+                let end = sequence
+                    .len()
                     .checked_add(emit.len())
                     .ok_or_else(|| Error::InvalidFormat("emit sequence overflow".into()))?;
                 if end > length {
@@ -3850,27 +3951,23 @@ fn reconstruct_v21_aligned_read(
                         "emit sequence exceeds read length".into(),
                     ));
                 }
-                sequence[query_pos..end].copy_from_slice(emit);
-                query_pos = end;
+                sequence.extend_from_slice(emit);
             }
             _ => unreachable!(),
         }
     }
-    if query_pos < length {
+    if sequence.len() < length {
         let end = ref_pos
-            .checked_add(length - query_pos)
+            .checked_add(length - sequence.len())
             .ok_or_else(|| Error::InvalidFormat("final reference span overflow".into()))?;
         if end > reference.len() {
             return Err(Error::InvalidFormat(
                 "final reference span exceeds reference".into(),
             ));
         }
-        for position in query_pos..length {
-            sequence[position] = reference[ref_pos + position - query_pos];
-        }
-        query_pos = length;
+        sequence.extend_from_slice(&reference[ref_pos..end]);
     }
-    if query_pos != length || emit_index != emits.len() {
+    if sequence.len() != length || emit_index != emits.len() {
         return Err(Error::InvalidFormat("aligned read length mismatch".into()));
     }
     if reverse {
@@ -3885,7 +3982,7 @@ fn decode_ids(
     mode: IdMode,
     layout: AlignmentLayout,
 ) -> Result<Vec<Vec<Vec<u8>>>> {
-    let mut cursor = Cursor::new(input.to_vec());
+    let mut cursor = Cursor::new(input);
     let mut blocks = vec![Vec::new(); layout.streams()];
     for block in &mut blocks {
         let length = usize_from(read_u64(&mut cursor)?, "ID block")?;
@@ -3911,46 +4008,48 @@ fn decode_ids(
         }
         return Ok(vec![first]);
     }
-    let second = match mode {
-        IdMode::None => vec![Vec::new(); count],
-        IdMode::Independent => decode_prefix_ids(&blocks[1], count)?,
+    if mode == IdMode::SlashMate && !blocks[1].is_empty() {
+        return Err(Error::InvalidFormat("unexpected mate-2 ID bytes".into()));
+    }
+    let (first, second) = match mode {
+        IdMode::None => (first, vec![Vec::new(); count]),
+        IdMode::Independent => (first, decode_prefix_ids(&blocks[1], count)?),
         IdMode::IdenticalMates => {
             if !blocks[1].is_empty() {
                 return Err(Error::InvalidFormat("unexpected mate-2 ID bytes".into()));
             }
-            first.clone()
+            let second = first.clone();
+            (first, second)
         }
+        // Each identifier is allocated exactly once per mate: mate 1 gets the
+        // "/1" suffix appended in place, mate 2 reuses a clone of mate 1 with
+        // the suffix replaced (no reallocation, same length).
         IdMode::SlashMate => {
-            if !blocks[1].is_empty() {
-                return Err(Error::InvalidFormat("unexpected mate-2 ID bytes".into()));
-            }
-            first
+            let first = first
+                .into_iter()
+                .map(|mut id| {
+                    id.extend_from_slice(b"/1");
+                    id
+                })
+                .collect::<Vec<_>>();
+            let second = first
                 .iter()
                 .map(|id| {
                     let mut value = id.clone();
+                    let base = value.len() - 2;
+                    value.truncate(base);
                     value.extend_from_slice(b"/2");
                     value
                 })
-                .collect()
+                .collect();
+            (first, second)
         }
-    };
-    let first = if mode == IdMode::SlashMate {
-        first
-            .iter()
-            .map(|id| {
-                let mut value = id.clone();
-                value.extend_from_slice(b"/1");
-                value
-            })
-            .collect()
-    } else {
-        first
     };
     Ok(vec![first, second])
 }
 
 fn decode_prefix_ids(input: &[u8], count: usize) -> Result<Vec<Vec<u8>>> {
-    let mut cursor = Cursor::new(input.to_vec());
+    let mut cursor = Cursor::new(input);
     let mut previous = Vec::new();
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
@@ -3984,7 +4083,7 @@ fn decode_qualities(
     preserve: bool,
     layout: AlignmentLayout,
 ) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
-    let mut cursor = Cursor::new(input.to_vec());
+    let mut cursor = Cursor::new(input);
     let mut result = Vec::with_capacity(layout.streams());
     for _ in 0..layout.streams() {
         let length = usize_from(read_u64(&mut cursor)?, "quality stream")?;
@@ -4290,7 +4389,7 @@ fn encode_reference(
         *raw.last_mut().unwrap() |= bits << (6 - (index % 4) * 2);
     }
     Ok(EncodedReference {
-        block: zstd::stream::encode_all(Cursor::new(&raw), options.zstd_level)?,
+        block: zstd::bulk::compress(&raw, options.zstd_level)?,
         raw_len: raw.len() as u64,
     })
 }
@@ -4305,31 +4404,32 @@ fn decode_reference(block: &[u8]) -> Result<Vec<u8>> {
     }
 
     let invalid_payload = || Error::InvalidFormat("invalid reference payload".into());
-    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(block))?.single_frame();
-    let mut count_bytes = [0; 8];
-    decoder
-        .read_exact(&mut count_bytes)
-        .map_err(|_| invalid_payload())?;
+    // Decompress the packed payload exactly once, sizing the buffer from the
+    // frame's embedded content size when present; legacy frames without one
+    // fall back to the streaming decoder.
+    let payload = match zstd::zstd_safe::get_frame_content_size(block)
+        .map_err(|_| invalid_payload())?
+    {
+        Some(size) => {
+            let mut payload =
+                vec![0u8; usize::try_from(size).map_err(|_| invalid_payload())?];
+            decompress_frame_into(block, &mut payload)?;
+            payload
+        }
+        None => zstd::stream::decode_all(Cursor::new(block)).map_err(|_| invalid_payload())?,
+    };
+    let count_bytes: [u8; 8] = payload
+        .get(..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(invalid_payload)?;
     let base_count = usize_from(u64::from_le_bytes(count_bytes), "reference base count")?;
     let packed_len = base_count.div_ceil(4);
-    let mut decoded_packed_len = 0usize;
-    let mut last_packed = 0u8;
-    let mut buffer = [0; 8192];
-    loop {
-        let read = decoder.read(&mut buffer).map_err(|_| invalid_payload())?;
-        if read == 0 {
-            break;
-        }
-        decoded_packed_len = decoded_packed_len
-            .checked_add(read)
-            .ok_or_else(|| Error::InvalidFormat("reference payload length overflow".into()))?;
-        last_packed = buffer[read - 1];
-    }
-    if decoded_packed_len != packed_len {
+    if payload.len() != 8 + packed_len {
         return Err(Error::InvalidFormat(
             "reference packed payload length mismatch".into(),
         ));
     }
+    let last_packed = payload[payload.len() - 1];
     let remainder = base_count % 4;
     if remainder != 0 && last_packed & ((1 << ((4 - remainder) * 2)) - 1) != 0 {
         return Err(Error::InvalidFormat(
@@ -4337,24 +4437,13 @@ fn decode_reference(block: &[u8]) -> Result<Vec<u8>> {
         ));
     }
 
-    let mut reference = Vec::new();
-    reference
-        .try_reserve_exact(base_count)
-        .map_err(|_| Error::InvalidFormat("reference base count is too large".into()))?;
-    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(block))?.single_frame();
-    decoder
-        .read_exact(&mut count_bytes)
-        .map_err(|_| invalid_payload())?;
-    for _ in 0..packed_len {
-        let mut packed = [0];
-        decoder
-            .read_exact(&mut packed)
-            .map_err(|_| invalid_payload())?;
+    let mut reference = Vec::with_capacity(base_count);
+    for &packed in &payload[8..] {
         for shift in [6, 4, 2, 0] {
             if reference.len() == base_count {
                 break;
             }
-            reference.push(b"ACGT"[((packed[0] >> shift) & 3) as usize]);
+            reference.push(b"ACGT"[((packed >> shift) & 3) as usize]);
         }
     }
     Ok(reference)
@@ -4514,7 +4603,7 @@ fn write_varint(output: &mut Vec<u8>, mut value: u64) -> Result<()> {
     Ok(())
 }
 
-fn read_varint(input: &mut Cursor<Vec<u8>>) -> Result<u64> {
+fn read_varint<T: AsRef<[u8]>>(input: &mut Cursor<T>) -> Result<u64> {
     let mut value = 0u64;
     for shift in (0..=63).step_by(7) {
         let byte = read_u8(input)?;

@@ -2082,3 +2082,311 @@ fn validate_rejects_mismatched_index_originals() {
         .assert()
         .success();
 }
+
+fn qvz_test_quality(length: usize, seed: u64) -> String {
+    let mut state = seed;
+    (0..length)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (35 + (state >> 33) % 38) as u8 as char
+        })
+        .collect()
+}
+
+fn reverse_complement(sequence: &[u8]) -> Vec<u8> {
+    sequence
+        .iter()
+        .rev()
+        .map(|base| match base {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+#[test]
+fn qvz_quality_mode_round_trips_with_lossy_quality() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let second_path = directory.path().join("reads.2.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+    let decoded_first = directory.path().join("decoded.1.fastq");
+    let decoded_second = directory.path().join("decoded.2.fastq");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+
+    // Six pairs aligned to the reference with varied quality strings so the
+    // QVZ training statistics are non-degenerate.
+    let read_length = 40usize;
+    let mut first_fastq = String::new();
+    let mut second_fastq = String::new();
+    for pair in 0..6usize {
+        let start = 8 + pair * 5;
+        let first_sequence = &reference[start..start + read_length];
+        let second_sequence = reverse_complement(&reference[start + 2..start + 2 + read_length]);
+        first_fastq.push_str(&format!(
+            "@pair{pair}/1\n{}\n+\n{}\n",
+            String::from_utf8_lossy(first_sequence),
+            qvz_test_quality(read_length, 1000 + pair as u64)
+        ));
+        second_fastq.push_str(&format!(
+            "@pair{pair}/2\n{}\n+\n{}\n",
+            String::from_utf8_lossy(&second_sequence),
+            qvz_test_quality(read_length, 2000 + pair as u64)
+        ));
+    }
+    std::fs::write(&first_path, &first_fastq).unwrap();
+    std::fs::write(&second_path, &second_fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .arg("--quality-mode")
+        .arg("qvz")
+        .arg("--qvz-ratio")
+        .arg("1.0")
+        .assert()
+        .success();
+
+    // Quality is lossy, so full validation against the originals must fail.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("validate")
+        .arg(&archive_path)
+        .arg("-1")
+        .arg(&first_path)
+        .arg("-2")
+        .arg(&second_path)
+        .assert()
+        .failure();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .arg("decompress")
+        .arg(&archive_path)
+        .arg("--mate-1")
+        .arg(&decoded_first)
+        .arg("--mate-2")
+        .arg(&decoded_second)
+        .assert()
+        .success();
+
+    let parse_fastq = |path: &std::path::Path| -> Vec<(String, String, String)> {
+        let text = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        (0..lines.len())
+            .step_by(4)
+            .map(|index| {
+                (
+                    lines[index].to_owned(),
+                    lines[index + 1].to_owned(),
+                    lines[index + 3].to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    let original_first = parse_fastq(&first_path);
+    let original_second = parse_fastq(&second_path);
+    let decoded_mate1 = parse_fastq(&decoded_first);
+    let decoded_mate2 = parse_fastq(&decoded_second);
+
+    assert_eq!(decoded_mate1.len(), original_first.len());
+    assert_eq!(decoded_mate2.len(), original_second.len());
+    let mut quality_changed = false;
+    for (((original, decoded), original_second), decoded_second) in original_first
+        .iter()
+        .zip(&decoded_mate1)
+        .zip(&original_second)
+        .zip(&decoded_mate2)
+    {
+        // Identifiers and sequences survive exactly.
+        assert_eq!(decoded.0, original.0);
+        assert_eq!(decoded.1, original.1);
+        assert_eq!(decoded_second.0, original_second.0);
+        assert_eq!(decoded_second.1, original_second.1);
+        // Qualities keep their length but are quantized.
+        assert_eq!(decoded.2.len(), original.2.len());
+        assert_eq!(decoded_second.2.len(), original_second.2.len());
+        assert!(decoded.2.chars().all(|q| ('!'..='h').contains(&q)));
+        assert!(decoded_second.2.chars().all(|q| ('!'..='h').contains(&q)));
+        if decoded.2 != original.2 || decoded_second.2 != original_second.2 {
+            quality_changed = true;
+        }
+    }
+    assert!(quality_changed, "qvz mode must alter quality values");
+}
+
+#[test]
+fn qvz_quality_mode_rejects_invalid_ratio_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    std::fs::write(
+        &first_path,
+        "@r1\nACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    // Missing ratio.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .arg("--quality-mode")
+        .arg("qvz")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --qvz-ratio"));
+
+    // Zero ratio.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .arg("--quality-mode")
+        .arg("qvz")
+        .arg("--qvz-ratio")
+        .arg("0")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("positive"));
+
+    // Ratio supplied without the qvz mode.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .arg("--qvz-ratio")
+        .arg("1.0")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--qvz-ratio requires --quality-mode qvz",
+        ));
+
+    // Incompatible with --no-quality.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .arg("--no-quality")
+        .arg("--quality-mode")
+        .arg("qvz")
+        .arg("--qvz-ratio")
+        .arg("1.0")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--no-quality"));
+
+    assert!(!archive_path.exists());
+}
+
+#[test]
+fn compress_rejects_quality_bytes_outside_printable_ascii() {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+
+    for bad_byte in [0x01u8, 0x7f] {
+        let reads_path = directory.path().join("reads.fastq");
+        let mut quality = vec![b'I'; 40];
+        quality[5] = bad_byte;
+        let mut record = b"@r1\nACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGG\n+\n".to_vec();
+        record.extend_from_slice(&quality);
+        record.push(b'\n');
+        std::fs::write(&reads_path, record).unwrap();
+
+        Command::cargo_bin("seqarc")
+            .unwrap()
+            .args(["compress", "--index"])
+            .arg(&index_path)
+            .arg("--mate-1")
+            .arg(&reads_path)
+            .arg("--output")
+            .arg(&archive_path)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "quality scores must be printable Phred+33 ASCII (bytes 33..=126)",
+            ));
+    }
+
+    assert!(!archive_path.exists());
+}

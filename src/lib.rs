@@ -9,6 +9,7 @@ mod fastx;
 pub mod minibwa;
 mod packed_sequence;
 mod quality;
+mod qvz;
 mod reference_free;
 mod rustar_index;
 
@@ -107,6 +108,11 @@ impl ReadRecord {
                     "quality length does not match sequence length".into(),
                 ));
             }
+            if !quality.iter().all(|&byte| (33..=126).contains(&byte)) {
+                return Err(Error::InvalidInput(
+                    "quality scores must be printable Phred+33 ASCII (bytes 33..=126)".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -143,6 +149,9 @@ pub(crate) fn apply_quality(record: &mut ReadRecord, mode: &QualityMode) {
                     };
                 }
             }
+            // QVZ is a batch transform over a block of reads; it is applied
+            // when the chunk quality stream is assembled, not per record.
+            QualityMode::Qvz { .. } => {}
         }
     }
 }
@@ -192,6 +201,9 @@ pub enum QualityMode {
     Lossless,
     IlluminaBinning,
     Binary { threshold: u8, high: u8, low: u8 },
+    /// QVZ rate-targeted lossy quantization (ported from Spring). `ratio` is
+    /// the target entropy in bits per quality symbol.
+    Qvz { ratio: f64 },
 }
 
 #[derive(Clone, Debug)]
@@ -1035,6 +1047,30 @@ mod tests {
         assert_eq!(identifier_token(b"read0").unwrap(), b"read0");
         assert_eq!(identifier_token(b"  spaced  id ").unwrap(), b"spaced");
         assert!(identifier_token(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_quality_bytes_outside_printable_ascii() {
+        let mut record = ReadRecord::new(
+            "read",
+            b"ACGTACGT".to_vec(),
+            Some((33u8..=126).collect::<Vec<_>>()[..8].to_vec()),
+        );
+        assert!(record.validate(true, false).is_ok());
+
+        // Control character below the Phred+33 floor.
+        record.quality = Some(b"A\x01C\x01ACGT\x01".to_vec());
+        assert!(record.validate(true, false).is_err());
+
+        // DEL (127) and every byte above it are outside the printable range.
+        record.quality = Some(b"A\x7FC\x7FACGT\x7F".to_vec());
+        assert!(record.validate(true, false).is_err());
+        record.quality = Some(b"AAAAACGT".to_vec());
+        assert!(record.validate(true, false).is_ok());
+
+        // FASTA-style records without quality remain valid.
+        let record = ReadRecord::new("read", b"ACGT".to_vec(), None);
+        assert!(record.validate(false, false).is_ok());
     }
 
     #[test]

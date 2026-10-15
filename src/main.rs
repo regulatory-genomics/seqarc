@@ -95,6 +95,7 @@ enum QualityChoice {
     Lossless,
     Illumina,
     Binary,
+    Qvz,
 }
 
 #[derive(Args)]
@@ -144,6 +145,9 @@ struct CompressArgs {
     binary_high: Option<u8>,
     #[arg(long, requires = "binary_threshold", requires = "binary_high")]
     binary_low: Option<u8>,
+    /// Target entropy in bits per quality symbol for --quality-mode qvz.
+    #[arg(long)]
+    qvz_ratio: Option<f64>,
     /// Print detailed component sizes and mapping statistics.
     #[arg(long)]
     profile: bool,
@@ -704,9 +708,25 @@ fn quality_mode(args: &CompressArgs) -> Result<QualityMode> {
             "binary quality options require --quality-mode binary".into(),
         ));
     }
+    if !matches!(args.quality_mode, QualityChoice::Qvz) && args.qvz_ratio.is_some() {
+        return Err(Error::InvalidInput(
+            "--qvz-ratio requires --quality-mode qvz".into(),
+        ));
+    }
     match args.quality_mode {
         QualityChoice::Lossless => Ok(QualityMode::Lossless),
         QualityChoice::Illumina => Ok(QualityMode::IlluminaBinning),
+        QualityChoice::Qvz => {
+            let ratio = args.qvz_ratio.ok_or_else(|| {
+                Error::InvalidInput("qvz quality mode requires --qvz-ratio".into())
+            })?;
+            if ratio <= 0.0 || ratio.is_nan() {
+                return Err(Error::InvalidInput(
+                    "--qvz-ratio must be a positive number".into(),
+                ));
+            }
+            Ok(QualityMode::Qvz { ratio })
+        }
         QualityChoice::Binary => {
             let threshold = args.binary_threshold.ok_or_else(|| {
                 Error::InvalidInput("binary quality mode requires --binary-threshold".into())

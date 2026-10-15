@@ -2731,10 +2731,17 @@ fn write_quality_stream(
 ) -> Result<()> {
     for mate in 0..layout.streams() {
         let stream = if options.preserve_quality {
-            let rows = pairs
+            let mut rows = pairs
                 .iter()
                 .map(|pair| reconstruct_quality_row(pair, mate, descriptors))
                 .collect::<Result<Vec<_>>>()?;
+            if let crate::QualityMode::Qvz { ratio } = options.quality_mode {
+                // Quantize the whole chunk as one training block, mirroring
+                // Spring's per-block QVZ application. The decoder never sees
+                // the codebooks; the quantized values are stored losslessly.
+                let mut slices = rows.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>();
+                crate::qvz::quantize(&mut slices, ratio)?;
+            }
             let values = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
             encode_stream_bytes(&values)?
         } else {

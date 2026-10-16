@@ -4,11 +4,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use seqarc::{
     build_alignment_index, compress_aligned_paired_fastq_files_with_index_profiled,
     compress_aligned_single_fastq_file_with_index_profiled, decompress_aligned_into,
-    decompress_aligned_iter, open_fastx_reader, read_archive_info_with_breakdown, select_id_field,
-    truncate_read_id, verify_aligned_archive, AlignedRecordGroup, AlignedRecordSink, AlignerKind,
-    AlignmentCompressionOptions, AlignmentLayout, ArchiveInfo, DecompressionOptions,
-    EmbeddedIndexMate, EmbeddedIndexRange, Error, FastxReader, Format, GenomeIndexBuildOptions,
-    QualityMode, ReadRecord, Result, SectionBreakdown, SequenceRecordGroup,
+    decompress_aligned_iter, default_thread_count, open_fastx_reader,
+    read_archive_info_with_breakdown, select_id_field, truncate_read_id, verify_aligned_archive,
+    AlignedRecordGroup, AlignedRecordSink, AlignerKind, AlignmentCompressionOptions,
+    AlignmentLayout, ArchiveInfo, DecompressionOptions, EmbeddedIndexMate, EmbeddedIndexRange,
+    Error, FastxReader, Format, GenomeIndexBuildOptions, QualityMode, ReadRecord, Result,
+    SectionBreakdown, SequenceRecordGroup,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -71,7 +72,7 @@ struct IndexArgs {
     #[arg(long, default_value_t = 18)]
     chr_bin_nbits: u32,
     /// Number of index construction threads.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = default_thread_count())]
     threads: usize,
 }
 
@@ -121,7 +122,7 @@ struct CompressArgs {
     /// Output .seqarc archive.
     #[arg(short, long)]
     output: PathBuf,
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = default_thread_count())]
     threads: usize,
     #[arg(long, default_value_t = 250_000)]
     chunk_records: usize,
@@ -334,6 +335,29 @@ fn validate_index_ranges(ranges: &[EmbeddedIndexRange], paired: bool) -> Result<
     Ok(())
 }
 
+/// Attach the offending path to an I/O error so messages identify which of
+/// the several input/output files failed.
+fn io_path_error(path: &Path, error: std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(
+        error.kind(),
+        format!("{}: {error}", path.display()),
+    ))
+}
+
+fn open_archive(path: &Path) -> Result<BufReader<File>> {
+    let file = File::open(path).map_err(|error| io_path_error(path, error))?;
+    Ok(BufReader::with_capacity(16 * 1024 * 1024, file))
+}
+
+/// Flush a renamed file's parent directory entry to stable storage so the
+/// rename itself survives a crash.
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = File::open(parent).map_err(|error| io_path_error(parent, error))?;
+    directory.sync_all()?;
+    Ok(())
+}
+
 struct AtomicPath {
     final_path: PathBuf,
     partial_path: PathBuf,
@@ -367,12 +391,19 @@ impl AtomicPath {
     }
 
     fn commit(mut self) -> Result<()> {
-        // POSIX rename atomically replaces an existing destination, so no
-        // explicit remove is needed; removing first would open a crash window
-        // in which both the old and new archives are lost.
+        // Flush the partial file to stable storage before the rename so a
+        // crash never leaves a zero-length or truncated file at the final
+        // path. POSIX rename atomically replaces an existing destination, so
+        // no explicit remove is needed; removing first would open a crash
+        // window in which both the old and new archives are lost.
+        let partial = File::open(&self.partial_path).map_err(|error| {
+            io_path_error(&self.partial_path, error)
+        })?;
+        partial.sync_all()?;
+        drop(partial);
         std::fs::rename(&self.partial_path, &self.final_path)?;
         self.committed = true;
-        Ok(())
+        sync_parent_directory(&self.final_path)
     }
 }
 
@@ -407,7 +438,10 @@ impl Write for RecordWriter {
 
 impl RecordWriter {
     fn create(path: &Path, gzip: bool, level: u32) -> Result<Self> {
-        let writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create(path)?);
+        let writer = BufWriter::with_capacity(
+            4 * 1024 * 1024,
+            File::create(path).map_err(|error| io_path_error(path, error))?,
+        );
         Ok(if gzip {
             Self::Gzip(seqarc::gzip_writer(writer, level))
         } else {
@@ -795,6 +829,19 @@ fn run(cli: Cli) -> Result<()> {
                     "--threads and --chunk-records must be nonzero".into(),
                 ));
             }
+            // Fail fast on missing inputs instead of after loading the index.
+            let mut inputs: Vec<&PathBuf> = vec![&args.index, &args.mate_1];
+            inputs.extend(args.mate_2.iter());
+            inputs.extend(args.index_read_1.iter());
+            inputs.extend(args.index_read_2.iter());
+            for input in inputs {
+                if !input.exists() {
+                    return Err(Error::InvalidInput(format!(
+                        "input file not found: {}",
+                        input.display()
+                    )));
+                }
+            }
             validate_index_ranges(&args.index_ranges, args.mate_2.is_some())?;
             let quality = quality_mode(&args)?;
             let post_validation = (args.post_validate_records > 0).then(|| PostValidation {
@@ -856,7 +903,7 @@ fn run(cli: Cli) -> Result<()> {
                     "paired-end"
                 }
             );
-            debug_assert!(profile.rejected_alignments <= profile.raw_reads);
+            assert!(profile.rejected_alignments <= profile.raw_reads);
             let total_reads = profile.mapped_reads + profile.raw_reads;
             let no_hit_reads = profile
                 .raw_reads
@@ -984,10 +1031,7 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
         best_effort: args.best_effort,
         ..DecompressionOptions::default()
     };
-    let mut records = decompress_aligned_iter(
-        BufReader::with_capacity(16 * 1024 * 1024, File::open(args.archive)?),
-        &options,
-    )?;
+    let mut records = decompress_aligned_iter(open_archive(&args.archive)?, &options)?;
     let index_streams = records.index_streams();
     if index_streams != sink.index.len() {
         return Err(Error::InvalidInput(format!(
@@ -1057,7 +1101,7 @@ fn decompress_command(args: DecompressArgs) -> Result<()> {
 }
 
 fn verify_command(args: VerifyArgs) -> Result<()> {
-    let mut archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(&args.archive)?);
+    let mut archive = open_archive(&args.archive)?;
     let report = verify_aligned_archive(&mut archive)?;
     if report.is_ok() {
         println!(
@@ -1097,7 +1141,7 @@ fn verify_command(args: VerifyArgs) -> Result<()> {
 }
 
 fn info_command(args: InfoArgs) -> Result<()> {
-    let mut archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(&args.archive)?);
+    let mut archive = open_archive(&args.archive)?;
     let info = read_archive_info_with_breakdown(&mut archive, args.breakdown)?;
     let file_size = std::fs::metadata(&args.archive)?.len();
     println!("archive: {}", args.archive.display());
@@ -1380,7 +1424,7 @@ fn post_compress_validation(validation: &PostValidation) -> Result<()> {
     }
     let result = (|| -> Result<()> {
         let started = std::time::Instant::now();
-        let archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(&validation.archive)?);
+        let archive = open_archive(&validation.archive)?;
         let options = DecompressionOptions {
             max_records: Some(validation.limit),
             ..DecompressionOptions::default()
@@ -1471,7 +1515,7 @@ fn decompression_progress(total_chunks: u64) -> ProgressBar {
 }
 
 fn validate_command(args: ValidateArgs) -> Result<()> {
-    let archive = BufReader::with_capacity(16 * 1024 * 1024, File::open(args.archive)?);
+    let archive = open_archive(&args.archive)?;
     let options = DecompressionOptions {
         max_records: args.records,
         ..DecompressionOptions::default()

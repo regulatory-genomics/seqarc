@@ -200,7 +200,8 @@ fn aligned_cli_round_trip_and_validation() {
         .arg("--temp-dir")
         .arg(&temp_root)
         .assert()
-        .failure();
+        .failure()
+        .stderr(predicate::str::contains("missing.fastq.gz"));
     assert_directory_empty(&temp_root);
     assert!(!failed_archive.exists());
 

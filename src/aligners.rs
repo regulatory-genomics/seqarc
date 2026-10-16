@@ -11,22 +11,34 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const MAP_TASK_READS: usize = 256;
 
+/// Which read mapper an index or archive uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AlignerKind {
+    /// BWA-style short-read mapper (default).
     #[default]
     Minibwa,
+    /// Spliced RNA-seq mapper with GTF-driven junction support.
     Rustar,
 }
 
+/// Options for building a genome alignment index.
 #[derive(Clone, Debug)]
 pub struct GenomeIndexBuildOptions {
+    /// Scratch directory for temporary files; defaults to the system temp dir.
     pub temp_dir: Option<PathBuf>,
+    /// Mapper backend for the index.
     pub aligner: AlignerKind,
+    /// Worker threads for index construction.
     pub threads: usize,
+    /// GTF annotation for rustar splice-junction database construction.
     pub rustar_gtf: Option<PathBuf>,
+    /// rustar `sjdbOverhang` for splice-junction database construction.
     pub rustar_sjdb_overhang: u32,
+    /// rustar `--sa-sparseD` suffix-array sparsity factor.
     pub rustar_sa_sparse_d: u32,
+    /// rustar `--sa-index-nbases` suffix-array seed length.
     pub rustar_sa_index_nbases: u32,
+    /// rustar `--chr-bin-nbits` chromosome address width as a base-2 exponent.
     pub rustar_chr_bin_nbits: u32,
 }
 
@@ -45,12 +57,18 @@ impl Default for GenomeIndexBuildOptions {
     }
 }
 
+/// One selected alignment of a read against the reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GenomeAlignment {
+    /// Zero-based reference offset of the first aligned base.
     pub start: i64,
+    /// Zero-based read offset where the alignment starts.
     pub query_start: i32,
+    /// Zero-based read offset just past the alignment end.
     pub query_end: i32,
+    /// Alignment path as (read-length, operation) pairs.
     pub cigar: Vec<CigarOp>,
+    /// True when the read maps to the reverse strand.
     pub is_reverse: bool,
 }
 
@@ -204,6 +222,7 @@ pub(crate) struct KeptRun {
     pub(crate) length: usize,
 }
 
+/// Build a minibwa genome index with default options.
 pub fn build_genome_index(
     genome_fasta: impl AsRef<Path>,
     index_file: impl AsRef<Path>,
@@ -215,6 +234,7 @@ pub fn build_genome_index(
     )
 }
 
+/// Build a minibwa genome index with explicit options.
 pub fn build_genome_index_with_options(
     genome_fasta: impl AsRef<Path>,
     index_file: impl AsRef<Path>,
@@ -249,6 +269,7 @@ pub fn build_genome_index_with_options(
     Ok(index)
 }
 
+/// Build a genome index with the configured aligner backend.
 pub fn build_alignment_index(
     genome_fasta: impl AsRef<Path>,
     index_file: impl AsRef<Path>,
@@ -262,6 +283,7 @@ pub fn build_alignment_index(
     }
 }
 
+/// Normalize a FASTA reference into the single-line form the index builders expect.
 pub(crate) struct NormalizedGenome {
     pub(crate) fasta: PathBuf,
     #[allow(dead_code)]

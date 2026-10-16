@@ -83,10 +83,11 @@ selected by the output file suffix (or forced with `--gzip`/`--plain`).
   thresholding (configured with `--binary-threshold/high/low`), or `qvz`
   rate-targeted quantization (Spring-style; requires `--qvz-ratio`, a positive
   target bits-per-symbol value, e.g. `--quality-mode qvz --qvz-ratio 1.0`).
-  All three lossy modes are encoder-only: archives decode identically and only
-  the stored quality stream is affected. Gains depend on the input quality
-  entropy — data whose lossless quality stream already compresses below the
-  target rate (e.g. only a few distinct symbols) will not shrink further.
+  The `qvz` mode supports reads of at most 1022 bases. All three lossy modes
+  are encoder-only: archives decode identically and only the stored quality
+  stream is affected. Gains depend on the input quality entropy — data whose
+  lossless quality stream already compresses below the target rate (e.g. only
+  a few distinct symbols) will not shrink further.
 - `--index-read-1` / `--index-read-2` — store separate index reads (I1/I2).
 - `--index-range R1:START:END` — extract a read region (e.g., a UMI) into an
   embedded index before alignment and reinsert it on decompression. The range

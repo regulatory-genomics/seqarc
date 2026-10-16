@@ -277,6 +277,10 @@ struct V21AlignedFields {
 
 const V21_MATE_SECTION_COUNT: usize = 8;
 
+/// Streaming decoder that yields aligned records lazily in original order.
+///
+/// Chunks decode concurrently on a bounded worker pool; exhaust the iterator
+/// to validate every chunk and detect trailing bytes.
 pub struct AlignedRecordIter<R: Read> {
     input: R,
     pool: Option<rayon::ThreadPool>,
@@ -725,15 +729,11 @@ fn split_pair_indexes(
     Ok(extracted.into_iter().map(|(_, index)| index).collect())
 }
 
-fn compress_with_index<I2: AsRef<Path>>(
-    index: &AlignmentIndex,
-    input_1: impl AsRef<Path>,
-    input_2: Option<I2>,
-    output: impl AsRef<Path>,
+/// Reject unsupported alignment-compression option combinations up front.
+fn validate_compress_options(
     options: &crate::AlignmentCompressionOptions,
     layout: AlignmentLayout,
-) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
-    let pipeline_started = std::time::Instant::now();
+) -> Result<()> {
     validate_index_ranges(&options.embedded_index_ranges, layout)?;
     if options.index_read_files.len() > 2 {
         return Err(Error::InvalidInput(
@@ -750,6 +750,73 @@ fn compress_with_index<I2: AsRef<Path>>(
             "identifier field selection requires identifier preservation".into(),
         ));
     }
+    Ok(())
+}
+
+/// Write the global preamble (header fields, embedded reference, index
+/// metadata, and CRC) to `output`.
+///
+/// Returns the file opened read/write, positioned just past the preamble and
+/// ready for chunk payloads, plus the offset of the chunk-count field the
+/// caller must patch after writing chunks.
+#[allow(clippy::too_many_arguments)]
+fn write_archive_preamble(
+    output: &Path,
+    options: &crate::AlignmentCompressionOptions,
+    layout: AlignmentLayout,
+    preserve_ids: bool,
+    id_mode: IdMode,
+    absolute_position_width: usize,
+    delta_position_width: usize,
+    reference_block: &[u8],
+    index_metadata: &[u8],
+) -> Result<(std::fs::File, u64)> {
+    let mut archive = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output)?;
+    let header_size = 9 + 4 + 2 + 1 + 2 + 8 * 3 + 4;
+    archive.write_all(MAGIC)?;
+    write_u16(&mut archive, VERSION_MAJOR)?;
+    write_u16(&mut archive, VERSION_MINOR)?;
+    let mut flags = 0u16;
+    if preserve_ids {
+        flags |= 1;
+    }
+    if options.preserve_quality {
+        flags |= 2;
+    }
+    if layout == AlignmentLayout::SingleEnd {
+        flags |= 4;
+    }
+    flags |= (id_mode as u16) << 3;
+    write_u16(&mut archive, flags)?;
+    archive.write_all(&[options.index_read_files.len() as u8])?;
+    archive.write_all(&[absolute_position_width as u8, delta_position_width as u8])?;
+    write_u64(&mut archive, reference_block.len() as u64)?;
+    write_u64(&mut archive, index_metadata.len() as u64)?;
+    let chunk_count_pos = archive.stream_position()?;
+    write_u64(&mut archive, 0)?;
+    write_u32(&mut archive, 0)?;
+    debug_assert_eq!(archive.stream_position()?, header_size as u64);
+    archive.write_all(reference_block)?;
+    archive.write_all(index_metadata)?;
+    write_preamble_crc(&mut archive)?;
+    Ok((archive, chunk_count_pos))
+}
+
+fn compress_with_index<I2: AsRef<Path>>(
+    index: &AlignmentIndex,
+    input_1: impl AsRef<Path>,
+    input_2: Option<I2>,
+    output: impl AsRef<Path>,
+    options: &crate::AlignmentCompressionOptions,
+    layout: AlignmentLayout,
+) -> Result<(CompressionMetadata, AlignedCompressionProfile)> {
+    let pipeline_started = std::time::Instant::now();
+    validate_compress_options(options, layout)?;
     let preserve_ids = options.preserve_ids && options.id_prefix_chars != Some(0);
     let mapping_threads = options.threads.max(1);
     let mapping_batch_records = mapping_threads
@@ -988,39 +1055,17 @@ fn compress_with_index<I2: AsRef<Path>>(
     progress.finish_and_clear();
     let index_metadata = encode_index_metadata(&index_descriptors)?;
     // Read access is required to recompute and patch the preamble CRC.
-    let mut archive = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(output)?;
-    let header_size = 9 + 4 + 2 + 1 + 2 + 8 * 3 + 4;
-    archive.write_all(MAGIC)?;
-    write_u16(&mut archive, VERSION_MAJOR)?;
-    write_u16(&mut archive, VERSION_MINOR)?;
-    let mut flags = 0u16;
-    if preserve_ids {
-        flags |= 1;
-    }
-    if options.preserve_quality {
-        flags |= 2;
-    }
-    if layout == AlignmentLayout::SingleEnd {
-        flags |= 4;
-    }
-    flags |= (id_mode as u16) << 3;
-    write_u16(&mut archive, flags)?;
-    archive.write_all(&[options.index_read_files.len() as u8])?;
-    archive.write_all(&[absolute_position_width as u8, delta_position_width as u8])?;
-    write_u64(&mut archive, reference_block.block.len() as u64)?;
-    write_u64(&mut archive, index_metadata.len() as u64)?;
-    let chunk_count_pos = archive.stream_position()?;
-    write_u64(&mut archive, 0)?;
-    write_u32(&mut archive, 0)?;
-    debug_assert_eq!(archive.stream_position()?, header_size as u64);
-    archive.write_all(&reference_block.block)?;
-    archive.write_all(&index_metadata)?;
-    write_preamble_crc(&mut archive)?;
+    let (mut archive, chunk_count_pos) = write_archive_preamble(
+        output.as_ref(),
+        options,
+        layout,
+        preserve_ids,
+        id_mode,
+        absolute_position_width,
+        delta_position_width,
+        &reference_block.block,
+        &index_metadata,
+    )?;
 
     let mut written_chunks = 0u64;
     let mut replay_pair_count = 0u64;
@@ -1386,18 +1431,22 @@ pub(crate) fn decompress_iter<R: Read>(
 }
 
 impl<R: Read> AlignedRecordIter<R> {
+    /// Layout (single- or paired-end) declared by the archive.
     pub fn layout(&self) -> AlignmentLayout {
         self.layout
     }
 
+    /// Number of biological read streams.
     pub fn streams(&self) -> usize {
         self.layout.streams()
     }
 
+    /// Number of index-read streams.
     pub fn index_streams(&self) -> usize {
         self.index_streams
     }
 
+    /// Total chunks declared by the archive header.
     pub fn total_chunks(&self) -> u64 {
         self.total_chunks
     }
@@ -1412,6 +1461,7 @@ impl<R: Read> AlignedRecordIter<R> {
         self.skipped_record_total
     }
 
+    /// Number of chunks fully decoded so far.
     pub fn decoded_chunks(&self) -> u64 {
         self.decoded_chunks
     }
@@ -1924,7 +1974,9 @@ pub fn verify_aligned_archive<R: Read>(input: &mut R) -> Result<VerifyReport> {
 /// length after decompression when the section stores compressed data.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SectionSizes {
+    /// Bytes the section occupies on disk.
     pub compressed: u64,
+    /// Total length after decompression.
     pub raw: u64,
 }
 
@@ -1938,13 +1990,21 @@ impl std::ops::AddAssign for SectionSizes {
 /// The eight per-mate record subsections, in on-disk order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MateSubsectionSizes {
+    /// Read length column.
     pub lengths: SectionSizes,
+    /// Reference position column.
     pub positions: SectionSizes,
+    /// Mismatch/emit position column.
     pub noise_positions: SectionSizes,
+    /// Mismatch symbol column.
     pub noise: SectionSizes,
+    /// Reference skip (deletion) column.
     pub reference_skips: SectionSizes,
+    /// Inserted-bases column.
     pub emits: SectionSizes,
+    /// Strand-flags column.
     pub reverses: SectionSizes,
+    /// Raw fallback sequences for unaligned reads.
     pub unaligned_sequences: SectionSizes,
 }
 
@@ -1952,14 +2012,18 @@ pub struct MateSubsectionSizes {
 /// order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IndexStreamSubsectionSizes {
+    /// Quality column.
     pub qualities: SectionSizes,
+    /// Read length column.
     pub lengths: SectionSizes,
+    /// Sequence column.
     pub sequences: SectionSizes,
 }
 
 /// Per-subsection record section sizes, in on-disk order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordSubsectionSizes {
+    /// Per-record flags column.
     pub flags: SectionSizes,
     /// One entry per biological stream (one for single-end, two for paired).
     pub mates: Vec<MateSubsectionSizes>,
@@ -1984,7 +2048,9 @@ pub struct SectionBreakdown {
     pub chunk_headers: u64,
     /// The 24-byte compressed section directory per chunk payload.
     pub payload_directories: u64,
+    /// Identifier section sizes.
     pub ids: SectionSizes,
+    /// Quality section sizes.
     pub qualities: SectionSizes,
     /// `compressed` is the verbatim record section bytes on disk; `raw` is
     /// the sum of the decompressed subsection lengths.
@@ -1993,6 +2059,7 @@ pub struct SectionBreakdown {
     pub reference_block: u64,
     /// Size of the embedded index metadata block.
     pub index_metadata: u64,
+    /// Per-subsection record sizes.
     pub subsections: RecordSubsectionSizes,
 }
 
@@ -2018,18 +2085,26 @@ impl SectionBreakdown {
 /// [`verify_aligned_archive`] for a full integrity check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveInfo {
+    /// Major format version.
     pub version_major: u16,
+    /// Minor format version.
     pub version_minor: u16,
+    /// Single- or paired-end layout.
     pub layout: AlignmentLayout,
     /// Identifier storage mode: "none", "independent", "identical-mates", or
     /// "slash-mate".
     pub id_mode: &'static str,
+    /// Whether identifiers are stored.
     pub preserve_ids: bool,
+    /// Whether quality values are stored.
     pub preserve_quality: bool,
+    /// Number of declared index-read streams.
     pub index_streams: usize,
     /// Embedded index read ranges in one-based inclusive coordinates.
     pub embedded_indexes: Vec<EmbeddedIndexRange>,
+    /// Byte width of the absolute-position column.
     pub absolute_position_width: usize,
+    /// Byte width of the delta-position column.
     pub delta_position_width: usize,
     /// Chunk count declared by the global header.
     pub declared_chunks: u64,
@@ -2920,6 +2995,7 @@ fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
         let mut emits = Vec::new();
         let mut reverses = Vec::new();
         let mut unaligned = Vec::new();
+        let mut oriented_scratch = Vec::new();
         for (pair, &flag) in pairs.iter().zip(&flags) {
             let hit = pair.hit(mate);
             let aligned = matches!((flag, mate), (0, _) | (1, 0) | (2, 1));
@@ -2935,7 +3011,12 @@ fn write_v21_record_stream<R: ReferenceBases + ?Sized>(
                     .map_err(|_| Error::InvalidInput("read length exceeds u16 capacity".into()))?,
             )?;
             if let Some(hit) = hit {
-                let fields = collect_v21_aligned_fields(reference, record, hit)?;
+                let fields = collect_v21_aligned_fields(
+                    reference,
+                    record,
+                    hit,
+                    &mut oriented_scratch,
+                )?;
                 if mate == 1 && flag == 0 {
                     let first = pair.first_hit.as_ref().ok_or_else(|| {
                         Error::InvalidInput("paired R2 alignment is missing R1 alignment".into())
@@ -3070,11 +3151,15 @@ fn collect_v21_aligned_fields<R: ReferenceBases + ?Sized>(
     reference: &R,
     record: &ReadRecord,
     hit: &GenomeAlignment,
+    oriented: &mut Vec<u8>,
 ) -> Result<V21AlignedFields> {
     let start = nonnegative_usize(hit.start, "alignment start")?;
-    let mut oriented = record.sequence.clone();
+    // The caller reuses this buffer across records; per-read allocation is
+    // avoided and the copy doubles as the reverse-complement workspace.
+    oriented.clear();
+    oriented.extend_from_slice(&record.sequence);
     if hit.is_reverse {
-        reverse_complement(&mut oriented);
+        reverse_complement(oriented);
     }
     let cigar = effective_cigar(hit, record.sequence.len())?;
     let mut events = Vec::new();
@@ -3168,7 +3253,7 @@ fn encode_v21_aligned_read<R: ReferenceBases + ?Sized>(
     record: &ReadRecord,
     hit: &GenomeAlignment,
 ) -> Result<Vec<u8>> {
-    let fields = collect_v21_aligned_fields(reference, record, hit)?;
+    let fields = collect_v21_aligned_fields(reference, record, hit, &mut Vec::new())?;
     let mut body = Vec::new();
     write_u64(&mut body, fields.start)?;
     write_u8(&mut body, u8::from(fields.reverse))?;
@@ -3629,10 +3714,17 @@ fn decode_v21_mate_sections(
     let mut emit_count = 0usize;
     let mut event_count = 0usize;
     let mut skip_count = 0usize;
+    // Single pass over the noise payload: three separate filter passes here
+    // showed up as measurable decode overhead.
     for row in noise_payload.split(|&byte| byte == b'\n') {
         event_count += row.len();
-        skip_count += row.iter().filter(|&&symbol| symbol == b'4').count();
-        emit_count += row.iter().filter(|&&symbol| symbol == b'5').count();
+        for &symbol in row {
+            match symbol {
+                b'4' => skip_count += 1,
+                b'5' => emit_count += 1,
+                _ => {}
+            }
+        }
     }
     if sections[2].len() != event_count * 2 {
         return Err(Error::InvalidFormat(
@@ -3656,6 +3748,9 @@ fn decode_v21_mate_sections(
     let mut noise_row_index = 0usize;
     let mut sequences = Vec::with_capacity(flags.len());
     let mut alignments = vec![None; flags.len()];
+    // Reused across records; the aligned-record loop allocates otherwise.
+    let mut events: Vec<V21NoiseEvent> = Vec::new();
+    let mut emits: Vec<&[u8]> = Vec::new();
     for (record_index, &flag) in flags.iter().enumerate() {
         let length = read_u16(&mut lengths)? as usize;
         let aligned = matches!((flag, mate), (0, _) | (1, 0) | (2, 1));
@@ -3713,8 +3808,8 @@ fn decode_v21_mate_sections(
             let noise_row = noise_rows
                 .next()
                 .ok_or_else(|| Error::InvalidFormat("noise row count mismatch".into()))?;
-            let mut events = Vec::with_capacity(noise_row.len());
-            let mut emits = Vec::new();
+            events.clear();
+            emits.clear();
             for &encoded_symbol in noise_row {
                 if !(b'0'..=b'5').contains(&encoded_symbol) {
                     return Err(Error::InvalidFormat("unknown noise symbol".into()));
@@ -4050,14 +4145,15 @@ fn decode_ids(
 
 fn decode_prefix_ids(input: &[u8], count: usize) -> Result<Vec<Vec<u8>>> {
     let mut cursor = Cursor::new(input);
-    let mut previous = Vec::new();
-    let mut result = Vec::with_capacity(count);
+    let mut result: Vec<Vec<u8>> = Vec::with_capacity(count);
     for _ in 0..count {
         let common = usize_from(read_varint(&mut cursor)?, "ID prefix")?;
         let suffix_len = usize_from(read_varint(&mut cursor)?, "ID suffix")?;
-        if common > previous.len() {
+        if common > result.last().map_or(0, |value| value.len()) {
             return Err(Error::InvalidFormat("ID prefix out of bounds".into()));
         }
+        let empty: Vec<u8> = Vec::new();
+        let previous = result.last().unwrap_or(&empty);
         let mut value = previous[..common].to_vec();
         let start = cursor.position() as usize;
         let end = start
@@ -4068,7 +4164,6 @@ fn decode_prefix_ids(input: &[u8], count: usize) -> Result<Vec<Vec<u8>>> {
         }
         value.extend_from_slice(&cursor.get_ref()[start..end]);
         cursor.set_position(end as u64);
-        previous = value.clone();
         result.push(value);
     }
     if cursor.position() != cursor.get_ref().len() as u64 {

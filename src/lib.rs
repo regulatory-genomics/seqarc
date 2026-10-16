@@ -1,11 +1,26 @@
-//! A Rust-native, library-only sequencing read compressor.
+//! SeqArc is a Rust archiver for sequencing reads.
 //!
-//! SeqArc archives are self-describing and support range decoding
-//! without a command-line interface.
+//! Instead of compressing raw FASTQ bytes, reads are aligned against a
+//! reference genome and stored as a compact alignment-based representation,
+//! compressed with Zstandard. Archives reconstruct the original reads exactly
+//! while remaining far smaller than gzip-compressed FASTQ.
+//!
+//! Archives are self-describing: the global header and every chunk carry
+//! CRC32C checksums, and records can be decoded by logical-record range. The
+//! `seqarc` command-line binary in this crate exposes the full workflow
+//! (index, compress, decompress, validate, verify, info); this library API
+//! offers the same operations programmatically.
+
+#![warn(missing_docs)]
 
 mod aligners;
 mod alignment_archive;
 mod fastx;
+/// Read mapper ported from the C `minibwa` aligner.
+///
+/// Naming and layout follow the upstream C implementation; see the aligner
+/// wrappers in [`crate::aligners`] for the SeqArc-level API.
+#[allow(missing_docs)]
 pub mod minibwa;
 mod packed_sequence;
 mod quality;
@@ -33,13 +48,19 @@ pub use alignment_archive::{
 };
 pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
 
+/// Library result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Errors returned by SeqArc archive operations.
 #[derive(Debug)]
 pub enum Error {
+    /// Filesystem or stream failure.
     Io(std::io::Error),
+    /// The archive bytes do not follow the expected format.
     InvalidFormat(String),
+    /// The caller-supplied inputs are unusable.
     InvalidInput(String),
+    /// A stored checksum did not match the data.
     Checksum(String),
 }
 
@@ -69,14 +90,21 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// One decoded (or to-be-encoded) sequencing read.
+///
+/// Identifiers and sequences are raw bytes so non-UTF-8 archives round-trip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadRecord {
+    /// Read identifier without the leading `@`.
     pub id: Vec<u8>,
+    /// Bases as ASCII (A, C, G, T, N, or other IUPAC codes).
     pub sequence: Vec<u8>,
+    /// Phred+33 quality scores, present unless the archive drops quality.
     pub quality: Option<Vec<u8>>,
 }
 
 impl ReadRecord {
+    /// Build a record from raw parts.
     pub fn new(
         id: impl Into<Vec<u8>>,
         sequence: impl Into<Vec<u8>>,
@@ -191,34 +219,71 @@ pub fn identifier_token(id: &[u8]) -> Result<&[u8]> {
         .as_bytes())
 }
 
+/// Quality-preservation strategy applied while compressing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum QualityMode {
+    /// Store Phred+33 scores unchanged.
     Lossless,
+    /// Bin scores into the standard Illumina 8-bin scale.
     IlluminaBinning,
-    Binary { threshold: u8, high: u8, low: u8 },
+    /// Threshold scores into two values (`high`/`low`, Phred+33 encoded).
+    Binary {
+        /// Minimum raw Phred score (byte minus 33) that maps to `high`.
+        threshold: u8,
+        /// Stored byte for reads at or above `threshold`.
+        high: u8,
+        /// Stored byte for reads below `threshold`.
+        low: u8,
+    },
     /// QVZ rate-targeted lossy quantization (ported from Spring). `ratio` is
     /// the target entropy in bits per quality symbol.
-    Qvz { ratio: f64 },
+    Qvz {
+        /// Target entropy in bits per quality symbol.
+        ratio: f64,
+    },
 }
 
+/// Default worker count, derived from the machine's available parallelism.
+pub fn default_thread_count() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get())
+}
+
+/// Options for alignment-based FASTQ compression.
 #[derive(Clone, Debug)]
 pub struct AlignmentCompressionOptions {
+    /// Genome aligner used to map reads.
     pub aligner: AlignerKind,
+    /// Records grouped into one independently decodable archive chunk.
     pub chunk_records: usize,
+    /// Worker threads for mapping and chunk encoding.
     pub threads: usize,
+    /// Scratch directory for temporary files; defaults to the system temp dir.
     pub temp_dir: Option<std::path::PathBuf>,
+    /// Store read identifiers instead of dropping them.
     pub preserve_ids: bool,
+    /// Keep only the first N Unicode scalar values of each identifier.
     pub id_prefix_chars: Option<usize>,
+    /// Keep only the N-th whitespace-delimited field of each identifier.
     pub id_field: Option<usize>,
+    /// Store quality values instead of dropping them.
     pub preserve_quality: bool,
+    /// Lossy quality transform applied before storage.
     pub quality_mode: QualityMode,
+    /// Zstandard compression level for section payloads (up to 22).
     pub zstd_level: i32,
+    /// Read regions extracted as embedded index reads before mapping.
     pub embedded_index_ranges: Vec<EmbeddedIndexRange>,
+    /// Separate index-read FASTQ files (I1/I2) stored alongside the mates.
     pub index_read_files: Vec<std::path::PathBuf>,
+    /// GTF annotation for rustar splice-junction index construction.
     pub rustar_gtf: Option<std::path::PathBuf>,
+    /// rustar `sjdbOverhang` for splice-junction database construction.
     pub rustar_sjdb_overhang: u32,
+    /// rustar `--sa-sparseD` suffix-array sparsity factor.
     pub rustar_sa_sparse_d: u32,
+    /// rustar `--sa-index-nbases` suffix-array seed length.
     pub rustar_sa_index_nbases: u32,
+    /// rustar `--chr-bin-nbits` chromosome address width as a base-2 exponent.
     pub rustar_chr_bin_nbits: u32,
 }
 
@@ -227,7 +292,7 @@ impl Default for AlignmentCompressionOptions {
         Self {
             aligner: AlignerKind::Minibwa,
             chunk_records: 250_000,
-            threads: 16,
+            threads: default_thread_count(),
             temp_dir: None,
             preserve_ids: true,
             id_prefix_chars: None,
@@ -246,11 +311,16 @@ impl Default for AlignmentCompressionOptions {
     }
 }
 
+/// Options for decoding an archive.
 #[derive(Clone, Debug)]
 pub struct DecompressionOptions {
+    /// Inclusive zero-based logical-record range to decode; `None` means all.
     pub original_range: Option<RangeInclusive<u64>>,
+    /// Order in which decoded records are delivered.
     pub output_order: OutputOrder,
+    /// Scratch directory for temporary files; defaults to the system temp dir.
     pub temp_dir: Option<std::path::PathBuf>,
+    /// Number of chunks decoded concurrently during streaming iteration.
     pub threads: usize,
     /// Skip chunks that fail their checksum instead of aborting the decode.
     pub best_effort: bool,
@@ -271,29 +341,41 @@ impl Default for DecompressionOptions {
     }
 }
 
+/// Record delivery order for decompression.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OutputOrder {
+    /// Restore the original input order of the compressed records.
     #[default]
     Original,
+    /// Deliver records in the (reordered) compression order, which is cheaper.
     Compression,
 }
 
+/// Receiver for decoded paired records, avoiding whole-archive buffering.
 pub trait PairedRecordSink {
+    /// Consume one pair; `original_id` is the zero-based input position.
     fn write_pair(&mut self, original_id: u64, first: ReadRecord, second: ReadRecord)
         -> Result<()>;
 
+    /// Called once after the final pair.
     fn finish(&mut self) -> Result<()>;
 }
 
+/// Whether an archive stores single-end or paired-end reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlignmentLayout {
+    /// One biological read per logical record.
     SingleEnd,
+    /// Two mated reads per logical record.
     PairedEnd,
 }
 
+/// Which mate an embedded index range is extracted from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmbeddedIndexMate {
+    /// Read 1 (forward mate).
     R1,
+    /// Read 2 (reverse mate).
     R2,
 }
 
@@ -309,22 +391,28 @@ impl EmbeddedIndexMate {
 /// A zero-based, half-open range extracted from a biological read before mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddedIndexRange {
+    /// Mate the region is cut from.
     pub mate: EmbeddedIndexMate,
+    /// First included base offset within the read.
     pub start: usize,
+    /// End offset (exclusive) within the read.
     pub end: usize,
 }
 
 impl EmbeddedIndexRange {
+    /// Number of extracted bases.
     pub fn len(&self) -> usize {
         self.end.saturating_sub(self.start)
     }
 
+    /// True when the range extracts no bases.
     pub fn is_empty(&self) -> bool {
         self.start >= self.end
     }
 }
 
 impl AlignmentLayout {
+    /// Number of biological read streams the layout produces.
     pub fn streams(self) -> usize {
         match self {
             Self::SingleEnd => 1,
@@ -333,82 +421,137 @@ impl AlignmentLayout {
     }
 }
 
+/// The biological read payload of one logical record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SequenceRecordGroup {
+    /// Single-end read.
     Single(ReadRecord),
+    /// Paired-end reads (mate 1, mate 2).
     Paired(ReadRecord, ReadRecord),
 }
 
+/// One decoded logical record: biological reads plus any index reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlignedRecordGroup {
+    /// The biological read or read pair.
     pub sequence: SequenceRecordGroup,
+    /// Embedded or separate index reads (I1/I2, UMIs) for this record.
     pub index_reads: Vec<ReadRecord>,
 }
 
+/// Receiver for decoded logical records, avoiding whole-archive buffering.
 pub trait AlignedRecordSink {
+    /// Consume one record; `original_id` is the zero-based input position.
     fn write_group(&mut self, original_id: u64, group: AlignedRecordGroup) -> Result<()>;
 
+    /// Called once after the final record.
     fn finish(&mut self) -> Result<()>;
 }
 
+/// Statistics returned by alignment-aware decompression.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlignedDecompressionMetadata {
+    /// Single- or paired-end layout of the archive.
     pub layout: AlignmentLayout,
+    /// Number of biological read streams.
     pub streams: usize,
+    /// Number of index-read streams.
     pub index_streams: usize,
+    /// Logical records decoded.
     pub records: u64,
+    /// Order the records were delivered in.
     pub output_order: OutputOrder,
 }
 
+/// Statistics returned by reference-free paired decompression.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DecompressionMetadata {
+    /// Number of read streams (always 2 for paired archives).
     pub streams: usize,
+    /// Pairs decoded.
     pub pairs: u64,
+    /// Order the records were delivered in.
     pub output_order: OutputOrder,
 }
 
+/// Statistics returned by compression.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompressionMetadata {
+    /// Number of biological read streams written to the archive.
     pub streams: usize,
+    /// Logical records written to the archive.
     pub records: u64,
+    /// Whether identifiers were stored.
     pub preserved_ids: bool,
+    /// Whether quality values were stored.
     pub preserved_quality: bool,
+    /// Whether original record order is restorable.
     pub preserved_order: bool,
 }
 
+/// Size and timing profile of an alignment-based compression run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AlignedCompressionProfile {
+    /// End-to-end wall time.
     pub total: Duration,
+    /// Time spent loading or building the alignment index.
     pub index: Duration,
+    /// Time spent mapping reads and spooling alignment data.
     pub map_and_spool: Duration,
+    /// Time spent compacting and storing the embedded reference.
     pub reference: Duration,
+    /// Time spent encoding and compressing chunks.
     pub chunks: Duration,
+    /// Logical records compressed.
     pub records: u64,
+    /// Chunks written to the archive.
     pub chunk_count: u64,
+    /// Bytes written to temporary alignment spool files.
     pub spool_bytes: u64,
+    /// Peak number of encoded chunks awaiting their in-order slot.
     pub max_pending_chunks: u64,
+    /// Candidate alignments produced by the seed stage.
     pub candidate_hits: u64,
+    /// Reads with a selected alignment.
     pub mapped_reads: u64,
+    /// Reads stored through the raw fallback.
     pub raw_reads: u64,
+    /// Alignments ranked below the selected hit.
     pub selected_non_first_hits: u64,
+    /// Alignments discarded during selection.
     pub rejected_alignments: u64,
+    /// Reference bases embedded in the archive.
     pub reference_bases: u64,
+    /// Uncompressed size of the embedded reference.
     pub reference_raw_bytes: u64,
+    /// Compressed size of the embedded reference.
     pub reference_compressed_bytes: u64,
+    /// Uncompressed size of the identifier stream.
     pub ids_raw_bytes: u64,
+    /// Uncompressed size of the quality stream.
     pub qualities_raw_bytes: u64,
+    /// Uncompressed size of the record streams.
     pub records_raw_bytes: u64,
+    /// Compressed size of the identifier stream.
     pub ids_compressed_bytes: u64,
+    /// Compressed size of the quality stream.
     pub qualities_compressed_bytes: u64,
+    /// Compressed size of the record streams.
     pub records_compressed_bytes: u64,
+    /// Uncompressed size of the index-read streams.
     pub indexes_raw_bytes: u64,
+    /// Compressed size of the index-read streams.
     pub indexes_compressed_bytes: u64,
+    /// Compressed size of all chunk payloads.
     pub chunks_compressed_bytes: u64,
+    /// Final archive size in bytes.
     pub archive_bytes: u64,
 }
 
+/// Decoded records grouped by stream (mate 1 first, then mate 2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveRecords {
+    /// One vector of records per read stream.
     pub streams: Vec<Vec<ReadRecord>>,
 }
 
@@ -465,6 +608,7 @@ pub fn compress_aligned_paired_fastq_files_with_index_profiled(
     )
 }
 
+/// Compress single-end plain, gzip, or zstd FASTQ against a genome reference.
 pub fn compress_aligned_single_fastq_file(
     genome_fasta: impl AsRef<Path>,
     input: impl AsRef<Path>,
@@ -475,6 +619,7 @@ pub fn compress_aligned_single_fastq_file(
         .map(|(metadata, _)| metadata)
 }
 
+/// Compress single-end FASTQ and report archive details.
 pub fn compress_aligned_single_fastq_file_profiled(
     genome_fasta: impl AsRef<Path>,
     input: impl AsRef<Path>,
@@ -484,6 +629,7 @@ pub fn compress_aligned_single_fastq_file_profiled(
     alignment_archive::compress_single_fastq_file(genome_fasta, input, output, options)
 }
 
+/// Compress single-end FASTQ using an existing index.
 pub fn compress_aligned_single_fastq_file_with_index(
     index_file: impl AsRef<Path>,
     input: impl AsRef<Path>,
@@ -494,6 +640,7 @@ pub fn compress_aligned_single_fastq_file_with_index(
         .map(|(metadata, _)| metadata)
 }
 
+/// Compress single-end FASTQ with an existing SeqArc index and report details.
 pub fn compress_aligned_single_fastq_file_with_index_profiled(
     index_file: impl AsRef<Path>,
     input: impl AsRef<Path>,
@@ -527,6 +674,7 @@ pub fn decompress_aligned_paired<R: Read>(
     alignment_archive::decompress_paired(input, options)
 }
 
+/// Decompress an alignment archive into single-end records.
 pub fn decompress_aligned_single<R: Read>(
     input: R,
     options: &DecompressionOptions,
@@ -548,6 +696,7 @@ pub fn decompress_aligned_iter<R: Read>(
     alignment_archive::decompress_iter(input, options)
 }
 
+/// Eagerly decode aligned records into an [`AlignedRecordSink`].
 pub fn decompress_aligned_into<R: Read, S: AlignedRecordSink>(
     input: R,
     options: &DecompressionOptions,
@@ -556,6 +705,7 @@ pub fn decompress_aligned_into<R: Read, S: AlignedRecordSink>(
     alignment_archive::decompress_into(input, options, sink)
 }
 
+/// Eagerly decode paired records into a [`PairedRecordSink`].
 pub fn decompress_aligned_paired_into<R: Read, S: PairedRecordSink>(
     input: R,
     options: &DecompressionOptions,

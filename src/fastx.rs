@@ -16,23 +16,37 @@ enum InputCompression {
     Zstd,
 }
 
+/// Input file format for readers and writers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
+    /// FASTQ: identifier, sequence, separator, quality.
     Fastq,
+    /// FASTA: identifier and sequence only.
     Fasta,
 }
 
+/// Open a gzip (multi-member) reader around an existing stream.
 pub fn gzip_reader<R: std::io::Read>(reader: R) -> MultiGzDecoder<R> {
     MultiGzDecoder::new(reader)
 }
 
+/// Wrap a writer in a gzip encoder at the given level (clamped to 0..=9).
 pub fn gzip_writer<W: Write>(writer: W, level: u32) -> GzEncoder<W> {
     GzEncoder::new(writer, Compression::new(level.min(9)))
 }
 
 /// Open a plain, gzip, or zstd-compressed input detected from its magic bytes.
 pub fn open_fastx_reader(path: impl AsRef<Path>) -> Result<Box<dyn BufRead + Send>> {
-    let mut input = BufReader::with_capacity(INPUT_BUFFER_SIZE, File::open(path)?);
+    let path = path.as_ref();
+    let mut input = BufReader::with_capacity(
+        INPUT_BUFFER_SIZE,
+        File::open(path).map_err(|error| {
+            Error::Io(std::io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.display()),
+            ))
+        })?,
+    );
     let compression = detect_compression(input.fill_buf()?);
     let reader: Box<dyn BufRead + Send> = match compression {
         InputCompression::Plain => Box::new(input),
@@ -61,6 +75,7 @@ fn detect_compression(prefix: &[u8]) -> InputCompression {
     InputCompression::Plain
 }
 
+/// Streaming FASTQ or FASTA reader over an existing buffered stream.
 pub struct FastxReader<R> {
     reader: R,
     format: Format,
@@ -68,6 +83,7 @@ pub struct FastxReader<R> {
 }
 
 impl<R: BufRead> FastxReader<R> {
+    /// Read records of `format` from `reader`.
     pub fn new(reader: R, format: Format) -> Self {
         Self {
             reader,
@@ -160,14 +176,17 @@ impl<R: BufRead> FastxReader<R> {
     }
 }
 
+/// Buffered FASTQ or FASTA writer.
 pub struct FastxWriter<W> {
     writer: W,
     format: Format,
 }
 impl<W: Write> FastxWriter<W> {
+    /// Write records of `format` to `writer`.
     pub fn new(writer: W, format: Format) -> Self {
         Self { writer, format }
     }
+    /// Append one record, validating quality length for FASTQ output.
     pub fn write_record(&mut self, record: &ReadRecord) -> Result<()> {
         match self.format {
             Format::Fastq => {
@@ -192,6 +211,7 @@ impl<W: Write> FastxWriter<W> {
         }
         Ok(())
     }
+    /// Flush the underlying writer.
     pub fn finish(mut self) -> Result<()> {
         self.writer.flush().map_err(Into::into)
     }

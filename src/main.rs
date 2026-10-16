@@ -352,7 +352,12 @@ fn open_archive(path: &Path) -> Result<BufReader<File>> {
 /// Flush a renamed file's parent directory entry to stable storage so the
 /// rename itself survives a crash.
 fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // A bare filename such as "out.seqarc-index" has an empty parent path;
+    // opening it would fail with ENOENT, so fall back to "." as well.
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
     let directory = File::open(parent).map_err(|error| io_path_error(parent, error))?;
     directory.sync_all()?;
     Ok(())

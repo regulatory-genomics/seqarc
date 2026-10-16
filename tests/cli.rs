@@ -2577,3 +2577,63 @@ fn best_effort_decompress_recovers_undamaged_chunks() {
         format!("{}\n", recovered_second.join("\n"))
     );
 }
+
+#[test]
+fn bare_relative_output_filenames_commit_without_error() {
+    // A bare output filename has an empty parent path, which previously made
+    // the post-rename directory sync fail with
+    // "I/O error: : No such file or directory" after the file was written.
+    let directory = tempfile::tempdir().unwrap();
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        directory.path().join("reference.fa"),
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+    let sequence = &reference[20..60];
+    let fastq = format!(
+        "@read0\n{}\n+\n{}\n",
+        String::from_utf8_lossy(sequence),
+        "I".repeat(sequence.len()),
+    );
+    std::fs::write(directory.path().join("reads.fastq"), &fastq).unwrap();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args([
+            "index",
+            "reference.fa",
+            "--output",
+            "reference.seqarc-index",
+        ])
+        .current_dir(directory.path())
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args([
+            "compress",
+            "--index",
+            "reference.seqarc-index",
+            "--mate-1",
+            "reads.fastq",
+            "--output",
+            "reads.seqarc",
+        ])
+        .current_dir(directory.path())
+        .assert()
+        .success();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["decompress", "reads.seqarc", "--mate-1", "decoded.fastq"])
+        .current_dir(directory.path())
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("decoded.fastq")).unwrap(),
+        fastq
+    );
+}

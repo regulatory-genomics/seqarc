@@ -2,8 +2,13 @@
 name = "seqarc"
 version = "0.1.0"
 edition = "2021"
-description = "Rust-native library for archiving compressed sequencing reads"
+description = "Rust archiver for sequencing reads with fast, alignment-based compression"
 license = "MIT"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [dependencies]
 crossbeam-channel = "0.5"

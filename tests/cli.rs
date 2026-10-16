@@ -21,7 +21,6 @@ fn assert_directory_empty(path: &std::path::Path) {
     assert!(std::fs::read_dir(path).unwrap().next().is_none());
 }
 
-#[cfg(feature = "rustar")]
 fn pseudo_random_dna(length: usize) -> Vec<u8> {
     let mut state = 0x9e37_79b9u32;
     (0..length)
@@ -47,7 +46,6 @@ fn help_lists_aligned_workflow_commands() {
         .stdout(predicate::str::contains("validate"));
 }
 
-#[cfg(feature = "rustar")]
 #[test]
 fn rustar_cli_builds_single_file_index_and_compresses_spliced_read() {
     let directory = tempfile::tempdir().unwrap();
@@ -2389,4 +2387,192 @@ fn compress_rejects_quality_bytes_outside_printable_ascii() {
     }
 
     assert!(!archive_path.exists());
+}
+
+struct PairedArchiveFixture {
+    _directory: tempfile::TempDir,
+    archive_path: std::path::PathBuf,
+    first_fastq: String,
+    second_fastq: String,
+}
+
+/// Build a two-pair, two-chunk paired archive: pair0 maps to the reference and
+/// pair1 is an unmapped N-read fallback, with one record per chunk.
+fn create_paired_archive_fixture() -> PairedArchiveFixture {
+    let directory = tempfile::tempdir().unwrap();
+    let reference_path = directory.path().join("reference.fa");
+    let index_path = directory.path().join("reference.seqarc-index");
+    let first_path = directory.path().join("reads.1.fastq.gz");
+    let second_path = directory.path().join("reads.2.fastq.gz");
+    let archive_path = directory.path().join("reads.seqarc");
+
+    let reference =
+        b"ACGTTGCACTGATCGTACCTGAGTTCGATGCCATGACTGGTACAGTCTAGGCTAACGTGCTTAGCCTGATACGTTCAAGGTC";
+    std::fs::write(
+        &reference_path,
+        [b">chr1\n".as_slice(), reference, b"\n"].concat(),
+    )
+    .unwrap();
+
+    let first_sequence = &reference[20..60];
+    let second_sequence = reference[20..60]
+        .iter()
+        .rev()
+        .map(|base| match base {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let first_fastq = format!(
+        "@pair0/1\n{}\n+\n{}\n@pair1/1\n{}\n+\n{}\n",
+        String::from_utf8_lossy(first_sequence),
+        "I".repeat(first_sequence.len()),
+        "N".repeat(40),
+        "#".repeat(40),
+    );
+    let second_fastq = format!(
+        "@pair0/2\n{}\n+\n{}\n@pair1/2\n{}\n+\n{}\n",
+        String::from_utf8_lossy(&second_sequence),
+        "J".repeat(second_sequence.len()),
+        "N".repeat(40),
+        "$".repeat(40),
+    );
+    write_gzip(&first_path, first_fastq.as_bytes());
+    write_gzip(&second_path, second_fastq.as_bytes());
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["index", reference_path.to_str().unwrap(), "--output"])
+        .arg(&index_path)
+        .assert()
+        .success();
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["compress", "--index"])
+        .arg(&index_path)
+        .arg("--mate-1")
+        .arg(&first_path)
+        .arg("--mate-2")
+        .arg(&second_path)
+        .arg("--output")
+        .arg(&archive_path)
+        .args(["--threads", "1", "--chunk-records", "1"])
+        .assert()
+        .success();
+
+    PairedArchiveFixture {
+        _directory: directory,
+        archive_path,
+        first_fastq,
+        second_fastq,
+    }
+}
+
+fn flip_final_archive_byte(archive_path: &std::path::Path) {
+    let mut bytes = std::fs::read(archive_path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(archive_path, bytes).unwrap();
+}
+
+#[test]
+fn verify_detects_corrupted_chunks() {
+    let fixture = create_paired_archive_fixture();
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["verify"])
+        .arg(&fixture.archive_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("all checksums match"));
+
+    flip_final_archive_byte(&fixture.archive_path);
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["verify"])
+        .arg(&fixture.archive_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("chunks failed their checksums"));
+}
+
+#[test]
+fn decompress_range_selects_logical_records() {
+    let fixture = create_paired_archive_fixture();
+    let decoded_first = fixture._directory.path().join("ranged.1.fastq");
+    let decoded_second = fixture._directory.path().join("ranged.2.fastq");
+
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["decompress"])
+        .arg(&fixture.archive_path)
+        .arg("--mate-1")
+        .arg(&decoded_first)
+        .arg("--mate-2")
+        .arg(&decoded_second)
+        .args(["--range", "1:1"])
+        .assert()
+        .success();
+
+    let expected_first: Vec<&str> = fixture.first_fastq.lines().skip(4).take(4).collect();
+    let expected_second: Vec<&str> = fixture.second_fastq.lines().skip(4).take(4).collect();
+    assert_eq!(
+        std::fs::read_to_string(&decoded_first).unwrap(),
+        format!("{}\n", expected_first.join("\n"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&decoded_second).unwrap(),
+        format!("{}\n", expected_second.join("\n"))
+    );
+}
+
+#[test]
+fn best_effort_decompress_recovers_undamaged_chunks() {
+    let fixture = create_paired_archive_fixture();
+    let strict_first = fixture._directory.path().join("strict.1.fastq");
+    let best_effort_first = fixture._directory.path().join("recovered.1.fastq");
+    let best_effort_second = fixture._directory.path().join("recovered.2.fastq");
+
+    flip_final_archive_byte(&fixture.archive_path);
+
+    // Strict decoding refuses the damaged archive.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["decompress"])
+        .arg(&fixture.archive_path)
+        .arg("--mate-1")
+        .arg(&strict_first)
+        .assert()
+        .failure();
+
+    // Best-effort decoding recovers pair0 from the undamaged chunk. The
+    // command reports the skipped chunk and exits with a checksum failure.
+    Command::cargo_bin("seqarc")
+        .unwrap()
+        .args(["decompress"])
+        .arg(&fixture.archive_path)
+        .arg("--mate-1")
+        .arg(&best_effort_first)
+        .arg("--mate-2")
+        .arg(&best_effort_second)
+        .arg("--best-effort")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("best-effort recovery"));
+
+    let recovered_first: Vec<&str> = fixture.first_fastq.lines().take(4).collect();
+    let recovered_second: Vec<&str> = fixture.second_fastq.lines().take(4).collect();
+    assert_eq!(
+        std::fs::read_to_string(&best_effort_first).unwrap(),
+        format!("{}\n", recovered_first.join("\n"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&best_effort_second).unwrap(),
+        format!("{}\n", recovered_second.join("\n"))
+    );
 }

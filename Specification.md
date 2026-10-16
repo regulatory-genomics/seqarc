@@ -326,7 +326,7 @@ Subsections occur in this order:
 2. Eight R1 subsections.
 3. Eight R2 subsections for paired archives.
 4. One raw subsection for each embedded index range in declaration order.
-5. Four subsections for each declared index read stream in I1, I2 order.
+5. Three subsections for each declared index read stream in I1, I2 order.
 
 Every frame must decode to its declared raw length, and every subsection must be
 consumed exactly.

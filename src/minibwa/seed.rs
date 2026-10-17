@@ -1,0 +1,705 @@
+#![allow(unused_variables)]
+
+use crate::minibwa::bwt::{
+    mb_bwt_sa_batch_with_scratch, mb_bwt_smem_batch_ref_with_queue, Bwt,
+    SeedHit, SeedHitVec, mb_sai_v_clear, SmemEntryRef, TinyQueue,
+};
+use crate::minibwa::l2bit::{l2b_getseq, l2b_intv2cid, l2b_intv2cid_meth, l2b_meth_rev, L2bMeth, L2b};
+use crate::minibwa::lchain::Anchor;
+use crate::minibwa::map_algo::MapIndex;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnchorVec {
+    pub n: i64,
+    pub m: i64,
+    pub a: Vec<Anchor>,
+}
+
+/// Original C global function `mb_seed_intv_batch` from `minibwa/seed.c:56`.
+pub(crate) fn mb_seed_intv_batch(
+    bwt: &Bwt,
+    n_seq: i32,
+    len: &[i32],
+    seq: &[*const u8],
+    min_len: i32,
+    max_sub_occ: i32,
+    v: &mut [SeedHitVec],
+) {
+    const MAX_BATCH_SIZE: usize = 50;
+    for vi in v.iter_mut().take(n_seq as usize) {
+        mb_sai_v_clear(vi);
+    }
+    let mut tq = TinyQueue::default();
+    let mut s = Vec::with_capacity(MAX_BATCH_SIZE);
+    let mut i = 0usize;
+    while i < n_seq as usize {
+        let en = (i + MAX_BATCH_SIZE).min(n_seq as usize);
+        s.clear();
+        let v_ptr = v.as_mut_ptr();
+        for j in i..en {
+            s.push(SmemEntryRef {
+                min_len,
+                min_occ: 1,
+                st: 0,
+                en: len[j],
+                q: seq[j],
+                v: unsafe { v_ptr.add(j) },
+                stage: 0,
+                x: 0,
+                i: 0,
+                kmer: 0,
+                p: SeedHit::default(),
+            });
+        }
+        mb_bwt_smem_batch_ref_with_queue(bwt, (en - i) as i32, &mut s, v, &mut tq);
+        i = en;
+    }
+
+    let nv: Vec<usize> = v.iter().take(n_seq as usize).map(|x| x.n).collect();
+    s.clear();
+    let v_ptr = v.as_mut_ptr();
+    for i in 0..n_seq as usize {
+        for j in 0..nv[i] {
+            let st = (v[i].a[j].info >> 32) as u32;
+            let en = v[i].a[j].info as u32;
+            if en - st < (min_len * 2) as u32 || v[i].a[j].size > max_sub_occ as u64 {
+                continue;
+            }
+            s.push(SmemEntryRef {
+                min_len: (((en - st) / 2) as i32).max(min_len),
+                min_occ: v[i].a[j].size as i32 + 1,
+                st: st as i32,
+                en: en as i32,
+                q: seq[i],
+                v: unsafe { v_ptr.add(i) },
+                stage: 0,
+                x: 0,
+                i: 0,
+                kmer: 0,
+                p: SeedHit::default(),
+            });
+            if s.len() == MAX_BATCH_SIZE {
+                mb_bwt_smem_batch_ref_with_queue(bwt, s.len() as i32, &mut s, v, &mut tq);
+                s.clear();
+            }
+        }
+    }
+    if !s.is_empty() {
+        mb_bwt_smem_batch_ref_with_queue(bwt, s.len() as i32, &mut s, v, &mut tq);
+    }
+    for vi in v.iter_mut().take(n_seq as usize) {
+        vi.m = vi.a.capacity();
+    }
+}
+
+/// Original C static function `mb_seed_sort_dedup` from `minibwa/seed.c:109`.
+pub(crate) fn mb_seed_sort_dedup(u: &mut SeedHitVec) {
+    if u.n <= 1 {
+        return;
+    }
+    radix_sort_mb_sai_by_key::<0>(&mut u.a[..u.n]);
+    let mut i0 = 0usize;
+    let mut i = 1usize;
+    while i <= u.n {
+        if i == u.n || u.a[i].x[0] != u.a[i0].x[0] {
+            if i - i0 > 1 {
+                radix_sort_mb_sai_by_key::<1>(&mut u.a[i0..i]);
+                u.a[i0..i].reverse();
+                let mut k0 = i0;
+                let mut k = i0 + 1;
+                while k <= i {
+                    if k == i || u.a[k0].size != u.a[k].size {
+                        if k - k0 > 1 {
+                            radix_sort_mb_sai_by_key::<2>(&mut u.a[k0..k]);
+                        }
+                        k0 = k;
+                    }
+                    k += 1;
+                }
+            }
+            i0 = i;
+        }
+        i += 1;
+    }
+    let mut j = 0usize;
+    for i in 1..u.n {
+        if !(u.a[i].x[0] == u.a[j].x[0] && u.a[i].size == u.a[j].size && u.a[i].info == u.a[j].info)
+        {
+            j += 1;
+            u.a[j] = u.a[i];
+        }
+    }
+    u.n = j + 1;
+    u.a.truncate(u.n);
+    u.m = u.a.capacity();
+}
+
+fn radix_sort_mb_sai_by_key<const KEY: u8>(a: &mut [SeedHit]) {
+    const RS_MIN_SIZE: usize = 64;
+    const RS_MAX_BITS: u32 = 8;
+    const RS_BUCKETS: usize = 1usize << RS_MAX_BITS;
+
+    #[inline(always)]
+    fn key<const KEY: u8>(x: &SeedHit) -> u64 {
+        match KEY {
+            0 => x.x[0],
+            1 => x.size,
+            2 => x.info,
+            _ => unreachable!(),
+        }
+    }
+
+    fn insertion_sort<const KEY: u8>(a: &mut [SeedHit]) {
+        for i in 1..a.len() {
+            if key::<KEY>(&a[i]) < key::<KEY>(&a[i - 1]) {
+                let tmp = a[i];
+                let mut j = i;
+                while j > 0 && key::<KEY>(&tmp) < key::<KEY>(&a[j - 1]) {
+                    a[j] = a[j - 1];
+                    j -= 1;
+                }
+                a[j] = tmp;
+            }
+        }
+    }
+
+    fn sort_rec<const KEY: u8>(a: &mut [SeedHit], n_bits: u32, s: u32) {
+        debug_assert_eq!(n_bits, RS_MAX_BITS);
+        let size = RS_BUCKETS;
+        let mask = RS_BUCKETS - 1;
+        let mut b = [0usize; RS_BUCKETS];
+        let mut e = [0usize; RS_BUCKETS];
+        for x in a.iter() {
+            e[((key::<KEY>(x) >> s) as usize) & mask] += 1;
+        }
+        let mut sum = 0usize;
+        for k in 0..size {
+            let count = e[k];
+            b[k] = sum;
+            sum += count;
+            e[k] = sum;
+        }
+        let bucket_end = e;
+
+        let mut k = 0usize;
+        while k < size {
+            if b[k] != e[k] {
+                let mut l = ((key::<KEY>(&a[b[k]]) >> s) as usize) & mask;
+                if l != k {
+                    let mut tmp = a[b[k]];
+                    loop {
+                        std::mem::swap(&mut tmp, &mut a[b[l]]);
+                        b[l] += 1;
+                        l = ((key::<KEY>(&tmp) >> s) as usize) & mask;
+                        if l == k {
+                            break;
+                        }
+                    }
+                    a[b[k]] = tmp;
+                    b[k] += 1;
+                } else {
+                    b[k] += 1;
+                }
+            } else {
+                k += 1;
+            }
+        }
+
+        if s != 0 {
+            let next_s = s.saturating_sub(n_bits);
+            for k in 0..size {
+                let start = if k == 0 { 0 } else { bucket_end[k - 1] };
+                let end = bucket_end[k];
+                let len = end - start;
+                if len > RS_MIN_SIZE {
+                    sort_rec::<KEY>(&mut a[start..end], n_bits, next_s);
+                } else if len > 1 {
+                    insertion_sort::<KEY>(&mut a[start..end]);
+                }
+            }
+        }
+    }
+
+    if a.len() <= RS_MIN_SIZE {
+        insertion_sort::<KEY>(a);
+    } else {
+        sort_rec::<KEY>(a, RS_MAX_BITS, 7 * RS_MAX_BITS);
+    }
+}
+
+/// Remove duplicated anchors. The two-round seeding algorithm may lead an
+/// anchor precisely contained in a longer anchor. This routine filters out the
+/// shorter anchor. This wouldn't happen to minimap2.
+///
+/// NB: assuming sorted by `tpos`.
+///
+/// Original C static function `mb_anchor_dedup` from `minibwa/seed.c:142`.
+pub(crate) fn mb_anchor_dedup(v: &mut AnchorVec) {
+    const MAX_BACK: usize = 100;
+    for i in 1..v.n as usize {
+        let ai = v.a[i];
+        let tsi = ai.tpos + 1 - ai.len as i64;
+        let qsi = ai.qpos + 1 - ai.len;
+        let mut k = 0usize;
+        let mut j = i;
+        while j > 0 && k < MAX_BACK {
+            j -= 1;
+            let aj = v.a[j];
+            if aj.sid != ai.sid || aj.tpos < tsi {
+                break;
+            }
+            let tsj = aj.tpos + 1 - aj.len as i64;
+            let qsj = aj.qpos + 1 - aj.len;
+            if tsj >= tsi {
+                if tsj - tsi == (qsj - qsi) as i64 {
+                    v.a[j].flt = 1;
+                }
+            } else if ai.tpos == aj.tpos && ai.qpos == aj.qpos {
+                v.a[i].flt = 1;
+            }
+            k += 1;
+        }
+    }
+    let mut j = 0usize;
+    for i in 0..v.n as usize {
+        if v.a[i].flt == 0 {
+            if j < i {
+                v.a[j] = v.a[i];
+            }
+            j += 1;
+        }
+    }
+    v.n = j as i64;
+    v.a.truncate(j);
+}
+
+fn radix_sort_mb_anchor_by_tpos(a: &mut [Anchor]) {
+    const RS_MIN_SIZE: usize = 64;
+    const RS_MAX_BITS: u32 = 8;
+    const RS_BUCKETS: usize = 1usize << RS_MAX_BITS;
+
+    fn key(x: &Anchor) -> u64 {
+        x.tpos as u64
+    }
+
+    fn insertion_sort(a: &mut [Anchor]) {
+        for i in 1..a.len() {
+            if key(&a[i]) < key(&a[i - 1]) {
+                let tmp = a[i];
+                let mut j = i;
+                while j > 0 && key(&tmp) < key(&a[j - 1]) {
+                    a[j] = a[j - 1];
+                    j -= 1;
+                }
+                a[j] = tmp;
+            }
+        }
+    }
+
+    fn sort_rec(a: &mut [Anchor], n_bits: u32, s: u32) {
+        debug_assert_eq!(n_bits, RS_MAX_BITS);
+        let size = RS_BUCKETS;
+        let mask = RS_BUCKETS - 1;
+        let mut b = [0usize; RS_BUCKETS];
+        let mut e = [0usize; RS_BUCKETS];
+        for x in a.iter() {
+            e[((key(x) >> s) as usize) & mask] += 1;
+        }
+        let mut sum = 0usize;
+        for k in 0..size {
+            let count = e[k];
+            b[k] = sum;
+            sum += count;
+            e[k] = sum;
+        }
+        let bucket_end = e;
+
+        let mut k = 0usize;
+        while k < size {
+            if b[k] != e[k] {
+                let mut l = ((key(&a[b[k]]) >> s) as usize) & mask;
+                if l != k {
+                    let mut tmp = a[b[k]];
+                    loop {
+                        std::mem::swap(&mut tmp, &mut a[b[l]]);
+                        b[l] += 1;
+                        l = ((key(&tmp) >> s) as usize) & mask;
+                        if l == k {
+                            break;
+                        }
+                    }
+                    a[b[k]] = tmp;
+                    b[k] += 1;
+                } else {
+                    b[k] += 1;
+                }
+            } else {
+                k += 1;
+            }
+        }
+
+        if s != 0 {
+            let next_s = s.saturating_sub(n_bits);
+            for k in 0..size {
+                let start = if k == 0 { 0 } else { bucket_end[k - 1] };
+                let end = bucket_end[k];
+                let len = end - start;
+                if len > RS_MIN_SIZE {
+                    sort_rec(&mut a[start..end], n_bits, next_s);
+                } else if len > 1 {
+                    insertion_sort(&mut a[start..end]);
+                }
+            }
+        }
+    }
+
+    if a.len() <= RS_MIN_SIZE {
+        insertion_sort(a);
+    } else {
+        sort_rec(a, RS_MAX_BITS, 7 * RS_MAX_BITS);
+    }
+}
+
+/// Original C static function `process_batch` from `minibwa/seed.c:175`.
+pub(crate) fn process_batch(
+    idx: &MapIndex,
+    aux: &[(i64, i64)],
+    m: i32,
+    b: &[(i64, i64)],
+    a: &mut [u64],
+    sa_batch: &mut Vec<(u64, u64)>,
+    qlen: i32,
+    mt: L2bMeth,
+    u: &SeedHitVec,
+    v: &mut AnchorVec,
+) {
+    for k in 0..m as usize {
+        a[k] = b[k].0 as u64;
+    }
+    mb_bwt_sa_batch_with_scratch(&idx.bwt, m as i64, a, sa_batch);
+    for k in 0..m as usize {
+        let p = aux[b[k].1 as usize];
+        for j in p.0..p.1 {
+            let qs = (u.a[j as usize].info >> 32) as i32;
+            let qe = u.a[j as usize].info as u32 as i32;
+            let len = qe - qs;
+            let mut rev = 0;
+            let mut cst = 0i64;
+            let tid = if mt != L2bMeth::None {
+                let mut mt_anchor = L2bMeth::None;
+                let tid = l2b_intv2cid_meth(
+                    &idx.l2b,
+                    a[k],
+                    a[k] + len as u64,
+                    &mut mt_anchor,
+                    &mut cst,
+                    &mut rev,
+                );
+                if tid < 0 {
+                    continue;
+                }
+                if (mt_anchor == mt) != (rev == 0) {
+                    continue;
+                }
+                tid
+            } else {
+                let tid = l2b_intv2cid(&idx.l2b, a[k], a[k] + len as u64, &mut cst, &mut rev);
+                if tid < 0 {
+                    continue;
+                }
+                tid
+            };
+            rev = (rev != 0) as i32;
+            let ctg = &idx.l2b.ctg[tid as usize];
+            v.a.push(Anchor {
+                sid: ((tid as i32) << 1) | rev,
+                len,
+                qpos: if rev != 0 {
+                    qlen - 1 - qs
+                } else {
+                    qs + len - 1
+                },
+                flag: 0,
+                flt: 0,
+                tpos: (ctg.off * 2 + ctg.len * rev as u64) as i64 + cst + len as i64 - 1,
+            });
+            v.n += 1;
+        }
+    }
+    v.m = v.a.capacity() as i64;
+}
+
+pub(crate) fn mb_anchor_split_meth(
+    l2b: &L2b,
+    min_len: i32,
+    qlen: i32,
+    qseq0: &[u8],
+    mt0: L2bMeth,
+    v: &mut AnchorVec,
+) {
+    if v.n == 0 {
+        return;
+    }
+    let max_len =
+        v.a.iter()
+            .take(v.n as usize)
+            .map(|a| a.len)
+            .max()
+            .unwrap_or(0);
+    let mut tseq = vec![0u8; max_len.max(0) as usize];
+    let mut qseq2 = [
+        vec![0u8; qlen.max(0) as usize],
+        vec![0u8; qlen.max(0) as usize],
+    ];
+    qseq2[0].copy_from_slice(&qseq0[..qlen.max(0) as usize]);
+    for i in 0..qlen.max(0) as usize {
+        let c = qseq0[i];
+        qseq2[1][qlen as usize - 1 - i] = if c > 3 { 4 } else { 3 - c };
+    }
+
+    let mut out = Vec::with_capacity((v.n * 2).max(1) as usize);
+    for q in v.a.iter().take(v.n as usize) {
+        let ctg = &l2b.ctg[(q.sid >> 1) as usize];
+        let rev = q.sid & 1;
+        let tpos = q.tpos - (ctg.off * 2 + ctg.len * rev as u64) as i64;
+        let ts = tpos + 1 - q.len as i64;
+        let qs = q.qpos + 1 - q.len;
+        if qs < 0 || qs + q.len > qlen || ts < 0 {
+            continue;
+        }
+        l2b_getseq(
+            l2b,
+            (q.sid >> 1) as i64,
+            ts,
+            ts + q.len as i64,
+            &mut tseq[..q.len as usize],
+        );
+        let mt = if rev != 0 { l2b_meth_rev(mt0) } else { mt0 };
+        let t_allow = if mt == L2bMeth::C2t { 1 } else { 2 };
+        let q_allow = if mt == L2bMeth::C2t { 3 } else { 0 };
+        let qseq = &qseq2[rev as usize][qs as usize..(qs + q.len) as usize];
+        let mut j0 = 0i32;
+        for j in 0..=q.len {
+            let split = if j == q.len {
+                true
+            } else {
+                let tb = tseq[j as usize];
+                let qb = qseq[j as usize];
+                tb == 4 || qb == 4 || (tb != qb && !(tb == t_allow && qb == q_allow))
+            };
+            if split {
+                if j - j0 >= min_len {
+                    let mut p = *q;
+                    p.len = j - j0;
+                    p.qpos = q.qpos - (q.len - j);
+                    p.tpos = q.tpos - (q.len - j) as i64;
+                    out.push(p);
+                }
+                j0 = j + 1;
+            }
+        }
+    }
+    v.a = out;
+    v.n = v.a.len() as i64;
+    v.m = v.a.capacity() as i64;
+}
+
+pub(crate) fn mb_anchor_with_scratch(
+    idx: &MapIndex,
+    u: &mut SeedHitVec,
+    min_len: i32,
+    qlen: i32,
+    qseq: &[u8],
+    mt: L2bMeth,
+    max_occ: i32,
+    v: &mut AnchorVec,
+    aux: &mut Vec<(i64, i64)>,
+    a: &mut Vec<u64>,
+    sa_batch: &mut Vec<(u64, u64)>,
+    b: &mut Vec<(i64, i64)>,
+) -> f64 {
+    const BATCH_SIZE: i32 = 20;
+    v.n = 0;
+    v.a.clear();
+    if u.n == 0 {
+        return 1.0;
+    }
+    mb_seed_sort_dedup(u);
+    let max_occ_u = max_occ.max(0) as u64;
+    let n_anchor_cap =
+        u.a.iter()
+            .take(u.n)
+            .map(|q| q.size.min(max_occ_u) as usize)
+            .sum::<usize>();
+    v.a.reserve(n_anchor_cap.saturating_sub(v.a.capacity()));
+    aux.clear();
+    let mut i0 = 0usize;
+    let mut i = 1usize;
+    while i <= u.n {
+        if i == u.n || u.a[i].x[0] != u.a[i0].x[0] || u.a[i].size != u.a[i0].size {
+            aux.push((i0 as i64, i as i64));
+            i0 = i;
+        }
+        i += 1;
+    }
+    let m_a = max_occ.max(BATCH_SIZE) as usize;
+    a.clear();
+    a.resize(m_a.max(1), 0);
+    b.clear();
+    b.reserve(m_a.max(1).saturating_sub(b.capacity()));
+    for (i, p) in aux.iter().enumerate() {
+        let q = &u.a[p.0 as usize];
+        if q.size as usize + b.len() > BATCH_SIZE as usize {
+            process_batch(idx, aux, b.len() as i32, b, a, sa_batch, qlen, mt, u, v);
+            b.clear();
+        }
+        if q.size <= max_occ as u64 {
+            for j in 0..q.size {
+                b.push((q.x[0].wrapping_add(j) as i64, i as i64));
+            }
+        } else {
+            let mut n = 0i32;
+            let mut j = 0u64;
+            while j < q.size && n < max_occ {
+                let mut step = (q.size - j) / (max_occ - n) as u64;
+                if step < 1 {
+                    step = 1;
+                }
+                b.push((q.x[0].wrapping_add(j) as i64, i as i64));
+                j += step;
+                n += 1;
+            }
+        }
+        assert!(b.len() <= m_a);
+    }
+    process_batch(idx, aux, b.len() as i32, b, a, sa_batch, qlen, mt, u, v);
+
+    let mut seed_ratio = 1.0f64;
+    if mt != L2bMeth::None && v.n > 0 {
+        let t0 =
+            v.a.iter()
+                .take(v.n as usize)
+                .map(|a| a.len as i64)
+                .sum::<i64>();
+        mb_anchor_split_meth(&idx.l2b, min_len, qlen, qseq, mt, v);
+        let t1 =
+            v.a.iter()
+                .take(v.n as usize)
+                .map(|a| a.len as i64)
+                .sum::<i64>();
+        if t0 > 0 {
+            seed_ratio = t1 as f64 / t0 as f64;
+        }
+    }
+
+    radix_sort_mb_anchor_by_tpos(&mut v.a);
+    for q in &mut v.a {
+        let ctg = &idx.l2b.ctg[(q.sid >> 1) as usize];
+        q.tpos -= (ctg.off * 2 + ctg.len * (q.sid & 1) as u64) as i64;
+    }
+    v.n = v.a.len() as i64;
+    mb_anchor_dedup(v);
+    seed_ratio
+}
+
+/// Original C global function `mb_anchor_sort` from `minibwa/seed.c:269`.
+pub(crate) fn mb_anchor_sort(l2b: &L2b, n_a: i64, a: &mut [Anchor]) {
+    if n_a <= 1 {
+        return;
+    }
+    for x in a.iter_mut().take(n_a as usize) {
+        let ctg = &l2b.ctg[(x.sid >> 1) as usize];
+        x.tpos += (ctg.off * 2 + ctg.len * (x.sid & 1) as u64) as i64;
+    }
+    radix_sort_mb_anchor_by_tpos(&mut a[..n_a as usize]);
+    for x in a.iter_mut().take(n_a as usize) {
+        let ctg = &l2b.ctg[(x.sid >> 1) as usize];
+        x.tpos -= (ctg.off * 2 + ctg.len * (x.sid & 1) as u64) as i64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn seed_sort_dedup_reverses_only_current_x0_group() {
+        let mut u = SeedHitVec {
+            n: 5,
+            m: 5,
+            a: vec![
+                SeedHit {
+                    x: [2, 0],
+                    size: 2,
+                    info: 20,
+                },
+                SeedHit {
+                    x: [1, 0],
+                    size: 1,
+                    info: 10,
+                },
+                SeedHit {
+                    x: [2, 0],
+                    size: 5,
+                    info: 50,
+                },
+                SeedHit {
+                    x: [1, 0],
+                    size: 3,
+                    info: 30,
+                },
+                SeedHit {
+                    x: [1, 0],
+                    size: 3,
+                    info: 25,
+                },
+            ],
+        };
+        mb_seed_sort_dedup(&mut u);
+        let keys =
+            u.a.iter()
+                .take(u.n)
+                .map(|x| (x.x[0], x.size, x.info))
+                .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![(1, 3, 25), (1, 3, 30), (1, 1, 10), (2, 5, 50), (2, 2, 20)]
+        );
+    }
+
+    #[test]
+    fn anchor_sort_uses_absolute_contig_order_then_restores_local_tpos() {
+        let mut l2b = L2b::default();
+        l2b.n_ctg = 2;
+        l2b.ctg = vec![
+            crate::minibwa::l2bit::L2bCtg {
+                name: "a".into(),
+                len: 100,
+                off: 0,
+                comm: None,
+            },
+            crate::minibwa::l2bit::L2bCtg {
+                name: "b".into(),
+                len: 100,
+                off: 100,
+                comm: None,
+            },
+        ];
+        let mut a = vec![
+            Anchor {
+                sid: 2,
+                tpos: 1,
+                ..Default::default()
+            },
+            Anchor {
+                sid: 0,
+                tpos: 90,
+                ..Default::default()
+            },
+        ];
+        mb_anchor_sort(&l2b, a.len() as i64, &mut a);
+        assert_eq!(
+            a.iter().map(|x| (x.sid, x.tpos)).collect::<Vec<_>>(),
+            vec![(0, 90), (2, 1)]
+        );
+    }
+}

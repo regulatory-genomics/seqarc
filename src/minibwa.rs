@@ -1,4 +1,110 @@
-use minibwa_rs as raw;
+//! Read mapper ported from the C `minibwa` aligner (see `src/lib.rs`).
+//!
+//! This module is the safe wrapper around the vendored translation, which
+//! lives in the sibling files and is declared below.
+//!
+//! The vendored code was copied from `minibwa-rs`
+//! (https://github.com/henriksson-lab/minibwa-rs) at revision
+//! `0f4b719b46c8c232ea25ea22f628e4632d037277` (v0.2.0), trimmed to the
+//! modules used by this crate. Unused CLI, SAM-output, and alternate-mapper
+//! code from upstream was dropped, as were upstream unit tests requiring
+//! locally-generated fixtures that never shipped with the crate.
+//!
+//! Vendored code is licensed under the MIT License:
+//! Copyright (c) 2025-     Dana-Farber Cancer Institute
+//!
+//! Only this wrapper should depend on the vendored internals; they are
+//! translated-from-C code and not idiomatic Rust.
+#![allow(
+    clippy::absurd_extreme_comparisons,
+    clippy::almost_swapped,
+    clippy::approx_constant,
+    clippy::chunks_exact_to_as_chunks,
+    clippy::collapsible_if,
+    clippy::drop_non_drop,
+    clippy::excessive_precision,
+    clippy::field_reassign_with_default,
+    clippy::identity_op,
+    clippy::if_same_then_else,
+    clippy::int_plus_one,
+    clippy::items_after_test_module,
+    clippy::large_enum_variant,
+    clippy::let_unit_value,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_range_contains,
+    clippy::missing_safety_doc,
+    clippy::missing_transmute_annotations,
+    clippy::needless_range_loop,
+    clippy::needless_return,
+    clippy::ptr_arg,
+    clippy::too_many_arguments,
+    clippy::uninit_vec,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_unwrap,
+    clippy::upper_case_acronyms
+)]
+
+#[path = "minibwa/qsufsort.rs"]
+pub mod qsufsort;
+pub mod align;
+pub mod bwt;
+pub mod bwtgen;
+pub mod cs;
+pub mod index;
+pub mod ketopt;
+pub mod kommon;
+pub mod ksw2;
+pub mod ksw2_extd2_sse;
+pub mod ksw2_extz2_sse;
+pub mod ksw2_ll_sse;
+pub mod l2bit;
+pub mod lchain;
+pub mod map_algo;
+pub mod mapped_u64;
+pub mod mbpriv;
+pub mod options;
+pub mod pe;
+pub mod s2n_lite;
+pub mod seed;
+
+pub(crate) struct NoDropVec<T> {
+    inner: std::mem::ManuallyDrop<Vec<T>>,
+}
+
+impl<T> NoDropVec<T> {
+    #[inline(always)]
+    pub(crate) fn new(inner: Vec<T>) -> Self {
+        Self {
+            inner: std::mem::ManuallyDrop::new(inner),
+        }
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn into_inner(self) -> Vec<T> {
+        std::mem::ManuallyDrop::into_inner(self.inner)
+    }
+}
+
+impl<T> std::ops::Deref for NoDropVec<T> {
+    type Target = Vec<T>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> std::ops::DerefMut for NoDropVec<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -23,7 +129,7 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct Index {
-    inner: raw::map_algo::mb_idx_t,
+    inner: map_algo::MapIndex,
 }
 
 impl Index {
@@ -59,7 +165,7 @@ impl Index {
         ];
         arguments.push(fasta.as_ref().to_string_lossy().into_owned());
         arguments.push(prefix.to_string_lossy().into_owned());
-        let (status, message) = raw::index::main_index(&arguments);
+        let (status, message) = index::main_index(&arguments);
         if status != 0 {
             return Err(Error(if message.is_empty() {
                 "minibwa index build failed".into()
@@ -82,7 +188,7 @@ impl Index {
     }
 
     pub fn contig_name(&self, tid: i32) -> Option<&str> {
-        raw::map_algo::mb_idx_ctg_name(&self.inner, tid)
+        map_algo::mb_idx_ctg_name(&self.inner, tid)
     }
 
     pub fn reference_len(&self) -> usize {
@@ -95,7 +201,7 @@ impl Index {
 
     #[inline(always)]
     pub(crate) fn reference_base_at(&self, position: usize) -> u8 {
-        b"ACGT"[raw::l2bit::l2b_get0(&self.inner.l2b, position as u64) as usize]
+        b"ACGT"[l2bit::l2b_get0(&self.inner.l2b, position as u64) as usize]
     }
 }
 
@@ -161,7 +267,7 @@ fn pack_components(
 fn load_container(path: impl AsRef<Path>) -> Result<Index> {
     #[cfg(all(unix, not(target_arch = "wasm32"), target_endian = "little"))]
     {
-        let map = raw::mapped_u64::mmap_file(path.as_ref(), 0)
+        let map = mapped_u64::mmap_file(path.as_ref(), 0)
             .ok_or_else(|| Error("failed to mmap minibwa index".into()))?;
         let bytes = map.as_bytes();
         if bytes.len() < INDEX_HEADER_SIZE as usize || &bytes[..8] != INDEX_MAGIC {
@@ -190,11 +296,11 @@ fn load_container(path: impl AsRef<Path>) -> Result<Index> {
         }
         let mut bwt = parse_mbw(map, mbw_offset, mbw_len)?;
         if bwt.seq_len != reference_len.saturating_mul(2) {
-            return Err(Error("reference and BWT lengths differ".into()));
+            return Err(Error("reference and GenBwt lengths differ".into()));
         }
-        raw::bwt::mb_bwt_cache(&mut bwt, 10);
+        bwt::mb_bwt_cache(&mut bwt, 10);
         Ok(Index {
-            inner: raw::map_algo::mb_idx_t {
+            inner: map_algo::MapIndex {
                 is_meth: 0,
                 l2b,
                 bwt,
@@ -212,10 +318,10 @@ fn load_container(path: impl AsRef<Path>) -> Result<Index> {
 
 #[cfg(all(unix, not(target_arch = "wasm32"), target_endian = "little"))]
 fn parse_l2b(
-    map: Arc<raw::mapped_u64::UnixMmap>,
+    map: Arc<mapped_u64::UnixMmap>,
     base: usize,
     length: usize,
-) -> Result<raw::l2bit::l2b_t> {
+) -> Result<l2bit::L2b> {
     let bytes = map.as_bytes();
     let section = &bytes[base..base + length];
     if section.len() < 64 || &section[..4] != b"L2B\x01" {
@@ -236,7 +342,7 @@ fn parse_l2b(
     for _ in 0..n_ctg {
         let len = read_u64_at(section, offset)?;
         offset += 8;
-        contigs.push(raw::l2bit::l2b_ctg_t {
+        contigs.push(l2bit::L2bCtg {
             name: String::new(),
             comm: None,
             len,
@@ -260,7 +366,7 @@ fn parse_l2b(
     if pac_end > section.len() {
         return Err(Error("truncated packed reference".into()));
     }
-    let pac = raw::mapped_u64::mapped_u64_slice(Arc::clone(&map), base + offset, n_pac as usize)
+    let pac = mapped_u64::mapped_u64_slice(Arc::clone(&map), base + offset, n_pac as usize)
         .ok_or_else(|| Error("invalid packed reference range".into()))?;
     offset = pac_end;
     let names_end = offset
@@ -275,7 +381,7 @@ fn parse_l2b(
     let cat_name = section[offset..names_end].to_vec();
     let cat_comm = section[names_end..comments_end].to_vec();
     populate_contig_strings(&mut contigs, &cat_name, &cat_comm)?;
-    Ok(raw::l2bit::l2b_t {
+    Ok(l2bit::L2b {
         tot_len,
         n_ctg,
         m_ctg: n_ctg,
@@ -296,35 +402,35 @@ fn parse_l2b(
 
 #[cfg(all(unix, not(target_arch = "wasm32"), target_endian = "little"))]
 fn parse_mbw(
-    map: Arc<raw::mapped_u64::UnixMmap>,
+    map: Arc<mapped_u64::UnixMmap>,
     base: usize,
     length: usize,
-) -> Result<raw::bwt::mb_bwt_t> {
+) -> Result<bwt::Bwt> {
     let bytes = map.as_bytes();
     let section = &bytes[base..base + length];
     if section.len() < 56 || &section[..4] != b"MBW\x02" {
         return Err(Error("invalid MBW section".into()));
     }
-    let mut bwt = raw::bwt::mb_bwt_init();
+    let mut bwt = bwt::mb_bwt_init();
     bwt.sa_bit = read_u32_at(section, 4)?;
     bwt.primary = read_u64_at(section, 8)?;
     for index in 1..5 {
-        bwt.L2[index] = read_u64_at(section, 8 + index * 8)?;
+        bwt.l2[index] = read_u64_at(section, 8 + index * 8)?;
     }
-    bwt.seq_len = bwt.L2[4];
-    bwt.data_len = raw::bwt::mb_bwt_data_len(bwt.seq_len);
-    let data_bytes = usize_from(bwt.data_len, "BWT data length")?
+    bwt.seq_len = bwt.l2[4];
+    bwt.data_len = bwt::mb_bwt_data_len(bwt.seq_len);
+    let data_bytes = usize_from(bwt.data_len, "GenBwt data length")?
         .checked_mul(8)
-        .ok_or_else(|| Error("BWT size overflow".into()))?;
+        .ok_or_else(|| Error("GenBwt size overflow".into()))?;
     let n_sa_offset = 48usize
         .checked_add(data_bytes)
-        .ok_or_else(|| Error("BWT size overflow".into()))?;
+        .ok_or_else(|| Error("GenBwt size overflow".into()))?;
     if n_sa_offset + 8 > section.len() {
-        return Err(Error("truncated BWT data".into()));
+        return Err(Error("truncated GenBwt data".into()));
     }
     bwt.data =
-        raw::mapped_u64::mapped_u64_slice(Arc::clone(&map), base + 48, bwt.data_len as usize)
-            .ok_or_else(|| Error("invalid BWT data range".into()))?;
+        mapped_u64::mapped_u64_slice(Arc::clone(&map), base + 48, bwt.data_len as usize)
+            .ok_or_else(|| Error("invalid GenBwt data range".into()))?;
     bwt.n_sa = read_u64_at(section, n_sa_offset)?;
     if bwt.sa_bit != u32::MAX && bwt.n_sa != 0 {
         let step = 1u64
@@ -344,7 +450,7 @@ fn parse_mbw(
         {
             return Err(Error("truncated suffix array".into()));
         }
-        bwt.sa = raw::mapped_u64::mapped_u64_slice(map, base + sa_offset, bwt.n_sa as usize)
+        bwt.sa = mapped_u64::mapped_u64_slice(map, base + sa_offset, bwt.n_sa as usize)
             .ok_or_else(|| Error("invalid suffix-array range".into()))?;
     }
     Ok(bwt)
@@ -354,19 +460,19 @@ fn read_intervals(
     section: &[u8],
     offset: &mut usize,
     count: u64,
-) -> Result<Vec<raw::l2bit::l2b_intv_t>> {
+) -> Result<Vec<l2bit::L2bIntv>> {
     let mut intervals = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let st = read_u64_at(section, *offset)?;
         let en = read_u64_at(section, *offset + 8)?;
         *offset += 16;
-        intervals.push(raw::l2bit::l2b_intv_t { st, en });
+        intervals.push(l2bit::L2bIntv { st, en });
     }
     Ok(intervals)
 }
 
 fn populate_contig_strings(
-    contigs: &mut [raw::l2bit::l2b_ctg_t],
+    contigs: &mut [l2bit::L2bCtg],
     names: &[u8],
     comments: &[u8],
 ) -> Result<()> {
@@ -442,21 +548,21 @@ fn align_u64(value: u64, alignment: u64) -> u64 {
 
 #[derive(Clone)]
 pub struct Opts {
-    inner: raw::options::mb_opt_t,
+    inner: options::MapOpts,
 }
 
 impl Opts {
     pub fn new() -> Self {
-        let mut inner = raw::options::mb_opt_t::default();
-        raw::options::mb_opt_init(&mut inner);
+        let mut inner = options::MapOpts::default();
+        options::mb_opt_init(&mut inner);
         Self { inner }
     }
 
     pub fn set_paired(mut self, paired: bool) -> Self {
         if paired {
-            self.inner.flag |= raw::options::MB_F_PE;
+            self.inner.flag |= options::MB_F_PE;
         } else {
-            self.inner.flag &= !raw::options::MB_F_PE;
+            self.inner.flag &= !options::MB_F_PE;
         }
         self
     }
@@ -469,13 +575,13 @@ impl Default for Opts {
 }
 
 pub struct ThreadBuf {
-    inner: raw::map_algo::mb_tbuf_t,
+    inner: map_algo::MapBuffer,
 }
 
 impl ThreadBuf {
     pub fn new() -> Self {
         Self {
-            inner: raw::map_algo::mb_tbuf_init(0),
+            inner: map_algo::mb_tbuf_init(),
         }
     }
 }
@@ -532,8 +638,8 @@ impl<'a> Aligner<'a> {
             .collect::<Result<Vec<_>>>()?;
         let mut hit_counts = vec![0; sequences.len()];
         let mut options = self.options.inner.clone();
-        options.flag &= !raw::options::MB_F_PE;
-        let hits = raw::map_algo::mb_map_batch(
+        options.flag &= !options::MB_F_PE;
+        let hits = map_algo::mb_map_batch(
             &options,
             &self.index.inner,
             sequences.len() as i32,
@@ -600,7 +706,7 @@ pub struct Hit {
 }
 
 impl Hit {
-    fn from_raw(hit: raw::pe::mb_hit_t, index: &Index) -> Result<Self> {
+    fn from_raw(hit: pe::Hit, index: &Index) -> Result<Self> {
         let cigar = hit
             .p
             .as_ref()

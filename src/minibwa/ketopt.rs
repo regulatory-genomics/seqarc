@@ -1,0 +1,321 @@
+#![allow(unused_variables, dead_code)]
+
+pub(crate) const KO_NO_ARGUMENT: i32 = 0;
+pub(crate) const KO_REQUIRED_ARGUMENT: i32 = 1;
+pub(crate) const KO_OPTIONAL_ARGUMENT: i32 = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KetOpt {
+    pub ind: i32,
+    pub opt: i32,
+    pub arg: Option<String>,
+    pub longidx: i32,
+    pub i: i32,
+    pub pos: i32,
+    pub n_args: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KoLongOpt {
+    pub name: Option<String>,
+    pub has_arg: i32,
+    pub val: i32,
+}
+
+pub(crate) static KETOPT_INIT: KetOpt = KetOpt {
+    ind: 1,
+    opt: 0,
+    arg: None,
+    longidx: -1,
+    i: 1,
+    pos: 0,
+    n_args: 0,
+};
+
+fn c_strlen_bytes(s: &str) -> usize {
+    s.as_bytes().iter().position(|&c| c == 0).unwrap_or(s.len())
+}
+
+/// Original C static function `ketopt_permute` from `minibwa/ketopt.h:27`.
+pub(crate) fn ketopt_permute(argv: &mut [String], j: i32, n: i32) {
+    let mut k = 0;
+    let p = argv[j as usize].clone();
+    while k < n {
+        let dst = (j - k) as usize;
+        let src = (j - k - 1) as usize;
+        argv[dst] = argv[src].clone();
+        k += 1;
+    }
+    argv[(j - k) as usize] = p;
+}
+
+/// Parse command-line options and arguments
+///
+/// This fuction has a similar interface to GNU's getopt_long(). Each call
+/// parses one option and returns the option name.  s->arg points to the option
+/// argument if present. The function returns -1 when all command-line arguments
+/// are parsed. In this case, s->ind is the index of the first non-option
+/// argument.
+///
+/// # Arguments
+/// - `s`: status; shall be initialized to KETOPT_INIT on the first call
+/// - `argc`: length of argv[]
+/// - `argv`: list of command-line arguments; argv[0] is ignored
+/// - `permute`: non-zero to move options ahead of non-option arguments
+/// - `ostr`: option string
+/// - `longopts`: long options
+///
+/// # Returns
+/// ASCII for a short option; KoLongOpt::val for a long option; -1 if
+/// argv[] is fully processed; '?' for an unknown option or an ambiguous
+/// long option; ':' if an option argument is missing
+///
+/// Original C static function `ketopt` from `minibwa/ketopt.h:56`.
+pub(crate) fn ketopt(
+    s: &mut KetOpt,
+    argc: i32,
+    argv: &mut [String],
+    permute: i32,
+    ostr: &str,
+    longopts: Option<&[KoLongOpt]>,
+) -> i32 {
+    let mut opt: i32;
+    if permute != 0 {
+        while s.i < argc {
+            let a = argv[s.i as usize].as_bytes();
+            if a.first() == Some(&b'-') && a.get(1) != Some(&b'\0') && a.len() > 1 {
+                break;
+            }
+            s.i += 1;
+            s.n_args += 1;
+        }
+    }
+    s.arg = None;
+    s.longidx = -1;
+    let i0 = s.i;
+    if s.i >= argc {
+        s.ind = s.i - s.n_args;
+        return -1;
+    }
+    let cur = argv[s.i as usize].clone();
+    let cur_len = c_strlen_bytes(&cur);
+    let cur_b = &cur.as_bytes()[..cur_len];
+    if cur_b.first() != Some(&b'-') || cur_b.get(1).is_none() {
+        s.ind = s.i - s.n_args;
+        return -1;
+    }
+    if cur_b.first() == Some(&b'-') && cur_b.get(1) == Some(&b'-') {
+        if cur_b.get(2).is_none() {
+            ketopt_permute(argv, s.i, s.n_args);
+            s.i += 1;
+            s.ind = s.i - s.n_args;
+            return -1;
+        }
+        s.opt = 0;
+        opt = '?' as i32;
+        s.pos = -1;
+        if let Some(longopts) = longopts {
+            let mut j = 2usize;
+            while j < cur_b.len() && cur_b[j] != b'=' {
+                j += 1;
+            }
+            let query = &cur[2..j];
+            let mut n_exact = 0;
+            let mut n_partial = 0;
+            let mut exact_idx = 0usize;
+            let mut partial_idx = 0usize;
+            for (k, o) in longopts.iter().enumerate() {
+                let Some(name) = &o.name else {
+                    break;
+                };
+                let name_len = c_strlen_bytes(name);
+                let name_c = &name.as_bytes()[..name_len];
+                if name_c.starts_with(query.as_bytes()) {
+                    if name_len == query.len() {
+                        n_exact += 1;
+                        exact_idx = k;
+                    } else {
+                        n_partial += 1;
+                        partial_idx = k;
+                    }
+                }
+            }
+            if n_exact > 1 || (n_exact == 0 && n_partial > 1) {
+                s.i += 1;
+                return '?' as i32;
+            }
+            let o_idx = if n_exact == 1 {
+                Some(exact_idx)
+            } else if n_partial == 1 {
+                Some(partial_idx)
+            } else {
+                None
+            };
+            if let Some(o_idx) = o_idx {
+                let o = &longopts[o_idx];
+                s.opt = o.val;
+                opt = o.val;
+                s.longidx = o_idx as i32;
+                if j < cur_b.len() && cur_b[j] == b'=' {
+                    s.arg = Some(cur[j + 1..cur_len].to_string());
+                }
+                if o.has_arg == KO_REQUIRED_ARGUMENT && j == cur_b.len() {
+                    if s.i < argc - 1 {
+                        s.i += 1;
+                        let arg_len = c_strlen_bytes(&argv[s.i as usize]);
+                        s.arg = Some(argv[s.i as usize][..arg_len].to_string());
+                    } else {
+                        opt = ':' as i32;
+                    }
+                }
+            }
+        }
+    } else {
+        if s.pos == 0 {
+            s.pos = 1;
+        }
+        let pos = s.pos as usize;
+        opt = cur_b[pos] as i32;
+        s.opt = opt;
+        s.pos += 1;
+        let ostr_len = c_strlen_bytes(ostr);
+        let ostr_b = &ostr.as_bytes()[..ostr_len];
+        if let Some(p) = ostr_b.iter().position(|&c| c as i32 == opt) {
+            if ostr_b.get(p + 1) == Some(&b':') {
+                if s.pos as usize >= cur_b.len() {
+                    if s.i < argc - 1 {
+                        s.i += 1;
+                        let arg_len = c_strlen_bytes(&argv[s.i as usize]);
+                        s.arg = Some(argv[s.i as usize][..arg_len].to_string());
+                    } else {
+                        opt = ':' as i32;
+                    }
+                } else {
+                    s.arg = Some(cur[s.pos as usize..cur_len].to_string());
+                }
+                s.pos = -1;
+            }
+        } else {
+            opt = '?' as i32;
+        }
+    }
+    let active_len = c_strlen_bytes(&argv[s.i as usize]);
+    if s.pos < 0 || s.pos as usize >= active_len {
+        s.i += 1;
+        s.pos = 0;
+        if s.n_args > 0 {
+            let mut j = i0;
+            while j < s.i {
+                ketopt_permute(argv, j, s.n_args);
+                j += 1;
+            }
+        }
+    }
+    s.ind = s.i - s.n_args;
+    opt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ketopt_parses_short_options_and_permutes_arguments() {
+        let mut argv = vec![
+            "prog".to_string(),
+            "input.fa".to_string(),
+            "-abval".to_string(),
+            "tail".to_string(),
+        ];
+        let mut st = KETOPT_INIT.clone();
+        assert_eq!(ketopt(&mut st, 4, &mut argv, 1, "ab:", None), 'a' as i32);
+        assert_eq!(st.arg, None);
+        assert_eq!(ketopt(&mut st, 4, &mut argv, 1, "ab:", None), 'b' as i32);
+        assert_eq!(st.arg.as_deref(), Some("val"));
+        assert_eq!(ketopt(&mut st, 4, &mut argv, 1, "ab:", None), -1);
+        assert_eq!(st.ind, 2);
+        assert_eq!(argv[1], "-abval");
+        assert_eq!(argv[2], "input.fa");
+    }
+
+    #[test]
+    fn ketopt_parses_long_options_and_errors() {
+        let longopts = vec![
+            KoLongOpt {
+                name: Some("threads".to_string()),
+                has_arg: KO_REQUIRED_ARGUMENT,
+                val: 't' as i32,
+            },
+            KoLongOpt {
+                name: Some("verbose".to_string()),
+                has_arg: KO_NO_ARGUMENT,
+                val: 'v' as i32,
+            },
+            KoLongOpt {
+                name: None,
+                has_arg: 0,
+                val: 0,
+            },
+        ];
+        let mut argv = vec![
+            "prog".to_string(),
+            "--threads=8".to_string(),
+            "--verb".to_string(),
+            "--unknown".to_string(),
+        ];
+        let mut st = KETOPT_INIT.clone();
+        assert_eq!(
+            ketopt(&mut st, 4, &mut argv, 0, "", Some(&longopts)),
+            't' as i32
+        );
+        assert_eq!(st.longidx, 0);
+        assert_eq!(st.arg.as_deref(), Some("8"));
+        assert_eq!(
+            ketopt(&mut st, 4, &mut argv, 0, "", Some(&longopts)),
+            'v' as i32
+        );
+        assert_eq!(st.longidx, 1);
+        assert_eq!(
+            ketopt(&mut st, 4, &mut argv, 0, "", Some(&longopts)),
+            '?' as i32
+        );
+    }
+
+    #[test]
+    fn ketopt_treats_argv_and_option_tables_as_c_strings() {
+        let longopts = vec![
+            KoLongOpt {
+                name: Some("threads\0tail".to_string()),
+                has_arg: KO_REQUIRED_ARGUMENT,
+                val: 't' as i32,
+            },
+            KoLongOpt {
+                name: None,
+                has_arg: 0,
+                val: 0,
+            },
+        ];
+        let mut argv = vec![
+            "prog".to_string(),
+            "-a\0b".to_string(),
+            "--threads=8\0tail".to_string(),
+            "--\0not-long".to_string(),
+            "tail".to_string(),
+        ];
+        let mut st = KETOPT_INIT.clone();
+        assert_eq!(
+            ketopt(&mut st, 5, &mut argv, 0, "a\0b:", Some(&longopts)),
+            'a' as i32
+        );
+        assert_eq!(
+            ketopt(&mut st, 5, &mut argv, 0, "a\0b:", Some(&longopts)),
+            't' as i32
+        );
+        assert_eq!(st.arg.as_deref(), Some("8"));
+        assert_eq!(
+            ketopt(&mut st, 5, &mut argv, 0, "a\0b:", Some(&longopts)),
+            -1
+        );
+        assert_eq!(st.ind, 4);
+    }
+}

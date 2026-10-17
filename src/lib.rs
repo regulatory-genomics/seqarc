@@ -34,11 +34,6 @@ mod quality;
 mod qvz;
 mod star_index;
 
-/// mimalloc reduces allocator overhead in the decode path, where chunks of
-/// per-record allocations are freed while large section buffers churn.
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::io::Read;
 use std::ops::RangeInclusive;
 use std::path::Path;
@@ -54,6 +49,15 @@ pub use alignment_archive::{
     SectionBreakdown, SectionSizes, VerifyReport,
 };
 pub use fastx::{gzip_reader, gzip_writer, open_fastx_reader, FastxReader, FastxWriter, Format};
+
+/// Open an aligned archive from a filesystem path.
+pub fn open_aligned_archive(
+    path: impl AsRef<Path>,
+    options: &DecompressionOptions,
+) -> Result<AlignedRecordIter<std::io::BufReader<std::fs::File>>> {
+    let file = std::fs::File::open(path)?;
+    decompress_aligned_iter(std::io::BufReader::new(file), options)
+}
 
 /// Library result type.
 pub type Result<T> = std::result::Result<T, Error>;

@@ -17,6 +17,10 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// The CLI owns the process-wide allocator; the library remains embeddable.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "seqarc", version, about = "Archive sequencing reads")]
 struct Cli {

@@ -1446,6 +1446,21 @@ impl<R: Read> AlignedRecordIter<R> {
         self.index_streams
     }
 
+    /// Number of embedded index ranges restored into biological reads.
+    pub fn embedded_index_count(&self) -> usize {
+        self.indexes.len()
+    }
+
+    /// Whether read identifiers were preserved.
+    pub fn preserve_ids(&self) -> bool {
+        self.id_mode != IdMode::None
+    }
+
+    /// Whether quality values were preserved.
+    pub fn preserve_quality(&self) -> bool {
+        self.preserve_quality
+    }
+
     /// Total chunks declared by the archive header.
     pub fn total_chunks(&self) -> u64 {
         self.total_chunks

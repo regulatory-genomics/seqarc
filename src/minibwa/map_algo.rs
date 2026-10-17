@@ -1265,7 +1265,9 @@ pub(crate) fn mb_map_batch(
                         .take(qlen[idx_k] as usize)
                         .map(|c| KOM_NT4_TABLE[c as usize]),
                 );
-                sai[k] = SeedHitVec::default();
+                // sai[k] is cleared (capacity-preserving) inside
+                // mb_seed_intv_batch; do not reset it here or the grown
+                // SeedHitVec capacity is dropped every sub-batch.
             }
             let mut seq4_refs = seq4[..sb_n as usize]
                 .iter()
@@ -1280,9 +1282,6 @@ pub(crate) fn mb_map_batch(
                 &mut sai[..sb_n as usize],
             );
             seq4_refs.clear();
-            for s in seq4.iter_mut().take(sb_n as usize) {
-                *s = Vec::new();
-            }
             for k in 0..sb_n as usize {
                 let idx_k = sb_st as usize + k;
                 let mut opt_adap = MapOpts::default();

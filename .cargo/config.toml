@@ -1,4 +1,6 @@
 [build]
-# seqarc is built and run locally; native codegen enables the SSE4.1 fast
-# paths in the minibwa DP kernels (baseline x86-64 would emulate them).
-rustflags = ["-C", "target-cpu=native"]
+# x86-64-v2 (SSE4.2/POPCNT) enables the SSE4.1 fast paths in the minibwa DP
+# kernels without native codegen, so the binary stays portable across any
+# CPU from ~2009 on. (Profiling showed baseline x86-64 codegen emulates those
+# ops at ~14.5% of total runtime.)
+rustflags = ["-C", "target-cpu=x86-64-v2"]

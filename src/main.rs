@@ -56,19 +56,19 @@ struct IndexArgs {
     /// Alignment backend used by this index.
     #[arg(long, value_enum, default_value_t = AlignerChoice::Minibwa)]
     aligner: AlignerChoice,
-    /// GTF annotation used to insert known splice junctions into a rustar index.
+    /// GTF annotation used to insert known splice junctions into a star index.
     #[arg(long)]
     gtf: Option<PathBuf>,
-    /// Splice-junction overhang stored in a rustar index.
+    /// Splice-junction overhang stored in a star index.
     #[arg(long, default_value_t = 100)]
     sjdb_overhang: u32,
-    /// Rustar suffix-array sparsity. Larger values reduce index memory.
+    /// Star suffix-array sparsity. Larger values reduce index memory.
     #[arg(long, default_value_t = 1)]
     sa_sparse_d: u32,
-    /// Rustar suffix-array prefix length.
+    /// Star suffix-array prefix length.
     #[arg(long, default_value_t = 14)]
     sa_index_nbases: u32,
-    /// Rustar chromosome-bin size as a base-2 exponent.
+    /// Star chromosome-bin size as a base-2 exponent.
     #[arg(long, default_value_t = 18)]
     chr_bin_nbits: u32,
     /// Number of index construction threads.
@@ -79,14 +79,17 @@ struct IndexArgs {
 #[derive(Clone, Copy, ValueEnum)]
 enum AlignerChoice {
     Minibwa,
-    Rustar,
+    /// STAR-like spliced aligner (vendored from `rustar-aligner`); the old
+    /// `rustar` spelling is kept as a working alias.
+    #[value(alias = "rustar")]
+    Star,
 }
 
 impl From<AlignerChoice> for AlignerKind {
     fn from(value: AlignerChoice) -> Self {
         match value {
             AlignerChoice::Minibwa => AlignerKind::Minibwa,
-            AlignerChoice::Rustar => AlignerKind::Rustar,
+            AlignerChoice::Star => AlignerKind::Star,
         }
     }
 }
@@ -808,7 +811,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             if matches!(args.aligner, AlignerChoice::Minibwa) && args.gtf.is_some() {
                 return Err(Error::InvalidInput(
-                    "--gtf is only supported with --aligner rustar".into(),
+                    "--gtf is only supported with --aligner star".into(),
                 ));
             }
             let output = AtomicPath::new(args.output, args.force)?;
@@ -819,11 +822,11 @@ fn run(cli: Cli) -> Result<()> {
                     temp_dir: args.temp_dir,
                     aligner: args.aligner.into(),
                     threads: args.threads,
-                    rustar_gtf: args.gtf,
-                    rustar_sjdb_overhang: args.sjdb_overhang,
-                    rustar_sa_sparse_d: args.sa_sparse_d,
-                    rustar_sa_index_nbases: args.sa_index_nbases,
-                    rustar_chr_bin_nbits: args.chr_bin_nbits,
+                    star_gtf: args.gtf,
+                    star_sjdb_overhang: args.sjdb_overhang,
+                    star_sa_sparse_d: args.sa_sparse_d,
+                    star_sa_index_nbases: args.sa_index_nbases,
+                    star_chr_bin_nbits: args.chr_bin_nbits,
                 },
             )?;
             output.commit()

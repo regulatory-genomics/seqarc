@@ -18,7 +18,7 @@ pub enum AlignerKind {
     #[default]
     Minibwa,
     /// Spliced RNA-seq mapper with GTF-driven junction support.
-    Rustar,
+    Star,
 }
 
 /// Options for building a genome alignment index.
@@ -30,16 +30,16 @@ pub struct GenomeIndexBuildOptions {
     pub aligner: AlignerKind,
     /// Worker threads for index construction.
     pub threads: usize,
-    /// GTF annotation for rustar splice-junction database construction.
-    pub rustar_gtf: Option<PathBuf>,
-    /// rustar `sjdbOverhang` for splice-junction database construction.
-    pub rustar_sjdb_overhang: u32,
-    /// rustar `--sa-sparseD` suffix-array sparsity factor.
-    pub rustar_sa_sparse_d: u32,
-    /// rustar `--sa-index-nbases` suffix-array seed length.
-    pub rustar_sa_index_nbases: u32,
-    /// rustar `--chr-bin-nbits` chromosome address width as a base-2 exponent.
-    pub rustar_chr_bin_nbits: u32,
+    /// GTF annotation for star splice-junction database construction.
+    pub star_gtf: Option<PathBuf>,
+    /// star `sjdbOverhang` for splice-junction database construction.
+    pub star_sjdb_overhang: u32,
+    /// star `--sa-sparseD` suffix-array sparsity factor.
+    pub star_sa_sparse_d: u32,
+    /// star `--sa-index-nbases` suffix-array seed length.
+    pub star_sa_index_nbases: u32,
+    /// star `--chr-bin-nbits` chromosome address width as a base-2 exponent.
+    pub star_chr_bin_nbits: u32,
 }
 
 impl Default for GenomeIndexBuildOptions {
@@ -48,11 +48,11 @@ impl Default for GenomeIndexBuildOptions {
             temp_dir: None,
             aligner: AlignerKind::Minibwa,
             threads: 4,
-            rustar_gtf: None,
-            rustar_sjdb_overhang: 100,
-            rustar_sa_sparse_d: 1,
-            rustar_sa_index_nbases: 14,
-            rustar_chr_bin_nbits: 18,
+            star_gtf: None,
+            star_sjdb_overhang: 100,
+            star_sa_sparse_d: 1,
+            star_sa_index_nbases: 14,
+            star_chr_bin_nbits: 18,
         }
     }
 }
@@ -91,7 +91,7 @@ struct AlignmentCandidate {
 
 pub(crate) enum AlignmentIndex {
     Minibwa(Index),
-    Rustar(Box<crate::rustar_index::RustarIndex>),
+    Star(Box<crate::star_index::StarIndex>),
 }
 
 pub(crate) struct MappingProgressStats {
@@ -166,11 +166,11 @@ impl AlignmentIndex {
     pub(crate) fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut magic = [0; 8];
-        let is_rustar = File::open(path)?.read_exact(&mut magic).is_ok() && magic == *b"SRSTAR01";
-        if is_rustar {
-            return crate::rustar_index::load(path)
+        let is_star = File::open(path)?.read_exact(&mut magic).is_ok() && magic == *b"SRSTAR01";
+        if is_star {
+            return crate::star_index::load(path)
                 .map(Box::new)
-                .map(Self::Rustar);
+                .map(Self::Star);
         }
         Index::load(path)
             .map(Self::Minibwa)
@@ -180,7 +180,7 @@ impl AlignmentIndex {
     pub(crate) fn reference_len(&self) -> usize {
         match self {
             Self::Minibwa(index) => index.reference_len(),
-            Self::Rustar(index) => index.reference_len(),
+            Self::Star(index) => index.reference_len(),
         }
     }
 }
@@ -194,7 +194,7 @@ impl ReferenceBases for AlignmentIndex {
     fn base(&self, position: usize) -> u8 {
         match self {
             Self::Minibwa(index) => index.reference_base_at(position),
-            Self::Rustar(index) => index.reference_base_at(position),
+            Self::Star(index) => index.reference_base_at(position),
         }
     }
 }
@@ -278,7 +278,7 @@ pub fn build_alignment_index(
         AlignerKind::Minibwa => {
             build_genome_index_with_options(genome_fasta, index_file, options).map(|_| ())
         }
-        AlignerKind::Rustar => crate::rustar_index::build(genome_fasta, index_file, options),
+        AlignerKind::Star => crate::star_index::build(genome_fasta, index_file, options),
     }
 }
 
@@ -587,8 +587,8 @@ where
         AlignmentIndex::Minibwa(raw_index) => {
             map_minibwa_records(raw_index, index, records, mapping_pool, candidate_cost)
         }
-        AlignmentIndex::Rustar(raw_index) => {
-            map_rustar_records(raw_index, index, records, mapping_pool, candidate_cost)
+        AlignmentIndex::Star(raw_index) => {
+            map_star_records(raw_index, index, records, mapping_pool, candidate_cost)
         }
     }
 }
@@ -656,8 +656,8 @@ where
         })
 }
 
-fn map_rustar_records<F>(
-    index: &crate::rustar_index::RustarIndex,
+fn map_star_records<F>(
+    index: &crate::star_index::StarIndex,
     reference: &AlignmentIndex,
     records: &[&ReadRecord],
     mapping_pool: &rayon::ThreadPool,
@@ -678,10 +678,10 @@ where
                             .sequence
                             .iter()
                             .copied()
-                            .map(rustar_aligner::io::fastq::encode_base)
+                            .map(crate::star::io::fastq::encode_base)
                             .collect::<Vec<_>>();
-                        let name = rustar_read_name(&record.id);
-                        let (transcripts, _, _, _) = rustar_aligner::align::align_read(
+                        let name = star_read_name(&record.id);
+                        let (transcripts, _, _, _) = crate::star::align::align_read(
                             &encoded,
                             &name,
                             &index.inner,
@@ -690,7 +690,7 @@ where
                         .map_err(|error| Error::InvalidInput(error.to_string()))?;
                         let candidates = transcripts
                             .into_iter()
-                            .map(|transcript| rustar_candidate(transcript, record.sequence.len()))
+                            .map(|transcript| star_candidate(transcript, record.sequence.len()))
                             .collect::<Result<Vec<_>>>()?;
                         select_alignment(record, candidates, reference, candidate_cost)
                     })
@@ -701,7 +701,7 @@ where
     })
 }
 
-fn rustar_read_name(id: &[u8]) -> String {
+fn star_read_name(id: &[u8]) -> String {
     if let Ok(id) = std::str::from_utf8(id) {
         return id.to_owned();
     }
@@ -715,15 +715,15 @@ fn rustar_read_name(id: &[u8]) -> String {
     name
 }
 
-fn rustar_candidate(
-    transcript: rustar_aligner::align::Transcript,
+fn star_candidate(
+    transcript: crate::star::align::Transcript,
     read_len: usize,
 ) -> Result<AlignmentCandidate> {
     use noodles::sam::alignment::record::cigar::op::Kind;
 
     if transcript.read_length() != read_len {
         return Err(Error::InvalidInput(
-            "rustar CIGAR does not consume the complete read".into(),
+            "star CIGAR does not consume the complete read".into(),
         ));
     }
     let cigar = transcript
@@ -744,7 +744,7 @@ fn rustar_candidate(
             Ok(CigarOp {
                 kind,
                 len: u32::try_from(op.len()).map_err(|_| {
-                    Error::InvalidInput("rustar CIGAR operation is too long".into())
+                    Error::InvalidInput("star CIGAR operation is too long".into())
                 })?,
             })
         })
@@ -753,7 +753,7 @@ fn rustar_candidate(
         score: transcript.score,
         alignment: GenomeAlignment {
             start: i64::try_from(transcript.genome_start)
-                .map_err(|_| Error::InvalidInput("rustar alignment start is too large".into()))?,
+                .map_err(|_| Error::InvalidInput("star alignment start is too large".into()))?,
             query_start: 0,
             query_end: i32::try_from(read_len)
                 .map_err(|_| Error::InvalidInput("read is too long".into()))?,

@@ -11,12 +11,18 @@ codegen-units = 1
 strip = true
 
 [dependencies]
+bitflags = "2"
+bstr = "1"
+byteorder = "1"
+caps-sa = "0.6"
+clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 bed-utils = "0.11"
-clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"
+dashmap = "6"
 flate2 = "1"
 indicatif = "0.17"
+log = "0.4"
 mimalloc = "0.1"
 libc = "0.2"
 libm = "0.2"
@@ -24,10 +30,18 @@ libsais-rs = "0.2.2"
 memmap2 = "0.9"
 noodles = { version = "0.113", features = ["sam"] }
 rayon = "1"
+rustc-hash = "2"
 rkyv = { version = "0.8", features = ["bytecheck"] }
-rustar-aligner = { git = "https://github.com/scverse/rustar-aligner", rev = "207773b11df5fb9c229bbbcf5385f6daa7f2fe7c" }
+shlex = "2"
+anyhow = "1"
 tempfile = "3"
+thiserror = "2"
 zstd = "0.13"
+
+# NOTE: the former `rustar-aligner` git dependency is vendored into src/star
+# (see the provenance header in src/star/mod.rs); the extra entries above
+# (bitflags, bstr, byteorder, caps-sa, dashmap, log, rustc-hash, shlex) are
+# the dependencies of that subset.
 
 [dev-dependencies]
 assert_cmd = "2"

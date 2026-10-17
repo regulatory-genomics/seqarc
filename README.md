@@ -27,7 +27,7 @@ extraction (embedded index ranges) and index reads (I1/I2).
 ## How it works
 
 - Reads are aligned to a reference genome with a built-in aligner
-  (BWA-style via `minibwa`, or `rustar`). Mapped reads are stored as compact
+  (BWA-style via `minibwa`, or `star`). Mapped reads are stored as compact
   positions, orientation flags, and a per-read noise stream; unmapped reads
   are stored as raw bytes.
 - Every archive embeds the subset of reference bases it needs (2-bit packed),

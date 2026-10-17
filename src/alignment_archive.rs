@@ -402,11 +402,11 @@ fn index_build_options(
         temp_dir: Some(workspace.to_path_buf()),
         aligner: options.aligner,
         threads: options.threads,
-        rustar_gtf: options.rustar_gtf.clone(),
-        rustar_sjdb_overhang: options.rustar_sjdb_overhang,
-        rustar_sa_sparse_d: options.rustar_sa_sparse_d,
-        rustar_sa_index_nbases: options.rustar_sa_index_nbases,
-        rustar_chr_bin_nbits: options.rustar_chr_bin_nbits,
+        star_gtf: options.star_gtf.clone(),
+        star_sjdb_overhang: options.star_sjdb_overhang,
+        star_sa_sparse_d: options.star_sa_sparse_d,
+        star_sa_index_nbases: options.star_sa_index_nbases,
+        star_chr_bin_nbits: options.star_chr_bin_nbits,
     }
 }
 

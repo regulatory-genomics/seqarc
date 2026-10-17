@@ -13,6 +13,13 @@
 
 #![warn(missing_docs)]
 
+/// RNA-seq aligner subset vendored from `scverse/rustar-aligner`.
+///
+/// See [`crate::aligners`] for the SeqArc-level API; the index container is
+/// handled by [`crate::star_index`].
+#[allow(missing_docs)]
+pub(crate) mod star;
+
 mod aligners;
 mod alignment_archive;
 mod fastx;
@@ -25,7 +32,7 @@ pub mod minibwa;
 mod packed_sequence;
 mod quality;
 mod qvz;
-mod rustar_index;
+mod star_index;
 
 /// mimalloc reduces allocator overhead in the decode path, where chunks of
 /// per-record allocations are freed while large section buffers churn.
@@ -275,16 +282,16 @@ pub struct AlignmentCompressionOptions {
     pub embedded_index_ranges: Vec<EmbeddedIndexRange>,
     /// Separate index-read FASTQ files (I1/I2) stored alongside the mates.
     pub index_read_files: Vec<std::path::PathBuf>,
-    /// GTF annotation for rustar splice-junction index construction.
-    pub rustar_gtf: Option<std::path::PathBuf>,
-    /// rustar `sjdbOverhang` for splice-junction database construction.
-    pub rustar_sjdb_overhang: u32,
-    /// rustar `--sa-sparseD` suffix-array sparsity factor.
-    pub rustar_sa_sparse_d: u32,
-    /// rustar `--sa-index-nbases` suffix-array seed length.
-    pub rustar_sa_index_nbases: u32,
-    /// rustar `--chr-bin-nbits` chromosome address width as a base-2 exponent.
-    pub rustar_chr_bin_nbits: u32,
+    /// GTF annotation for star splice-junction index construction.
+    pub star_gtf: Option<std::path::PathBuf>,
+    /// star `sjdbOverhang` for splice-junction database construction.
+    pub star_sjdb_overhang: u32,
+    /// star `--sa-sparseD` suffix-array sparsity factor.
+    pub star_sa_sparse_d: u32,
+    /// star `--sa-index-nbases` suffix-array seed length.
+    pub star_sa_index_nbases: u32,
+    /// star `--chr-bin-nbits` chromosome address width as a base-2 exponent.
+    pub star_chr_bin_nbits: u32,
 }
 
 impl Default for AlignmentCompressionOptions {
@@ -302,11 +309,11 @@ impl Default for AlignmentCompressionOptions {
             zstd_level: 19,
             embedded_index_ranges: Vec::new(),
             index_read_files: Vec::new(),
-            rustar_gtf: None,
-            rustar_sjdb_overhang: 100,
-            rustar_sa_sparse_d: 1,
-            rustar_sa_index_nbases: 14,
-            rustar_chr_bin_nbits: 18,
+            star_gtf: None,
+            star_sjdb_overhang: 100,
+            star_sa_sparse_d: 1,
+            star_sa_index_nbases: 14,
+            star_chr_bin_nbits: 18,
         }
     }
 }

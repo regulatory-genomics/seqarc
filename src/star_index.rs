@@ -1,13 +1,15 @@
 use crate::{temporary_directory, Error, GenomeIndexBuildOptions, Result};
 use memmap2::{Mmap, MmapOptions};
-use rustar_aligner::genome::{Genome, GenomeSeq};
-use rustar_aligner::index::packed_array::PackedArray;
-use rustar_aligner::index::sa_index::SaIndex;
-use rustar_aligner::index::suffix_array::SuffixArray;
-use rustar_aligner::index::GenomeIndex;
-use rustar_aligner::junction::sjdb_insert::PreparedJunction;
-use rustar_aligner::junction::SpliceJunctionDb;
-use rustar_aligner::params::Parameters;
+use crate::star::error::Error as StarError;
+use crate::star::genome::{Genome, GenomeSeq};
+use crate::star::index::SectionSink;
+use crate::star::index::packed_array::PackedArray;
+use crate::star::index::sa_index::SaIndex;
+use crate::star::index::suffix_array::SuffixArray;
+use crate::star::index::GenomeIndex;
+use crate::star::junction::sjdb_insert::PreparedJunction;
+use crate::star::junction::SpliceJunctionDb;
+use crate::star::params::Parameters;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,12 +28,12 @@ struct Section {
     length: u64,
 }
 
-pub(crate) struct RustarIndex {
+pub(crate) struct StarIndex {
     pub(crate) inner: GenomeIndex,
     pub(crate) params: Parameters,
 }
 
-impl RustarIndex {
+impl StarIndex {
     pub(crate) fn reference_len(&self) -> usize {
         self.inner.genome.n_genome_real as usize
     }
@@ -53,42 +55,207 @@ pub(crate) fn build(
     output: impl AsRef<Path>,
     options: &GenomeIndexBuildOptions,
 ) -> Result<()> {
-    if !(1..=14).contains(&options.rustar_sa_index_nbases) {
+    if !(1..=14).contains(&options.star_sa_index_nbases) {
         return Err(Error::InvalidInput(
-            "rustar SA index prefix length must be in 1..=14".into(),
+            "star SA index prefix length must be in 1..=14".into(),
         ));
     }
-    if options.rustar_chr_bin_nbits > 30 {
+    if options.star_chr_bin_nbits > 30 {
         return Err(Error::InvalidInput(
-            "rustar chromosome bin exponent must be at most 30".into(),
+            "star chromosome bin exponent must be at most 30".into(),
         ));
     }
-    let workspace = temporary_directory(options.temp_dir.as_deref(), "seqarc-rustar-index-")?;
-    let index_dir = workspace.path().join("star");
-    std::fs::create_dir(&index_dir)?;
+    let workspace = temporary_directory(options.temp_dir.as_deref(), "seqarc-star-index-")?;
     let mut params = default_parameters()?;
-    params.run_mode_in = vec!["genomeGenerate".into()];
     params.run_thread_n = NonZeroUsize::new(options.threads.max(1)).unwrap();
-    params.temp_dir = Some(workspace.path().join("work"));
-    std::fs::create_dir_all(workspace.path().join("work"))?;
-    params.genome_dir = index_dir.clone();
+    // Single scratch space: caps-sa's external-memory chunks and the
+    // normalized FASTA/GTF copies share the workspace (there is no
+    // separate STAR-style index directory any more — sections stream
+    // straight into the container).
+    params.temp_dir = Some(workspace.path().to_path_buf());
     let normalized = crate::aligners::normalize_genome(
         genome_fasta.as_ref(),
-        options.rustar_gtf.as_deref(),
+        options.star_gtf.as_deref(),
         workspace.path(),
     )?;
     params.genome_fasta_files = vec![normalized.fasta];
     params.sjdb_gtf_file = normalized.gtf;
-    params.genome_sa_sparse_d = options.rustar_sa_sparse_d.max(1);
-    params.genome_sa_index_nbases = options.rustar_sa_index_nbases;
-    params.genome_chr_bin_nbits = options.rustar_chr_bin_nbits;
-    params.sjdb_overhang = options.rustar_sjdb_overhang;
-    GenomeIndex::generate_streaming(&params)
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
-    pack_directory(&index_dir, output.as_ref())
+    params.genome_sa_sparse_d = options.star_sa_sparse_d.max(1);
+    params.genome_sa_index_nbases = options.star_sa_index_nbases;
+    params.genome_chr_bin_nbits = options.star_chr_bin_nbits;
+    params.sjdb_overhang = options.star_sjdb_overhang;
+
+    let output = output.as_ref();
+    let mut sink = ContainerSink::create(output)?;
+    GenomeIndex::generate_streaming_with(&params, &mut sink)
+        .and_then(|()| sink.finish())
+        .map_err(|error| {
+            // Best effort: don't leave a truncated container behind.
+            let _ = std::fs::remove_file(output);
+            Error::InvalidInput(error.to_string())
+        })?;
+    Ok(())
 }
 
-pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
+/// Single-pass container writer: sections stream straight into the
+/// `.seqarc-index` file. The table of contents is reserved (as a placeholder)
+/// before the first section — the section list is known once the junction
+/// preparation has decided whether `sjdbInfo.txt` exists — and back-patched
+/// by [`ContainerSink::finish`] once every section's final offset/length is
+/// known. Layout matches the old pack-the-directory path: header, TOC, then
+/// sections in alphabetical order, each 64 KiB aligned.
+struct ContainerSink {
+    file: File,
+    names: Vec<String>,
+    entries: Vec<(String, Section)>,
+    next_offset: u64,
+    planned: bool,
+}
+
+impl ContainerSink {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            // Read+write: the SAindex pass preads the just-streamed SA
+            // section through a cloned handle.
+            file: std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?,
+            names: Vec::new(),
+            entries: Vec::new(),
+            next_offset: 0,
+            planned: false,
+        })
+    }
+}
+
+/// Map an I/O failure on the container file.
+fn container_io(e: std::io::Error) -> StarError {
+    StarError::Index(format!("container write failed: {e}"))
+}
+
+impl SectionSink for ContainerSink {
+    fn plan(&mut self, names: &[&str]) -> std::result::Result<(), StarError> {
+        assert!(!self.planned, "container sink planned twice");
+        self.planned = true;
+        let toc_len = names.iter().try_fold(0u64, |total, name| {
+            total
+                .checked_add(20 + name.len() as u64)
+                .ok_or_else(|| StarError::Index("star index table overflow".into()))
+        })?;
+        let writer = &mut self.file;
+        writer.write_all(INDEX_MAGIC).map_err(container_io)?;
+        writer
+            .write_all(&INDEX_VERSION.to_le_bytes())
+            .map_err(container_io)?;
+        writer
+            .write_all(&(names.len() as u32).to_le_bytes())
+            .map_err(container_io)?;
+        writer
+            .write_all(&toc_len.to_le_bytes())
+            .map_err(container_io)?;
+        writer
+            .write_all(&0u64.to_le_bytes())
+            .map_err(container_io)?;
+        // Placeholder TOC, back-patched by `finish`.
+        writer
+            .write_all(vec![0u8; toc_len as usize].as_slice())
+            .map_err(container_io)?;
+        self.names = names.iter().map(|name| (*name).to_owned()).collect();
+        self.next_offset = align_u64(INDEX_HEADER_SIZE + toc_len, MMAP_ALIGNMENT);
+        Ok(())
+    }
+
+    fn write_section(&mut self, name: &str, data: &[u8]) -> std::result::Result<(), StarError> {
+        let offset = self.next_offset;
+        pad_to(&mut self.file, offset).map_err(container_io)?;
+        self.file
+            .write_all(data)
+            .map_err(|e| StarError::Index(format!("writing section {name}: {e}")))?;
+        self.next_offset = align_u64(
+            offset
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| StarError::Index("star index size overflow".into()))?,
+            MMAP_ALIGNMENT,
+        );
+        self.entries
+            .push((name.to_owned(), Section { offset, length: data.len() as u64 }));
+        Ok(())
+    }
+
+    fn stream_section(
+        &mut self,
+        name: &str,
+        stream: &mut dyn FnMut(&mut File) -> std::result::Result<u64, StarError>,
+    ) -> std::result::Result<(), StarError> {
+        let offset = self.next_offset;
+        pad_to(&mut self.file, offset).map_err(container_io)?;
+        let length = stream(&mut self.file).map_err(|e| StarError::Index(e.to_string()))?;
+        self.next_offset = align_u64(
+            offset
+                .checked_add(length)
+                .ok_or_else(|| StarError::Index("star index size overflow".into()))?,
+            MMAP_ALIGNMENT,
+        );
+        self.entries.push((name.to_owned(), Section { offset, length }));
+        Ok(())
+    }
+
+    fn section_reader(&self, name: &str) -> std::result::Result<(File, u64), StarError> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|(written, _)| written == name)
+            .ok_or_else(|| StarError::Index(format!("section {name} not written yet")))?;
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|e| StarError::Index(format!("cloning container handle: {e}")))?;
+        Ok((file, entry.1.offset))
+    }
+}
+
+impl ContainerSink {
+    /// Back-patch the table of contents with the final section layout and
+    /// flush. Sections must appear in `plan()` order — the placeholder was
+    /// sized for exactly that list.
+    fn finish(mut self) -> std::result::Result<(), StarError> {
+        if !self.planned || self.entries.len() != self.names.len() {
+            return Err(StarError::Index(
+                "container sink finished with missing sections".into(),
+            ));
+        }
+        self.file
+            .seek(SeekFrom::Start(INDEX_HEADER_SIZE))
+            .map_err(container_io)?;
+        for (name, section) in &self.entries {
+            let name_len = u16::try_from(name.len())
+                .map_err(|_| StarError::Index("star index filename is too long".into()))?;
+            self.file
+                .write_all(&name_len.to_le_bytes())
+                .map_err(container_io)?;
+            self.file
+                .write_all(&0u16.to_le_bytes())
+                .map_err(container_io)?;
+            self.file
+                .write_all(&section.offset.to_le_bytes())
+                .map_err(container_io)?;
+            self.file
+                .write_all(&section.length.to_le_bytes())
+                .map_err(container_io)?;
+            self.file
+                .write_all(name.as_bytes())
+                .map_err(container_io)?;
+        }
+        self.file.flush().map_err(container_io)?;
+        self.file.sync_all().map_err(container_io)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn load(path: impl AsRef<Path>) -> Result<StarIndex> {
     let path = path.as_ref();
     let mut file = File::open(path)?;
     let sections = read_sections(&mut file)?;
@@ -108,22 +275,18 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
     )?;
     if chr_name.len() != chr_length.len() || chr_start.len() != chr_name.len() + 1 {
         return Err(Error::InvalidFormat(
-            "rustar chromosome metadata lengths disagree".into(),
+            "star chromosome metadata lengths disagree".into(),
         ));
     }
     let n_chr_real = chr_name.len();
     let n_genome_real = chr_start[n_chr_real];
-    let n_genome = sections
-        .get("genomeParameters.txt")
-        .map(|section| read_section(&mut file, section))
-        .transpose()?
-        .and_then(|bytes| parse_genome_size(&bytes))
-        .unwrap_or(n_genome_real);
     let genome_section = required(&sections, "Genome")?;
-    if genome_section.length != n_genome {
+    // The Genome section is exactly `n_genome` bytes (padded genome, sjdb
+    // extension included) — the single source of truth for the genome length.
+    let n_genome = genome_section.length;
+    if n_genome < n_genome_real {
         return Err(Error::InvalidFormat(format!(
-            "rustar Genome section length mismatch: expected {n_genome}, got {}",
-            genome_section.length
+            "star Genome section ({n_genome}) shorter than the real genome ({n_genome_real})"
         )));
     }
     let genome_map = map_section(&file, genome_section, 0)?;
@@ -131,7 +294,7 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
     let genome = Genome {
         sequence: GenomeSeq::Mapped {
             fwd: Arc::new(genome_map),
-            n_genome: usize_from(n_genome, "rustar genome length")?,
+            n_genome: usize_from(n_genome, "star genome length")?,
         },
         n_genome,
         n_genome_real,
@@ -139,7 +302,6 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
         chr_name,
         chr_length,
         chr_start,
-        transform_blocks: None,
     };
 
     let sa_section = required(&sections, "SA")?;
@@ -160,19 +322,19 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
     let sai_header = read_section_prefix(&mut file, sai_section, 8)?;
     let nbases = u64::from_le_bytes(sai_header.try_into().unwrap());
     let nbases = u32::try_from(nbases)
-        .map_err(|_| Error::InvalidFormat("rustar SAindex nbases is too large".into()))?;
+        .map_err(|_| Error::InvalidFormat("star SAindex nbases is too large".into()))?;
     let header_len = 8u64
         .checked_add(8u64.saturating_mul(u64::from(nbases) + 1))
-        .ok_or_else(|| Error::InvalidFormat("rustar SAindex header overflow".into()))?;
+        .ok_or_else(|| Error::InvalidFormat("star SAindex header overflow".into()))?;
     if header_len > sai_section.length {
         return Err(Error::InvalidFormat(
-            "truncated rustar SAindex header".into(),
+            "truncated star SAindex header".into(),
         ));
     }
     let header = read_section_prefix(
         &mut file,
         sai_section,
-        usize_from(header_len, "rustar SAindex header")?,
+        usize_from(header_len, "star SAindex header")?,
     )?;
     let genome_sa_index_start = header[8..]
         .chunks_exact(8)
@@ -180,18 +342,18 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
         .collect::<Vec<_>>();
     let sai_data = {
         let mut sai_bytes = read_section(&mut file, sai_section)?;
-        sai_bytes.drain(..usize_from(header_len, "rustar SAindex header")?);
+        sai_bytes.drain(..usize_from(header_len, "star SAindex header")?);
         sai_bytes
     };
     let sai_word_length = gstrand_bit + 3;
     let num_indices = SaIndex::calculate_num_indices(nbases);
     let expected_sai_len = PackedArray::data_byte_len_for(
         sai_word_length,
-        usize_from(num_indices, "rustar SAindex entries")?,
+        usize_from(num_indices, "star SAindex entries")?,
     ) as u64;
     if sai_section.length - header_len != expected_sai_len {
         return Err(Error::InvalidFormat(
-            "rustar SAindex packed length mismatch".into(),
+            "star SAindex packed length mismatch".into(),
         ));
     }
     let sa_index = SaIndex {
@@ -201,10 +363,9 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
         // hottest random accesses during seeding.
         data: PackedArray::from_bytes(
             sai_word_length,
-            usize_from(num_indices, "rustar SAindex entries")?,
+            usize_from(num_indices, "star SAindex entries")?,
             sai_data,
         ),
-        word_length: sai_word_length,
         gstrand_bit,
     };
 
@@ -231,13 +392,12 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
     };
     params.sjdb_overhang = sjdb_overhang;
 
-    Ok(RustarIndex {
+    Ok(StarIndex {
         inner: GenomeIndex {
             genome,
             suffix_array,
             sa_index,
             junction_db,
-            transcriptome: None,
             prepared_junctions,
             sjdb_overhang,
         },
@@ -246,79 +406,7 @@ pub(crate) fn load(path: impl AsRef<Path>) -> Result<RustarIndex> {
 }
 
 fn default_parameters() -> Result<Parameters> {
-    Parameters::try_parse_from(["seqarc", "--readFilesIn", "reads.fastq"])
-        .map_err(|error| Error::InvalidInput(format!("rustar parameters: {error}")))
-}
-
-fn pack_directory(directory: &Path, output: &Path) -> Result<()> {
-    let mut files = std::fs::read_dir(directory)?
-        .map(|entry| {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                return Ok(None);
-            }
-            let name = entry.file_name().into_string().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 index filename")
-            })?;
-            let length = entry.metadata()?.len();
-            Ok(Some((name, entry.path(), length)))
-        })
-        .collect::<std::io::Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    if files.is_empty() {
-        return Err(Error::InvalidInput(
-            "rustar index generation produced no files".into(),
-        ));
-    }
-    let toc_len = files.iter().try_fold(0u64, |total, (name, _, _)| {
-        total
-            .checked_add(20 + name.len() as u64)
-            .ok_or_else(|| Error::InvalidInput("rustar index table overflow".into()))
-    })?;
-    let mut next_offset = align_u64(INDEX_HEADER_SIZE + toc_len, MMAP_ALIGNMENT);
-    let mut entries = Vec::with_capacity(files.len());
-    for (name, path, length) in files {
-        let offset = next_offset;
-        next_offset = align_u64(
-            offset
-                .checked_add(length)
-                .ok_or_else(|| Error::InvalidInput("rustar index size overflow".into()))?,
-            MMAP_ALIGNMENT,
-        );
-        entries.push((name, path, Section { offset, length }));
-    }
-
-    let mut writer = File::create(output)?;
-    writer.write_all(INDEX_MAGIC)?;
-    writer.write_all(&INDEX_VERSION.to_le_bytes())?;
-    writer.write_all(&(entries.len() as u32).to_le_bytes())?;
-    writer.write_all(&toc_len.to_le_bytes())?;
-    writer.write_all(&0u64.to_le_bytes())?;
-    for (name, _, section) in &entries {
-        let name_len = u16::try_from(name.len())
-            .map_err(|_| Error::InvalidInput("rustar index filename is too long".into()))?;
-        writer.write_all(&name_len.to_le_bytes())?;
-        writer.write_all(&0u16.to_le_bytes())?;
-        writer.write_all(&section.offset.to_le_bytes())?;
-        writer.write_all(&section.length.to_le_bytes())?;
-        writer.write_all(name.as_bytes())?;
-    }
-    for (_, path, section) in entries {
-        pad_to(&mut writer, section.offset)?;
-        let mut reader = File::open(path)?;
-        let copied = std::io::copy(&mut reader, &mut writer)?;
-        if copied != section.length {
-            return Err(Error::InvalidInput(
-                "rustar index component changed while packing".into(),
-            ));
-        }
-    }
-    writer.flush()?;
-    Ok(())
+    Ok(Parameters::seqarc_defaults())
 }
 
 fn read_sections(file: &mut File) -> Result<BTreeMap<String, Section>> {
@@ -326,11 +414,11 @@ fn read_sections(file: &mut File) -> Result<BTreeMap<String, Section>> {
     let mut header = [0; INDEX_HEADER_SIZE as usize];
     file.read_exact(&mut header)?;
     if &header[..8] != INDEX_MAGIC {
-        return Err(Error::InvalidFormat("bad rustar index magic".into()));
+        return Err(Error::InvalidFormat("bad star index magic".into()));
     }
     if u32::from_le_bytes(header[8..12].try_into().unwrap()) != INDEX_VERSION {
         return Err(Error::InvalidFormat(
-            "unsupported rustar index version".into(),
+            "unsupported star index version".into(),
         ));
     }
     let count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
@@ -338,18 +426,18 @@ fn read_sections(file: &mut File) -> Result<BTreeMap<String, Section>> {
     if u64::from_le_bytes(header[24..32].try_into().unwrap()) != 0
         || INDEX_HEADER_SIZE.saturating_add(toc_len) > file_len
     {
-        return Err(Error::InvalidFormat("invalid rustar index header".into()));
+        return Err(Error::InvalidFormat("invalid star index header".into()));
     }
     let toc = read_at(
         file,
         INDEX_HEADER_SIZE,
-        usize_from(toc_len, "rustar index table")?,
+        usize_from(toc_len, "star index table")?,
     )?;
     let mut cursor = 0usize;
     let mut sections = BTreeMap::new();
     for _ in 0..count {
         if cursor + 20 > toc.len() {
-            return Err(Error::InvalidFormat("truncated rustar index table".into()));
+            return Err(Error::InvalidFormat("truncated star index table".into()));
         }
         let name_len = u16::from_le_bytes(toc[cursor..cursor + 2].try_into().unwrap()) as usize;
         let flags = u16::from_le_bytes(toc[cursor + 2..cursor + 4].try_into().unwrap());
@@ -357,32 +445,32 @@ fn read_sections(file: &mut File) -> Result<BTreeMap<String, Section>> {
         let length = u64::from_le_bytes(toc[cursor + 12..cursor + 20].try_into().unwrap());
         cursor += 20;
         if flags != 0 || cursor + name_len > toc.len() {
-            return Err(Error::InvalidFormat("invalid rustar index entry".into()));
+            return Err(Error::InvalidFormat("invalid star index entry".into()));
         }
         let name = std::str::from_utf8(&toc[cursor..cursor + name_len])
-            .map_err(|_| Error::InvalidFormat("non-UTF-8 rustar index filename".into()))?
+            .map_err(|_| Error::InvalidFormat("non-UTF-8 star index filename".into()))?
             .to_owned();
         cursor += name_len;
         if name.is_empty() || name.contains('/') || name.contains('\\') {
-            return Err(Error::InvalidFormat("invalid rustar index filename".into()));
+            return Err(Error::InvalidFormat("invalid star index filename".into()));
         }
         let end = offset
             .checked_add(length)
-            .ok_or_else(|| Error::InvalidFormat("rustar index section overflow".into()))?;
+            .ok_or_else(|| Error::InvalidFormat("star index section overflow".into()))?;
         if offset < INDEX_HEADER_SIZE + toc_len || end > file_len {
             return Err(Error::InvalidFormat(
-                "rustar index section is out of bounds".into(),
+                "star index section is out of bounds".into(),
             ));
         }
         if sections.insert(name, Section { offset, length }).is_some() {
             return Err(Error::InvalidFormat(
-                "duplicate rustar index section".into(),
+                "duplicate star index section".into(),
             ));
         }
     }
     if cursor != toc.len() {
         return Err(Error::InvalidFormat(
-            "trailing rustar index table bytes".into(),
+            "trailing star index table bytes".into(),
         ));
     }
     let mut ranges = sections.values().collect::<Vec<_>>();
@@ -392,7 +480,7 @@ fn read_sections(file: &mut File) -> Result<BTreeMap<String, Section>> {
         .any(|pair| pair[0].offset + pair[0].length > pair[1].offset)
     {
         return Err(Error::InvalidFormat(
-            "overlapping rustar index sections".into(),
+            "overlapping star index sections".into(),
         ));
     }
     Ok(sections)
@@ -401,13 +489,13 @@ fn read_sections(file: &mut File) -> Result<BTreeMap<String, Section>> {
 fn required<'a>(sections: &'a BTreeMap<String, Section>, name: &str) -> Result<&'a Section> {
     sections
         .get(name)
-        .ok_or_else(|| Error::InvalidFormat(format!("missing rustar index section {name}")))
+        .ok_or_else(|| Error::InvalidFormat(format!("missing star index section {name}")))
 }
 
 fn read_text_lines(file: &mut File, section: &Section) -> Result<Vec<String>> {
     let bytes = read_section(file, section)?;
     let text = std::str::from_utf8(&bytes)
-        .map_err(|_| Error::InvalidFormat("rustar metadata is not UTF-8".into()))?;
+        .map_err(|_| Error::InvalidFormat("star metadata is not UTF-8".into()))?;
     Ok(text.lines().map(str::to_owned).collect())
 }
 
@@ -420,17 +508,6 @@ fn parse_u64_lines(bytes: &[u8], name: &str) -> Result<Vec<u64>> {
                 .map_err(|_| Error::InvalidFormat(format!("invalid integer in {name}")))
         })
         .collect()
-}
-
-fn parse_genome_size(bytes: &[u8]) -> Option<u64> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    text.lines().find_map(|line| {
-        line.strip_prefix("genomeFileSizes\t")?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-    })
 }
 
 fn parse_sjdb_info(bytes: &[u8], genome: &Genome) -> Result<(Vec<PreparedJunction>, u32)> {
@@ -501,14 +578,14 @@ fn read_section(file: &mut File, section: &Section) -> Result<Vec<u8>> {
     read_at(
         file,
         section.offset,
-        usize_from(section.length, "rustar index section")?,
+        usize_from(section.length, "star index section")?,
     )
 }
 
 fn read_section_prefix(file: &mut File, section: &Section, length: usize) -> Result<Vec<u8>> {
     if length as u64 > section.length {
         return Err(Error::InvalidFormat(
-            "truncated rustar index section".into(),
+            "truncated star index section".into(),
         ));
     }
     read_at(file, section.offset, length)
@@ -524,17 +601,17 @@ fn read_at(file: &mut File, offset: u64, length: usize) -> Result<Vec<u8>> {
 fn map_section(file: &File, section: &Section, relative_offset: u64) -> Result<Mmap> {
     if relative_offset > section.length {
         return Err(Error::InvalidFormat(
-            "rustar mmap offset exceeds section".into(),
+            "star mmap offset exceeds section".into(),
         ));
     }
     let length = section.length - relative_offset;
     if length == 0 {
-        return Err(Error::InvalidFormat("empty rustar mmap section".into()));
+        return Err(Error::InvalidFormat("empty star mmap section".into()));
     }
     unsafe {
         MmapOptions::new()
             .offset(section.offset + relative_offset)
-            .len(usize_from(length, "rustar mmap section")?)
+            .len(usize_from(length, "star mmap section")?)
             .map(file)
             .map_err(Error::from)
     }
@@ -551,22 +628,25 @@ fn advise_random(_mmap: &Mmap) {}
 fn packed_length(byte_length: u64, word_length: u32) -> Result<usize> {
     if byte_length < 8 {
         return Err(Error::InvalidFormat(
-            "rustar packed array is too short".into(),
+            "star packed array is too short".into(),
         ));
     }
     let bits = (byte_length - 8)
         .checked_mul(8)
-        .ok_or_else(|| Error::InvalidFormat("rustar packed length overflow".into()))?;
+        .ok_or_else(|| Error::InvalidFormat("star packed length overflow".into()))?;
     usize_from(
         bits.div_ceil(u64::from(word_length)) + 1,
-        "rustar packed entries",
+        "star packed entries",
     )
 }
 
-fn pad_to(file: &mut File, offset: u64) -> Result<()> {
+fn pad_to(file: &mut File, offset: u64) -> std::io::Result<()> {
     let position = file.stream_position()?;
     if position > offset {
-        return Err(Error::InvalidInput("rustar index layout overlap".into()));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "star index layout overlap",
+        ));
     }
     let mut remaining = offset - position;
     let zeros = [0u8; 8192];
@@ -603,6 +683,40 @@ mod tests {
     }
 
     #[test]
+    fn index_build_is_deterministic() {
+        // No temp paths or timestamps may leak into the container: two builds
+        // from identical inputs must be byte-identical.
+        let directory = tempfile::tempdir().unwrap();
+        let fasta = directory.path().join("genome.fa");
+        let gtf = directory.path().join("genes.gtf");
+        std::fs::write(&fasta, [b">chr1\n".as_slice(), &[b'A'; 600], b"\n"].concat()).unwrap();
+        std::fs::write(
+            &gtf,
+            b"chr1\ttest\texon\t1\t60\t.\t+\t.\tgene_id \"g1\"; transcript_id \"t1\";\n\
+chr1\ttest\texon\t301\t360\t.\t+\t.\tgene_id \"g1\"; transcript_id \"t1\";\n",
+        )
+        .unwrap();
+        let options = GenomeIndexBuildOptions {
+            temp_dir: Some(directory.path().to_path_buf()),
+            aligner: crate::AlignerKind::Star,
+            threads: 1,
+            star_gtf: Some(gtf),
+            star_sjdb_overhang: 30,
+            star_sa_sparse_d: 1,
+            star_sa_index_nbases: 3,
+            star_chr_bin_nbits: 8,
+        };
+        let one = directory.path().join("one.seqarc-index");
+        let two = directory.path().join("two.seqarc-index");
+        build(&fasta, &one, &options).unwrap();
+        build(&fasta, &two, &options).unwrap();
+        assert_eq!(
+            std::fs::read(&one).unwrap(),
+            std::fs::read(&two).unwrap(),
+        );
+    }
+
+    #[test]
     fn single_file_index_loads_and_aligns_across_a_splice() {
         let directory = tempfile::tempdir().unwrap();
         let fasta = directory.path().join("genome.fa");
@@ -632,13 +746,13 @@ chr1\ttest\texon\t165\t224\t.\t+\t.\tgene_id \"g1\"; transcript_id \"t1\";\n",
         .unwrap();
         let options = GenomeIndexBuildOptions {
             temp_dir: Some(directory.path().to_path_buf()),
-            aligner: crate::AlignerKind::Rustar,
+            aligner: crate::AlignerKind::Star,
             threads: 1,
-            rustar_gtf: Some(gtf),
-            rustar_sjdb_overhang: 30,
-            rustar_sa_sparse_d: 1,
-            rustar_sa_index_nbases: 3,
-            rustar_chr_bin_nbits: 8,
+            star_gtf: Some(gtf),
+            star_sjdb_overhang: 30,
+            star_sa_sparse_d: 1,
+            star_sa_index_nbases: 3,
+            star_chr_bin_nbits: 8,
         };
 
         build(&fasta, &output, &options).unwrap();
@@ -650,10 +764,10 @@ chr1\ttest\texon\t165\t224\t.\t+\t.\tgene_id \"g1\"; transcript_id \"t1\";\n",
         let encoded = read
             .iter()
             .copied()
-            .map(rustar_aligner::io::fastq::encode_base)
+            .map(crate::star::io::fastq::encode_base)
             .collect::<Vec<_>>();
         let (transcripts, _, _, _) =
-            rustar_aligner::align::align_read(&encoded, "spliced", &index.inner, &index.params)
+            crate::star::align::align_read(&encoded, "spliced", &index.inner, &index.params)
                 .unwrap();
         assert!(transcripts.iter().any(|transcript| {
             transcript
@@ -750,13 +864,13 @@ chr1\ttest\texon\t119\t178\t.\t+\t.\tgene_id \"g1\"; transcript_id \"t1\";\n",
         .unwrap();
         let options = GenomeIndexBuildOptions {
             temp_dir: Some(directory.path().to_path_buf()),
-            aligner: crate::AlignerKind::Rustar,
+            aligner: crate::AlignerKind::Star,
             threads: 1,
-            rustar_gtf: Some(gtf),
-            rustar_sjdb_overhang: 30,
-            rustar_sa_sparse_d: 1,
-            rustar_sa_index_nbases: 3,
-            rustar_chr_bin_nbits: 8,
+            star_gtf: Some(gtf),
+            star_sjdb_overhang: 30,
+            star_sa_sparse_d: 1,
+            star_sa_index_nbases: 3,
+            star_chr_bin_nbits: 8,
         };
 
         build(&fasta, &output, &options).unwrap();
@@ -768,10 +882,10 @@ chr1\ttest\texon\t119\t178\t.\t+\t.\tgene_id \"g1\"; transcript_id \"t1\";\n",
         let encoded = read
             .iter()
             .copied()
-            .map(rustar_aligner::io::fastq::encode_base)
+            .map(crate::star::io::fastq::encode_base)
             .collect::<Vec<_>>();
         let (transcripts, _, _, _) =
-            rustar_aligner::align::align_read(&encoded, "spliced", &index.inner, &index.params)
+            crate::star::align::align_read(&encoded, "spliced", &index.inner, &index.params)
                 .unwrap();
         assert!(
             transcripts.iter().any(|transcript| {

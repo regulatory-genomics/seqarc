@@ -1,11 +1,3 @@
-#[cfg(not(unix))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Timeval {
-    pub tv_sec: i64,
-    pub tv_usec: i64,
-}
-
-
 const fn make_kom_nt4_table() -> [u8; 256] {
     let mut table = [4u8; 256];
     table[0] = 0;

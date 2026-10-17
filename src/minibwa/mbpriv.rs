@@ -1,13 +1,9 @@
 #![allow(unused_variables)]
 
-use crate::minibwa::options::{MapOpts, MB_F_ADAP, MB_F_LONG};
+use crate::minibwa::options::{MapOpts, MB_F_ADAP};
 use std::sync::atomic::AtomicI32;
 
 pub(crate) const MB_DBG_ALN_SEQ: i32 = 0x1;
-pub(crate) const MB_DBG_ANCHOR: i32 = 0x2;
-pub(crate) const MB_DBG_SEED: i32 = 0x4;
-pub(crate) const MB_DBG_QNAME: i32 = 0x8;
-pub(crate) const MB_DBG_ALN_PE: i32 = 0x10;
 pub(crate) const MB_DBG_AN_POS: i32 = 0x20;
 
 /// Original C global variable `kom_dbg_flag` from `minibwa/kommon.c:7`.
@@ -63,7 +59,7 @@ pub(crate) fn mb_seq_rev(len: u32, seq: &mut [u8]) {
 
 /// Original C static function `mb_is_sr_mode` from `minibwa/mbpriv.h:134`.
 pub(crate) fn mb_is_sr_mode(opt: &MapOpts, qlen: i32) -> i32 {
-    if (opt.flag & MB_F_LONG) != 0 || ((opt.flag & MB_F_ADAP) != 0 && qlen > opt.max_sr_len) {
+    if (opt.flag & MB_F_ADAP) != 0 && qlen > opt.max_sr_len {
         0
     } else {
         1
@@ -73,7 +69,7 @@ pub(crate) fn mb_is_sr_mode(opt: &MapOpts, qlen: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::minibwa::options::{mb_opt_init, mb_opt_preset};
+    use crate::minibwa::options::mb_opt_init;
 
     #[test]
     fn hash_helpers_match_known_vectors() {
@@ -102,7 +98,5 @@ mod tests {
         mb_opt_init(&mut opt);
         assert_eq!(mb_is_sr_mode(&opt, 100), 1);
         assert_eq!(mb_is_sr_mode(&opt, 1000), 0);
-        mb_opt_preset(&mut opt, "lr");
-        assert_eq!(mb_is_sr_mode(&opt, 100), 0);
     }
 }

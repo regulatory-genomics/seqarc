@@ -10,14 +10,6 @@ use crate::minibwa::mapped_u64::U64Storage;
 
 const L2B_MAGIC: &[u8; 4] = b"L2B\x01";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum L2bMeth {
-    #[default]
-    None = 0,
-    C2t = 1,
-    G2a = 2,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct L2bCtg {
     pub name: String,
@@ -93,39 +85,6 @@ pub(crate) fn l2b_intv2cid(l2b: &L2b, st: u64, en: u64, cst: &mut i64, rev: &mut
     l2b_pos2cid(l2b, s, (en - st) as i64, cst)
 }
 
-/// Original C global function `l2b_intv2cid_meth` from `minibwa/l2bit.c:36`.
-pub(crate) fn l2b_intv2cid_meth(
-    l2b: &L2b,
-    st: u64,
-    en: u64,
-    mt: &mut L2bMeth,
-    cst: &mut i64,
-    rev: &mut i32,
-) -> i64 {
-    assert!(st < en);
-    let len = (en - st) as i64;
-    let tot_len = l2b.tot_len;
-    if en > tot_len * 4 {
-        return -3;
-    }
-    let copy = (st / tot_len) as i32;
-    *mt = if copy == 0 || copy == 3 {
-        L2bMeth::C2t
-    } else {
-        L2bMeth::G2a
-    };
-    *rev = (copy >= 2) as i32;
-    let mut s = (st - tot_len * copy as u64) as i64;
-    if copy >= 2 {
-        s = tot_len as i64 - len - s;
-    }
-    if s < 0 {
-        -2
-    } else {
-        l2b_pos2cid(l2b, s, len, cst)
-    }
-}
-
 /// Original C global function `l2b_getseq` from `minibwa/l2bit.c:29`.
 pub(crate) fn l2b_getseq(l2b: &L2b, tid: i64, mut st: i64, mut en: i64, seq: &mut [u8]) -> i64 {
     if tid < 0 || tid >= l2b.n_ctg as i64 {
@@ -189,38 +148,10 @@ pub(crate) fn l2b_getseq(l2b: &L2b, tid: i64, mut st: i64, mut en: i64, seq: &mu
     en - st
 }
 
-/// Original C global function `l2b_meth_convert` from `minibwa/l2bit.c:93`.
-pub(crate) fn l2b_meth_convert(mt: L2bMeth, len: i64, seq: &mut [u8]) {
-    if mt == L2bMeth::C2t {
-        for i in 0..len as usize {
-            if seq[i] == 1 {
-                seq[i] = 3;
-            }
-        }
-    } else if mt == L2bMeth::G2a {
-        for i in 0..len as usize {
-            if seq[i] == 2 {
-                seq[i] = 0;
-            }
-        }
-    }
-}
-
 /// Original C static function `l2b_get0` from `minibwa/l2bit.h:43`.
 #[inline(always)]
 pub(crate) fn l2b_get0(l2b: &L2b, i: u64) -> i32 {
     ((l2b.pac[(i >> 5) as usize] >> ((i & 31) << 1)) & 3) as i32
-}
-
-/// Original C static function `l2b_meth_rev` from `minibwa/l2bit.h:54`.
-pub(crate) fn l2b_meth_rev(mt: L2bMeth) -> L2bMeth {
-    if mt == L2bMeth::None {
-        L2bMeth::None
-    } else if mt == L2bMeth::C2t {
-        L2bMeth::G2a
-    } else {
-        L2bMeth::C2t
-    }
 }
 
 /// Original C global function `l2b_getambi` from `minibwa/l2bit.c:56`.
@@ -715,74 +646,6 @@ pub(crate) fn l2b_save_pac<P: AsRef<Path>>(fn_: P, l2b: &L2b, both_strand: i32) 
     0
 }
 
-/// Original C static function `l2b_c2t` from `minibwa/l2bit.c:321`.
-pub(crate) fn l2b_c2t(b: u8) -> u8 {
-    if b == 1 {
-        3
-    } else {
-        b
-    }
-}
-
-/// Original C static function `l2b_g2a` from `minibwa/l2bit.c:322`.
-pub(crate) fn l2b_g2a(b: u8) -> u8 {
-    if b == 2 {
-        0
-    } else {
-        b
-    }
-}
-
-/// Original C global function `l2b_save_pac_meth` from `minibwa/l2bit.c:324`.
-pub(crate) fn l2b_save_pac_meth<P: AsRef<Path>>(fn_: P, l2b: &L2b, both_strand: i32) -> i32 {
-    let fn_ = c_path(fn_);
-    let path = fn_.to_string_lossy();
-    let mut fp: Box<dyn Write> = if path == "-" {
-        Box::new(io::stdout())
-    } else {
-        match File::create(&fn_) {
-            Ok(fp) => Box::new(fp),
-            Err(_) => return -1,
-        }
-    };
-    let mut len = l2b.tot_len * 2;
-    if both_strand != 0 {
-        len *= 2;
-    }
-    let n_pac = (len + 3) / 4;
-    let mut pac = vec![0u8; n_pac as usize];
-    let mut x = 0u64;
-    for i in 0..l2b.tot_len {
-        let b = l2b_c2t(l2b_get0(l2b, i) as u8);
-        pac[(x >> 2) as usize] |= b << ((!x & 3) * 2);
-        x += 1;
-    }
-    for i in 0..l2b.tot_len {
-        let b = l2b_g2a(l2b_get0(l2b, i) as u8);
-        pac[(x >> 2) as usize] |= b << ((!x & 3) * 2);
-        x += 1;
-    }
-    if both_strand != 0 {
-        for i in (0..l2b.tot_len).rev() {
-            let b = 3 - l2b_g2a(l2b_get0(l2b, i) as u8);
-            pac[(x >> 2) as usize] |= b << ((!x & 3) * 2);
-            x += 1;
-        }
-        for i in (0..l2b.tot_len).rev() {
-            let b = 3 - l2b_c2t(l2b_get0(l2b, i) as u8);
-            pac[(x >> 2) as usize] |= b << ((!x & 3) * 2);
-            x += 1;
-        }
-    }
-    let n_write = (x >> 2) + if (x & 3) == 0 { 0 } else { 1 };
-    let _ = fp.write_all(&pac[..n_write as usize]);
-    if x % 4 == 0 {
-        let _ = fp.write_all(&[0]);
-    }
-    let _ = fp.write_all(&[(x % 4) as u8]);
-    0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,17 +726,4 @@ mod tests {
         assert_eq!(l2b.ctg[0].comm.as_deref(), Some("comment"));
     }
 
-    #[test]
-    fn save_pac_meth_emits_expected_small_packed_sequence() {
-        let mut l2b = L2b::default();
-        let mut seq = b"ACGT".to_vec();
-        let mut rng = 3;
-        l2b_format_seq(seq.len() as u64, &mut seq, &mut rng);
-        l2b_add_seq(&mut l2b, seq.len() as u64, &seq, "s", None, &mut rng);
-        let path = std::env::temp_dir().join("minibwa-rs-small-meth.pac");
-        assert_eq!(l2b_save_pac_meth(&path, &l2b, 1), 0);
-        let bytes = std::fs::read(&path).expect("read meth pac");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(bytes, vec![0x3b, 0x13, 0x3b, 0x13, 0, 0]);
-    }
 }

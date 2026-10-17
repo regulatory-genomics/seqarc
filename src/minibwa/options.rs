@@ -1,16 +1,8 @@
 #![allow(unused_variables)]
 
-pub(crate) const MB_F_PE: u64 = 0x8;
-pub(crate) const MB_F_LONG: u64 = 0x10;
-pub(crate) const MB_F_EQX: u64 = 0x20;
-pub(crate) const MB_F_NO_KALLOC: u64 = 0x40;
 pub(crate) const MB_F_NO_ALN: u64 = 0x80;
-pub(crate) const MB_F_WRITE_DS: u64 = 0x200;
-pub(crate) const MB_F_WRITE_CS: u64 = 0x400;
-pub(crate) const MB_F_WRITE_MD: u64 = 0x800;
 pub(crate) const MB_F_ADAP: u64 = 0x4000;
 pub(crate) const MB_F_PRIMARY5: u64 = 0x8000;
-pub(crate) const MB_F_METH: u64 = 0x20000;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MapOpts {
@@ -32,7 +24,6 @@ pub(crate) struct MapOpts {
     pub best_n: i32,
     pub a: i32,
     pub b: i32,
-    pub b_ts: i32,
     pub b_ambi: i32,
     pub q: i32,
     pub q2: i32,
@@ -43,13 +34,6 @@ pub(crate) struct MapOpts {
     pub zdrop: i32,
     pub zdrop_inv: i32,
     pub min_ksw_len: i32,
-    pub max_pe_ins: i32,
-    pub max_rescue: i32,
-    pub pen_unpair: i32,
-    pub pe_avg: i32,
-    pub pe_std: i32,
-    pub pe_lo: i32,
-    pub pe_hi: i32,
     pub sb_len: i32,
     pub sb_seq: i32,
     pub n_thread: i32,
@@ -58,9 +42,7 @@ pub(crate) struct MapOpts {
     pub seed: i32,
     pub xa_max: i32,
     pub mb_size: i64,
-    pub max_mb_size: i64,
     pub max_sw_mat: i64,
-    pub cap_kalloc: i64,
 }
 
 /// Original C static function `mb_opt_reset` from `minibwa/options.c:5`.
@@ -84,13 +66,6 @@ pub(crate) fn mb_opt_reset(opt: &mut MapOpts) {
     opt.e = 2;
     opt.e2 = 1;
     opt.b_ambi = 1;
-    opt.max_pe_ins = 10000;
-    opt.max_rescue = 10;
-    opt.pen_unpair = 17;
-    opt.pe_avg = 400;
-    opt.pe_std = 100;
-    opt.pe_lo = 50;
-    opt.pe_hi = 800;
     opt.sb_len = 1000000;
     opt.sb_seq = 24;
     opt.n_thread = 1;
@@ -98,59 +73,26 @@ pub(crate) fn mb_opt_reset(opt: &mut MapOpts) {
     opt.out_s = 0.8;
     opt.xa_max = 5;
     opt.max_sw_mat = 100000000;
-    opt.cap_kalloc = 1i64 << 28;
-    opt.max_mb_size = 1000000000;
-    opt.flag |= MB_F_NO_KALLOC;
 }
 
 /// Original C global function `mb_opt_init` from `minibwa/options.c:46`.
+///
+/// Applies the `adap` (short-read, adapter-aware) preset inline; the `sr` and
+/// `lr` presets had no callers and were dropped. Unlike the C original, the
+/// `MB_F_PE` bit is not set: paired-end pairing was removed.
 pub(crate) fn mb_opt_init(opt: &mut MapOpts) {
     mb_opt_reset(opt);
-    mb_opt_preset(opt, "adap");
-}
-
-/// Original C global function `mb_opt_preset` from `minibwa/options.c:52`.
-pub(crate) fn mb_opt_preset(opt: &mut MapOpts, preset: &str) -> i32 {
-    mb_opt_reset(opt);
-    let preset = preset
-        .as_bytes()
-        .iter()
-        .position(|&c| c == 0)
-        .map(|end| &preset[..end])
-        .unwrap_or(preset);
-    if preset == "sr" || preset == "adap" {
-        opt.flag |= MB_F_PE;
-        if preset == "adap" {
-            opt.flag |= MB_F_ADAP;
-        }
-        opt.min_dp_max = 30;
-        opt.flag |= MB_F_ADAP;
-        opt.bw = 100;
-        opt.max_gap = 100;
-        opt.zdrop = 80;
-        opt.zdrop_inv = 80;
-        opt.best_n = 50;
-        opt.end_bonus = 10;
-        opt.min_chain_score = 25;
-        opt.min_ksw_len = 20;
-        opt.mb_size = 100000000;
-    } else if preset == "lr" {
-        opt.flag |= MB_F_LONG;
-        opt.flag &= !MB_F_PE;
-        opt.min_dp_max = 50;
-        opt.bw = 500;
-        opt.max_gap = 5000;
-        opt.zdrop = 400;
-        opt.zdrop_inv = 240;
-        opt.best_n = 5;
-        opt.end_bonus = -1;
-        opt.min_chain_score = 40;
-        opt.min_ksw_len = 200;
-        opt.mb_size = 500000000;
-    } else {
-        return -1;
-    }
-    0
+    opt.flag |= MB_F_ADAP;
+    opt.min_dp_max = 30;
+    opt.bw = 100;
+    opt.max_gap = 100;
+    opt.zdrop = 80;
+    opt.zdrop_inv = 80;
+    opt.best_n = 50;
+    opt.end_bonus = 10;
+    opt.min_chain_score = 25;
+    opt.min_ksw_len = 20;
+    opt.mb_size = 100000000;
 }
 
 /// Original C global function `mb_opt_adap` from `minibwa/options.c:88`.
@@ -203,10 +145,7 @@ mod tests {
     fn adap_preset_matches_original_defaults() {
         let mut opt = MapOpts::default();
         mb_opt_init(&mut opt);
-        assert_eq!(
-            opt.flag & (MB_F_PE | MB_F_ADAP | MB_F_NO_KALLOC),
-            MB_F_PE | MB_F_ADAP | MB_F_NO_KALLOC
-        );
+        assert_eq!(opt.flag & MB_F_ADAP, MB_F_ADAP);
         assert_eq!(opt.min_len, 19);
         assert_eq!(opt.bw, 100);
         assert_eq!(opt.max_gap, 100);
@@ -214,31 +153,6 @@ mod tests {
         assert_eq!(opt.zdrop_inv, 80);
         assert_eq!(opt.best_n, 50);
         assert_eq!(opt.mb_size, 100000000);
-    }
-
-    #[test]
-    fn lr_preset_matches_original_defaults() {
-        let mut opt = MapOpts::default();
-        assert_eq!(mb_opt_preset(&mut opt, "lr"), 0);
-        assert_ne!(opt.flag & MB_F_LONG, 0);
-        assert_eq!(opt.flag & MB_F_PE, 0);
-        assert_eq!(opt.bw, 500);
-        assert_eq!(opt.max_gap, 5000);
-        assert_eq!(opt.zdrop, 400);
-        assert_eq!(opt.zdrop_inv, 240);
-        assert_eq!(opt.best_n, 5);
-        assert_eq!(opt.end_bonus, -1);
-        assert_eq!(opt.mb_size, 500000000);
-    }
-
-    #[test]
-    fn preset_names_stop_at_embedded_nul_like_strcmp() {
-        let mut opt = MapOpts::default();
-        assert_eq!(mb_opt_preset(&mut opt, "lr\0hidden"), 0);
-        assert_ne!(opt.flag & MB_F_LONG, 0);
-        assert_eq!(mb_opt_preset(&mut opt, "adap\0hidden"), 0);
-        assert_ne!(opt.flag & MB_F_ADAP, 0);
-        assert_eq!(mb_opt_preset(&mut opt, "bad\0lr"), -1);
     }
 
     #[test]

@@ -4,25 +4,22 @@ use crate::minibwa::align::mb_align_skeleton_with_scratch;
 use crate::minibwa::bwt::{Bwt, SeedHit};
 use crate::minibwa::bwt::{SeedHitVec, mb_sai_v_clear};
 use crate::minibwa::kommon::KOM_NT4_TABLE;
-use crate::minibwa::l2bit::{l2b_meth_convert, L2bMeth, L2b};
+use crate::minibwa::l2bit::L2b;
 use crate::minibwa::lchain::{Mb128, Anchor, mb_lchain_dp, radix_sort_mb128x};
 use crate::minibwa::mbpriv::{
-    mb_cstr_prefix, mb_hash64, mb_hash_str, mb_is_sr_mode, KOM_DBG_FLAG, MB_DBG_ANCHOR,
-    MB_DBG_QNAME, MB_DBG_SEED,
+    mb_hash64, mb_hash_str, mb_is_sr_mode,
 };
-use crate::minibwa::options::{mb_opt_adap, MapOpts, MB_F_METH, MB_F_NO_ALN, MB_F_PE, MB_F_PRIMARY5};
-use crate::minibwa::pe::{Hit, mb_pair, Pestat};
+use crate::minibwa::options::{mb_opt_adap, MapOpts, MB_F_NO_ALN, MB_F_PRIMARY5};
+use crate::minibwa::pe::Hit;
 use crate::minibwa::seed::{
     mb_anchor_sort, AnchorVec, mb_anchor_with_scratch, mb_seed_intv_batch,
 };
-use std::sync::atomic::Ordering;
 
 pub(crate) const MB_PARENT_UNSET: i32 = -1;
 pub(crate) const MB_PARENT_TMP_PRI: i32 = -2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MapIndex {
-    pub is_meth: i32,
     pub l2b: L2b,
     pub bwt: Bwt,
 }
@@ -141,30 +138,12 @@ pub(crate) fn mb_cal_high_cov(n: i32, sai: &[SeedHit], max_occ: i32) -> i32 {
 }
 
 /// Original C global function `mb_sync_high_cov` from `minibwa/map-algo.c:165`.
-pub(crate) fn mb_sync_high_cov(n: i32, h: &mut [Hit]) {
-    let mut max_frac = 0u8;
-    for x in h.iter().take(n as usize) {
-        max_frac = max_frac.max(x.frac_high());
-    }
-    for x in h.iter_mut().take(n as usize) {
-        x.set_frac_high(max_frac);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::minibwa::l2bit::{L2bCtg, L2b};
     use crate::minibwa::options::{mb_opt_init, MapOpts};
     use crate::minibwa::pe::Extra;
-
-    #[test]
-    fn debug_qname_helpers_use_c_string_boundaries() {
-        assert_eq!(dbg_qname_or_star(Some("read\0hidden")), "read");
-        assert_eq!(dbg_qname_or_star(None), "*");
-        assert_eq!(dbg_qname_printf(Some("read\0hidden")), "read");
-        assert_eq!(dbg_qname_printf(None), "(null)");
-    }
 
     #[test]
     fn mblen_and_hit_coordinates_match_anchor_chain() {
@@ -1042,10 +1021,6 @@ pub(crate) fn mb_set_mapq(
             }
             mapq -= (4.343f64 * ((r.n_sub + 1) as f64).ln() + 0.499) as i32;
             mapq = mapq.max(0);
-            if r.seed_ratio() < 50 {
-                let sr = r.seed_ratio() as f64;
-                mapq = (mapq as f64 * sr * sr / 2500.0) as i32;
-            }
             r.mapq = mapq.min(60);
             if let Some(p) = &r.p {
                 if p.dp_max > p.dp_max2 && r.mapq == 0 {
@@ -1059,60 +1034,12 @@ pub(crate) fn mb_set_mapq(
     mb_set_inv_mapq(n_regs, regs);
 }
 
-/// Original C static function `mb_dbg_seed` from `minibwa/map-algo.c:513`.
-fn dbg_qname_or_star(qname: Option<&str>) -> &str {
-    qname.map(mb_cstr_prefix).unwrap_or("*")
-}
-
-fn dbg_qname_printf(qname: Option<&str>) -> &str {
-    qname.map(mb_cstr_prefix).unwrap_or("(null)")
-}
-
-pub(crate) fn mb_dbg_seed(n: i64, u: &[SeedHit], qname: Option<&str>) {
-    let name = dbg_qname_or_star(qname);
-    for p in u.iter().take(n as usize) {
-        eprintln!(
-            "SD\t{}\t{}\t{}\t{}",
-            name,
-            (p.info >> 32) as i32,
-            p.info as u32 as i32,
-            p.size as i64
-        );
-    }
-}
-
-/// Original C static function `mb_dbg_anchor` from `minibwa/map-algo.c:522`.
-pub(crate) fn mb_dbg_anchor(idx: &MapIndex, qlen: i32, n: i64, a: &[Anchor], qname: Option<&str>) {
-    let name = qname.map(mb_cstr_prefix).unwrap_or("*");
-    for ai in a.iter().take(n as usize) {
-        let rid = (ai.sid >> 1) as usize;
-        let rev = ai.sid & 1;
-        let qs = if rev != 0 {
-            qlen - 1 - ai.qpos
-        } else {
-            ai.qpos + 1 - ai.len
-        };
-        let ts = ai.tpos + 1 - ai.len as i64;
-        let strand = if rev != 0 { '-' } else { '+' };
-        eprintln!(
-            "AC\t{}\t{}\t{}\t{}\t{}\t{}",
-            name,
-            qs,
-            strand,
-            mb_cstr_prefix(&idx.l2b.ctg[rid].name),
-            ts,
-            ai.len
-        );
-    }
-}
-
 /// Original C global function `mb_map_sai` from `minibwa/map-algo.c:535`.
 pub(crate) fn mb_map_sai(
     opt: &MapOpts,
     idx: &MapIndex,
     qlen: i64,
     seq0: &str,
-    mt: L2bMeth,
     u: &mut SeedHitVec,
     n_hit_: &mut i32,
     b: &mut MapBuffer,
@@ -1125,6 +1052,8 @@ pub(crate) fn mb_map_sai(
         mb_sai_v_clear(u);
         return Vec::new();
     }
+    // Seeds the per-hit tie-break hash in `mb_gen_hit`; the query name is the
+    // only functional use of `qname` (the debug printers were removed).
     let mut hash = qname.map(mb_hash_str).unwrap_or(0);
     hash ^= (mb_hash64(qlen as u64).wrapping_add(mb_hash64(opt.seed as u64))) as u32;
     hash = mb_hash64(hash as u64) as u32;
@@ -1139,35 +1068,21 @@ pub(crate) fn mb_map_sai(
     let chn_pen_gap = opt.chain_gap_scale * 0.01 * opt.min_len as f32;
 
     let mut v = std::mem::take(&mut b.anchor_v);
-    if (KOM_DBG_FLAG.load(Ordering::Relaxed) & MB_DBG_QNAME) != 0 {
-        eprintln!("QN\t{}", dbg_qname_printf(qname));
-    }
-    if (KOM_DBG_FLAG.load(Ordering::Relaxed) & MB_DBG_SEED) != 0 {
-        mb_dbg_seed(u.n as i64, &u.a, qname);
-    }
-    let seed_ratio =  {
-        mb_anchor_with_scratch(idx,
-            u,
-            opt.min_len,
-            qlen as i32,
-            &seq,
-            mt,
-            opt.max_occ,
-            &mut v,
-            &mut b.anchor_aux,
-            &mut b.anchor_sa,
-            &mut b.anchor_sa_batch,
-            &mut b.anchor_batch,
-        )
-    };
+    mb_anchor_with_scratch(idx,
+        u,
+        qlen as i32,
+        opt.max_occ,
+        &mut v,
+        &mut b.anchor_aux,
+        &mut b.anchor_sa,
+        &mut b.anchor_sa_batch,
+        &mut b.anchor_batch,
+    );
     mb_sai_v_clear(u);
 
     let mut n_hit = 0;
     let mut w = std::mem::take(&mut b.chain_w);
     w.clear();
-    if (KOM_DBG_FLAG.load(Ordering::Relaxed) & MB_DBG_ANCHOR) != 0 {
-        mb_dbg_anchor(idx, qlen as i32, v.n, &v.a, qname);
-    }
     let anchors = std::mem::take(&mut v.a);
     let mut a =  {
         mb_lchain_dp(&idx.l2b,
@@ -1248,7 +1163,6 @@ pub(crate) fn mb_map_sai(
                 idx,
                 qlen as i32,
                 &seq,
-                mt,
                 &mut n_hit,
                 &mut hit,
                 &mut a,
@@ -1272,8 +1186,6 @@ pub(crate) fn mb_map_sai(
     }
         for h in hit.iter_mut().take(n_hit as usize) {
             h.set_frac_high((255.0 * hi_cov as f64 / qlen as f64) as u8);
-            let sr = (255.0 * seed_ratio + 0.499) as u8;
-            h.set_seed_ratio(sr.max(1));
         }
         mb_set_mapq(qlen as i32,
             n_hit,
@@ -1321,10 +1233,6 @@ pub(crate) fn mb_map_batch(
     if n_seq <= 0 {
         return Vec::new();
     }
-    let is_meth = ((opt.flag & MB_F_METH) != 0) as i32;
-    if is_meth != 0 && idx.is_meth == 0 {
-        return Vec::new();
-    }
     let mut owned;
     let b = if let Some(b) = b0 {
         b
@@ -1332,7 +1240,6 @@ pub(crate) fn mb_map_batch(
         owned = mb_tbuf_init();
         &mut owned
     };
-    let is_pe = ((opt.flag & MB_F_PE) != 0) as i32;
     let mut hit = vec![Vec::new(); n_seq as usize];
     let sb_max = opt.sb_seq.min(n_seq).max(0) as usize;
     let mut sai = vec![SeedHitVec::default(); sb_max.max(1)];
@@ -1351,13 +1258,6 @@ pub(crate) fn mb_map_batch(
             }
             for k in 0..sb_n as usize {
                 let idx_k = sb_st as usize + k;
-                let mt = if is_meth == 0 {
-                    L2bMeth::None
-                } else if is_pe == 0 || (idx_k & 1) == 0 {
-                    L2bMeth::C2t
-                } else {
-                    L2bMeth::G2a
-                };
                 seq4[k].clear();
                 seq4[k].extend(
                     seq[idx_k]
@@ -1365,9 +1265,6 @@ pub(crate) fn mb_map_batch(
                         .take(qlen[idx_k] as usize)
                         .map(|c| KOM_NT4_TABLE[c as usize]),
                 );
-                if mt != L2bMeth::None {
-                    l2b_meth_convert(mt, qlen[idx_k] as i64, &mut seq4[k]);
-                }
                 sai[k] = SeedHitVec::default();
             }
             let mut seq4_refs = seq4[..sb_n as usize]
@@ -1390,20 +1287,12 @@ pub(crate) fn mb_map_batch(
                 let idx_k = sb_st as usize + k;
                 let mut opt_adap = MapOpts::default();
                 mb_opt_adap(opt, qlen[idx_k], &mut opt_adap);
-                let mt = if is_meth == 0 {
-                    L2bMeth::None
-                } else if is_pe == 0 || (idx_k & 1) == 0 {
-                    L2bMeth::C2t
-                } else {
-                    L2bMeth::G2a
-                };
                 let name = qname.and_then(|names| names.get(idx_k).copied());
                 hit[idx_k] = mb_map_sai(
                     &opt_adap,
                     idx,
                     qlen[idx_k] as i64,
                     seq[idx_k],
-                    mt,
                     &mut sai[k],
                     &mut n_hit[idx_k],
                     b,
@@ -1417,40 +1306,6 @@ pub(crate) fn mb_map_batch(
             sb_len += qlen[i as usize];
         }
         i += 1;
-    }
-    if is_pe != 0 && n_seq >= 2 {
-        let mut pes = [Pestat {
-            failed: 1,
-            ..Default::default()
-        }; 4];
-        pes[1].failed = 0;
-        pes[1].avg = opt.pe_avg as f64;
-        pes[1].std = opt.pe_std as f64;
-        pes[1].lo = opt.pe_lo;
-        pes[1].hi = opt.pe_hi;
-        let mut i = 0usize;
-        while i + 1 < n_seq as usize {
-            let len2 = [qlen[i], qlen[i + 1]];
-            let seq2 = [seq[i], seq[i + 1]];
-            let (left, right) = hit.split_at_mut(i + 1);
-            let mut pair_hit = [std::mem::take(&mut left[i]), std::mem::take(&mut right[0])];
-            let mut pair_n_hit = [n_hit[i], n_hit[i + 1]];
-            mb_pair(&mut b.ksw,
-                opt,
-                &idx.l2b,
-                &mut pair_n_hit,
-                &mut pair_hit,
-                &pes,
-                len2,
-                seq2,
-            );
-            n_hit[i] = pair_n_hit[0];
-            n_hit[i + 1] = pair_n_hit[1];
-            let (left, right) = hit.split_at_mut(i + 1);
-            left[i] = std::mem::take(&mut pair_hit[0]);
-            right[0] = std::mem::take(&mut pair_hit[1]);
-            i += 2;
-        }
     }
     hit
 }

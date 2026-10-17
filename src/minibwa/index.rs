@@ -8,7 +8,7 @@ use crate::minibwa::bwtgen::mb_bwtgen;
 use crate::minibwa::ketopt::{ketopt, KoLongOpt, KETOPT_INIT};
 use crate::minibwa::kommon::{kom_atoi, kom_atol, kom_panic, kom_parse_num};
 use crate::minibwa::l2bit::{
-    l2b_get0, l2b_import, l2b_save, l2b_save_pac, l2b_save_pac_meth, L2b,
+    l2b_get0, l2b_import, l2b_save, l2b_save_pac, L2b,
 };
 use rayon::prelude::*;
 
@@ -38,24 +38,6 @@ fn use_parallel_index_post(n_thread: i32, len: usize) -> bool {
 
 fn c_arg(s: &str) -> &str {
     s.split_once('\0').map_or(s, |(prefix, _)| prefix)
-}
-
-/// Original C static function `l2b_c2t` from `minibwa/index.c:17`.
-pub(crate) fn l2b_c2t(b: u8) -> u8 {
-    if b == 1 {
-        3
-    } else {
-        b
-    }
-}
-
-/// Original C static function `l2b_g2a` from `minibwa/index.c:18`.
-pub(crate) fn l2b_g2a(b: u8) -> u8 {
-    if b == 2 {
-        0
-    } else {
-        b
-    }
 }
 
 #[cfg(target_arch = "x86")]
@@ -157,68 +139,6 @@ fn mb_l2b_fill_reverse_complement_2bit(seq: &mut [u8], l2b: &L2b) -> usize {
     while src_end > 0 {
         src_end -= 1;
         seq[dst] = 3 - l2b_get0(l2b, src_end as u64) as u8;
-        dst += 1;
-    }
-    len
-}
-
-#[inline]
-fn mb_l2b_fill_forward_meth_2bit(seq: &mut [u8], l2b: &L2b, is_g2a: bool) -> usize {
-    let len = l2b.tot_len as usize;
-    let mut i = 0usize;
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        let simd_len = len & !63usize;
-        let src = l2b.pac.as_ptr() as *const u8;
-        while i < simd_len {
-            unsafe { mb_unpack_2bit_16bytes_sse2(src.add(i >> 2), seq.as_mut_ptr().add(i)) };
-            for b in &mut seq[i..i + 64] {
-                if is_g2a {
-                    *b = l2b_g2a(*b);
-                } else {
-                    *b = l2b_c2t(*b);
-                }
-            }
-            i += 64;
-        }
-    }
-    while i < len {
-        let b = l2b_get0(l2b, i as u64) as u8;
-        seq[i] = if is_g2a { l2b_g2a(b) } else { l2b_c2t(b) };
-        i += 1;
-    }
-    len
-}
-
-#[inline]
-fn mb_l2b_fill_reverse_meth_2bit(seq: &mut [u8], l2b: &L2b, is_g2a: bool) -> usize {
-    let len = l2b.tot_len as usize;
-    let mut src_end = len;
-    let mut dst = 0usize;
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        while src_end & 63 != 0 {
-            src_end -= 1;
-            let b = l2b_get0(l2b, src_end as u64) as u8;
-            seq[dst] = 3 - if is_g2a { l2b_g2a(b) } else { l2b_c2t(b) };
-            dst += 1;
-        }
-        let src = l2b.pac.as_ptr() as *const u8;
-        let mut tmp = [0u8; 64];
-        while src_end >= 64 {
-            src_end -= 64;
-            unsafe { mb_unpack_2bit_16bytes_sse2(src.add(src_end >> 2), tmp.as_mut_ptr()) };
-            for k in 0..64 {
-                let b = tmp[63 - k];
-                seq[dst + k] = 3 - if is_g2a { l2b_g2a(b) } else { l2b_c2t(b) };
-            }
-            dst += 64;
-        }
-    }
-    while src_end > 0 {
-        src_end -= 1;
-        let b = l2b_get0(l2b, src_end as u64) as u8;
-        seq[dst] = 3 - if is_g2a { l2b_g2a(b) } else { l2b_c2t(b) };
         dst += 1;
     }
     len
@@ -355,34 +275,15 @@ fn sa_to_bwt_i64_parallel(a: &mut [i64], seq: &mut [u8], len: usize) -> u64 {
 }
 
 /// Original C global function `mb_bwt_libsais` from `minibwa/index.c:19`.
-pub(crate) fn mb_bwt_libsais(
-    l2b: &L2b,
-    sa_bit: i32,
-    both_strand: i32,
-    is_meth: i32,
-    n_thread: i32,
-) -> Bwt {
+pub(crate) fn mb_bwt_libsais(l2b: &L2b, sa_bit: i32, both_strand: i32, n_thread: i32) -> Bwt {
     let time_stages = std::env::var_os("MINIBWA_RS_INDEX_TIMING").is_some();
     let mut stage_start = std::time::Instant::now();
-    let copies = (if is_meth != 0 { 2 } else { 1 }) * (if both_strand != 0 { 2 } else { 1 });
+    let copies = if both_strand != 0 { 2 } else { 1 };
     let len = l2b.tot_len as usize * copies as usize;
     let mut seq = Vec::<u8>::with_capacity(len);
-    if is_meth != 0 {
-        let copy_len = l2b.tot_len as usize;
-        mb_l2b_fill_forward_meth_2bit(append_uninit_u8(&mut seq, copy_len), l2b, false);
-        mb_l2b_fill_forward_meth_2bit(append_uninit_u8(&mut seq, copy_len), l2b, true);
-        if both_strand != 0 {
-            mb_l2b_fill_reverse_meth_2bit(append_uninit_u8(&mut seq, copy_len), l2b, true);
-            mb_l2b_fill_reverse_meth_2bit(append_uninit_u8(&mut seq, copy_len), l2b, false);
-        }
-    } else {
-        mb_l2b_fill_forward_2bit(append_uninit_u8(&mut seq, l2b.tot_len as usize), l2b);
-        if both_strand != 0 {
-            mb_l2b_fill_reverse_complement_2bit(
-                append_uninit_u8(&mut seq, l2b.tot_len as usize),
-                l2b,
-            );
-        }
+    mb_l2b_fill_forward_2bit(append_uninit_u8(&mut seq, l2b.tot_len as usize), l2b);
+    if both_strand != 0 {
+        mb_l2b_fill_reverse_complement_2bit(append_uninit_u8(&mut seq, l2b.tot_len as usize), l2b);
     }
     assert_eq!(seq.len(), len);
     if time_stages {
@@ -492,7 +393,7 @@ pub(crate) fn usage_index(to_stdout: bool, seed: u64, sa_bit: i32, n_thread: i32
     (
             if to_stdout { 0 } else { 1 },
             format!(
-                "Usage: minibwa index [options] <in.fasta> [out.prefix]\nOptions:\n  -s INT    random seed for amibiguous bases [{seed}]\n  -u INT    SA sample rate at 1/(1<<INT) [{sa_bit}]\n  -l        low-memory GPL'd algorithm for GenBwt construction\n  -b NUM    block size (effective with -l) [10m]\n  -t INT    number of threads (effective w/o -l) [{n_thread}]\n  --meth    build FM-index for BS-seq mapping\n  --help    print this help message\n"
+                "Usage: minibwa index [options] <in.fasta> [out.prefix]\nOptions:\n  -s INT    random seed for amibiguous bases [{seed}]\n  -u INT    SA sample rate at 1/(1<<INT) [{sa_bit}]\n  -l        low-memory GPL'd algorithm for GenBwt construction\n  -b NUM    block size (effective with -l) [10m]\n  -t INT    number of threads (effective w/o -l) [{n_thread}]\n    --help    print this help message\n"
             ),
         )
 }
@@ -505,11 +406,6 @@ pub(crate) fn main_index(argv: &[String]) -> (i32, String) {
             has_arg: 0,
             val: 901,
         },
-        KoLongOpt {
-            name: Some("meth".into()),
-            has_arg: 0,
-            val: 902,
-        },
     ];
     let argc = argv.len() as i32;
     let mut args = argv.to_vec();
@@ -517,7 +413,6 @@ pub(crate) fn main_index(argv: &[String]) -> (i32, String) {
     let mut low_mem = 0;
     let mut n_thread = 4;
     let mut sa_bit = 4;
-    let mut is_meth = 0;
     let mut block_size = 10_000_000i64;
     let mut seed = 11u64;
     loop {
@@ -537,8 +432,6 @@ pub(crate) fn main_index(argv: &[String]) -> (i32, String) {
             seed = kom_atol(o.arg.as_deref().unwrap_or("0")) as u64;
         } else if c == 901 {
             return usage_index(true, seed, sa_bit, n_thread);
-        } else if c == 902 {
-            is_meth = 1;
         }
     }
     if argc - o.ind == 0 {
@@ -551,7 +444,6 @@ pub(crate) fn main_index(argv: &[String]) -> (i32, String) {
     };
     let fn_l2b = format!("{prefix}.l2b");
     let fn_bwt = format!("{prefix}.mbw");
-    let fn_meth_bwt = format!("{prefix}.meth.mbw");
     let time_index = std::env::var_os("MINIBWA_RS_INDEX_TIMING").is_some();
     let mut stage_start = std::time::Instant::now();
     let Some(mut l2b) = l2b_import(c_arg(&args[o.ind as usize]), seed) else {
@@ -576,37 +468,17 @@ pub(crate) fn main_index(argv: &[String]) -> (i32, String) {
             return (1, String::new());
         }
         l2b_save(&fn_l2b, &l2b);
-        if is_meth == 0 {
-            l2b.ctg = Vec::new();
-            l2b.ambi = Vec::new();
-            l2b.mask = Vec::new();
-            l2b.cat_name = Vec::new();
-            l2b.cat_comm = Vec::new();
-        }
+        l2b.ctg = Vec::new();
+        l2b.ambi = Vec::new();
+        l2b.mask = Vec::new();
+        l2b.cat_name = Vec::new();
+        l2b.cat_comm = Vec::new();
         let Some(mut bwt) = mb_bwt_load_raw(&fn_bwt) else {
             return (1, String::new());
         };
         mb_bwt_gen_sa(&mut bwt, sa_bit as u32);
         mb_bwt_save(&fn_bwt, &bwt);
         drop(bwt);
-        if is_meth != 0 {
-            l2b_save_pac_meth(&fn_l2b, &l2b, 1);
-            if mb_bwtgen(
-                std::path::Path::new(&fn_l2b),
-                std::path::Path::new(&fn_meth_bwt),
-                block_size as i32,
-            )
-            .is_err()
-            {
-                return (1, String::new());
-            }
-            let Some(mut bwt) = mb_bwt_load_raw(&fn_meth_bwt) else {
-                return (1, String::new());
-            };
-            mb_bwt_gen_sa(&mut bwt, sa_bit as u32);
-            mb_bwt_save(&fn_meth_bwt, &bwt);
-            l2b_save(&fn_l2b, &l2b);
-        }
     } else {
         l2b_save(&fn_l2b, &l2b);
         if time_index {
@@ -621,7 +493,7 @@ pub(crate) fn main_index(argv: &[String]) -> (i32, String) {
         l2b.mask = Vec::new();
         l2b.cat_name = Vec::new();
         l2b.cat_comm = Vec::new();
-        let bwt = run_with_index_pool(n_thread, || mb_bwt_libsais(&l2b, sa_bit, 1, 0, n_thread));
+        let bwt = run_with_index_pool(n_thread, || mb_bwt_libsais(&l2b, sa_bit, 1, n_thread));
         if time_index {
             eprintln!(
                 "[index::main_index] mb_bwt_libsais total {:.3}s",
@@ -637,11 +509,6 @@ pub(crate) fn main_index(argv: &[String]) -> (i32, String) {
             );
         }
         drop(bwt);
-        if is_meth != 0 {
-            let bwt =
-                run_with_index_pool(n_thread, || mb_bwt_libsais(&l2b, sa_bit, 1, 1, n_thread));
-            mb_bwt_save(&fn_meth_bwt, &bwt);
-        }
     }
     (0, String::new())
 }
@@ -659,7 +526,7 @@ mod tests {
         l2b_format_seq(seq.len() as u64, &mut seq, &mut rng);
         let mut l2b = L2b::default();
         l2b_add_seq(&mut l2b, seq.len() as u64, &seq, "ctg", None, &mut rng);
-        let bwt = mb_bwt_libsais(&l2b, 2, 1, 0, 1);
+        let bwt = mb_bwt_libsais(&l2b, 2, 1, 1);
         assert_eq!(bwt.seq_len, 12);
         assert_eq!(bwt.sa_bit, 2);
         assert_eq!(bwt.sa[0], u64::MAX);

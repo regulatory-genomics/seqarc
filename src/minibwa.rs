@@ -52,7 +52,6 @@ pub mod qsufsort;
 pub mod align;
 pub mod bwt;
 pub mod bwtgen;
-pub mod cs;
 pub mod index;
 pub mod ketopt;
 pub mod kommon;
@@ -136,24 +135,19 @@ impl Index {
     pub fn build_from_fasta(
         fasta: impl AsRef<Path>,
         output: impl AsRef<Path>,
-        methylation: bool,
         threads: u32,
     ) -> Result<()> {
         let workspace = crate::temporary_directory(None, "seqarc-minibwa-")
             .map_err(|error| Error(error.to_string()))?;
-        Self::build_from_fasta_in(fasta, output, methylation, threads, workspace.path())
+        Self::build_from_fasta_in(fasta, output, threads, workspace.path())
     }
 
     pub fn build_from_fasta_in(
         fasta: impl AsRef<Path>,
         output: impl AsRef<Path>,
-        methylation: bool,
         threads: u32,
         temp_root: impl AsRef<Path>,
     ) -> Result<()> {
-        if methylation {
-            return Err(Error("methylation indexes are not supported".into()));
-        }
         let workspace =
             crate::temporary_directory(Some(temp_root.as_ref()), "seqarc-minibwa-components-")
                 .map_err(|error| Error(error.to_string()))?;
@@ -180,10 +174,7 @@ impl Index {
         )
     }
 
-    pub fn load(path: impl AsRef<Path>, methylation: bool) -> Result<Self> {
-        if methylation {
-            return Err(Error("methylation indexes are not supported".into()));
-        }
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         load_container(path)
     }
 
@@ -301,7 +292,6 @@ fn load_container(path: impl AsRef<Path>) -> Result<Index> {
         bwt::mb_bwt_cache(&mut bwt, 10);
         Ok(Index {
             inner: map_algo::MapIndex {
-                is_meth: 0,
                 l2b,
                 bwt,
             },
@@ -558,14 +548,6 @@ impl Opts {
         Self { inner }
     }
 
-    pub fn set_paired(mut self, paired: bool) -> Self {
-        if paired {
-            self.inner.flag |= options::MB_F_PE;
-        } else {
-            self.inner.flag &= !options::MB_F_PE;
-        }
-        self
-    }
 }
 
 impl Default for Opts {
@@ -608,6 +590,7 @@ impl<'a> Aligner<'a> {
         names: &[N],
         sequences: &[S],
     ) -> Result<Vec<Vec<Hit>>> {
+        // Names seed minibwa's hit tie-break hash; they never appear in output.
         if names.len() != sequences.len() {
             return Err(Error("query name and sequence counts differ".into()));
         }
@@ -637,10 +620,9 @@ impl<'a> Aligner<'a> {
             })
             .collect::<Result<Vec<_>>>()?;
         let mut hit_counts = vec![0; sequences.len()];
-        let mut options = self.options.inner.clone();
-        options.flag &= !options::MB_F_PE;
+        let options = &self.options.inner;
         let hits = map_algo::mb_map_batch(
-            &options,
+            options,
             &self.index.inner,
             sequences.len() as i32,
             &lengths,
@@ -774,6 +756,6 @@ mod tests {
         let mut header = vec![0; INDEX_HEADER_SIZE as usize];
         header[8..12].copy_from_slice(&INDEX_VERSION.to_le_bytes());
         std::fs::write(&path, header).unwrap();
-        assert!(Index::load(path, false).is_err());
+        assert!(Index::load(path).is_err());
     }
 }

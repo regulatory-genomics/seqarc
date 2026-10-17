@@ -1,15 +1,14 @@
 #![allow(unused_variables)]
 
-use crate::minibwa::cs::{mb_write_md, mb_write_cs_ds};
 use crate::minibwa::ksw2::{
     KswExtz, ksw_push_cigar, ksw_reset_extz, KSW_EZ_APPROX_MAX, KSW_EZ_EXTZ_ONLY,
-    KSW_EZ_GENERIC_SC, KSW_EZ_REV_CIGAR, KSW_EZ_RIGHT,
+    KSW_EZ_REV_CIGAR, KSW_EZ_RIGHT,
 };
 use crate::minibwa::ksw2::Ksw2Scratch;
 use crate::minibwa::ksw2_extd2_sse::ksw_extd2_sse;
 use crate::minibwa::ksw2_extz2_sse::ksw_extz2_sse;
 use crate::minibwa::ksw2_ll_sse::{ksw_ll_i16, ksw_ll_qinit};
-use crate::minibwa::l2bit::{l2b_getseq, l2b_meth_rev, L2bMeth};
+use crate::minibwa::l2bit::l2b_getseq;
 use crate::minibwa::lchain::Anchor;
 use crate::minibwa::map_algo::{
     mb_cal_mblen, mb_filter_hits, mb_hit_sort, MapIndex, mb_split_hit, mb_squeeze_a,
@@ -26,8 +25,6 @@ pub(crate) const MB_CIGAR_MATCH: u32 = 0;
 pub(crate) const MB_CIGAR_INS: u32 = 1;
 pub(crate) const MB_CIGAR_DEL: u32 = 2;
 pub(crate) const MB_CIGAR_N_SKIP: u32 = 3;
-pub(crate) const MB_CIGAR_EQ_MATCH: u32 = 7;
-pub(crate) const MB_CIGAR_X_MISMATCH: u32 = 8;
 pub(crate) const MB_CIGAR_STR: &str = "MIDNSHP=XB";
 
 pub(crate) const MB_SEED_LONG_JOIN: u32 = 0x1;
@@ -286,98 +283,6 @@ pub(crate) fn mb_fix_cigar(
     }
 }
 
-/// Original C static function `mm_update_cigar_eqx` from `minibwa/align.c:148`.
-pub(crate) fn mm_update_cigar_eqx(r: &mut Hit, qseq: &[u8], tseq: &[u8]) {
-    let Some(p0) = r.p.as_ref() else {
-        return;
-    };
-    let mut n_x = 0u32;
-    let mut toff = 0usize;
-    let mut qoff = 0usize;
-    for &cg in p0.cigar().iter().take(p0.n_cigar as usize) {
-        let op = cg & 0xf;
-        let mut len = (cg >> 4) as usize;
-        if op == MB_CIGAR_MATCH {
-            while len > 0 {
-                let mut l = 0usize;
-                while l < len && qseq[qoff + l] == tseq[toff + l] && qseq[qoff + l] < 4 {
-                    l += 1;
-                }
-                if l > 0 {
-                    len -= l;
-                    toff += l;
-                    qoff += l;
-                }
-                l = 0;
-                while l < len && !(qseq[qoff + l] == tseq[toff + l] && qseq[qoff + l] < 4) {
-                    l += 1;
-                }
-                if l > 0 {
-                    n_x += 1;
-                    len -= l;
-                    toff += l;
-                    qoff += l;
-                }
-            }
-        } else if op == MB_CIGAR_INS {
-            qoff += len;
-        } else if op == MB_CIGAR_DEL || op == MB_CIGAR_N_SKIP {
-            toff += len;
-        }
-    }
-    let p = r.p.as_mut().unwrap();
-    if n_x == 0 {
-        let n_cigar = p.n_cigar as usize;
-        for cg in p.cigar_mut().iter_mut().take(n_cigar) {
-            let op = *cg & 0xf;
-            let len = *cg >> 4;
-            if op == MB_CIGAR_MATCH {
-                *cg = len << 4 | MB_CIGAR_EQ_MATCH;
-            }
-        }
-        return;
-    }
-    let old = p.cigar()[..p.n_cigar as usize].to_vec();
-    let mut new_cigar = Vec::new();
-    toff = 0;
-    qoff = 0;
-    for cg in old {
-        let op = cg & 0xf;
-        let mut len = (cg >> 4) as usize;
-        if op == MB_CIGAR_MATCH {
-            while len > 0 {
-                let mut l = 0usize;
-                while l < len && qseq[qoff + l] == tseq[toff + l] && qseq[qoff + l] < 4 {
-                    l += 1;
-                }
-                if l > 0 {
-                    new_cigar.push((l as u32) << 4 | MB_CIGAR_EQ_MATCH);
-                }
-                len -= l;
-                toff += l;
-                qoff += l;
-                l = 0;
-                while l < len && !(qseq[qoff + l] == tseq[toff + l] && qseq[qoff + l] < 4) {
-                    l += 1;
-                }
-                if l > 0 {
-                    new_cigar.push((l as u32) << 4 | MB_CIGAR_X_MISMATCH);
-                }
-                len -= l;
-                toff += l;
-                qoff += l;
-            }
-        } else {
-            if op == MB_CIGAR_INS {
-                qoff += len;
-            } else if op == MB_CIGAR_DEL || op == MB_CIGAR_N_SKIP {
-                toff += len;
-            }
-            new_cigar.push(cg);
-        }
-    }
-    p.set_cigar_from_vec(new_cigar);
-}
 
 /// Original C global function `mb_update_extra` from `minibwa/align.c:218`.
 pub(crate) fn mb_update_extra(
@@ -485,42 +390,6 @@ pub(crate) fn mb_update_extra(
     }
     debug_assert_eq!(qoff as i32, r.qe - r.qs);
     debug_assert_eq!(toff as i32, (r.te - r.ts) as i32);
-    if (opt_flag & crate::minibwa::options::MB_F_EQX) != 0 {
-        mm_update_cigar_eqx(r, qseq, tseq);
-    }
-    if (opt_flag
-        & (crate::minibwa::options::MB_F_WRITE_DS
-            | crate::minibwa::options::MB_F_WRITE_CS
-            | crate::minibwa::options::MB_F_WRITE_MD))
-        != 0
-    {
-        let mut s = String::with_capacity(256);
-        if (opt_flag & (crate::minibwa::options::MB_F_WRITE_DS | crate::minibwa::options::MB_F_WRITE_CS)) != 0 {
-            mb_write_cs_ds(&mut s,
-                tseq,
-                qseq,
-                r,
-                ((opt_flag & crate::minibwa::options::MB_F_WRITE_DS) != 0) as i32,
-            );
-        } else {
-            mb_write_md(&mut s, tseq, qseq, r);
-        }
-        let p = r.p.as_mut().unwrap();
-        p.set_cs(1);
-        p.truncate_cigar(p.n_cigar as usize);
-        // Pack the tag value NUL-terminated, little-endian into u32 words.
-        let mut bytes = s.into_bytes();
-        bytes.push(0);
-        let mut tag_words = Vec::with_capacity(bytes.len().div_ceil(4));
-        for chunk in bytes.chunks(4) {
-            let mut w = 0u32;
-            for (i, &b) in chunk.iter().enumerate() {
-                w |= (b as u32) << (i * 8);
-            }
-            tag_words.push(w);
-        }
-        p.set_tag_words_from_slice(&tag_words);
-    }
 }
 
 /// Original C static function `mb_enlarge_cigar` from `minibwa/align.c:284`.
@@ -595,14 +464,11 @@ pub(crate) fn mb_align_pair(
     mut w: i32,
     end_bonus: i32,
     zdrop: i32,
-    mut ksw_flag: i32,
+    ksw_flag: i32,
     ez: &mut KswExtz,
 ) {
     const MAX_BW_ADJ_LEN: i32 = 100;
     let mut n_mm = -1;
-    if (opt.b_ts != 0 && opt.b != opt.b_ts) || (opt.flag & crate::minibwa::options::MB_F_METH) != 0 {
-        ksw_flag |= KSW_EZ_GENERIC_SC;
-    }
     if (ksw_flag & KSW_EZ_EXTZ_ONLY) != 0 && tlen >= qlen {
         ksw_reset_extz(ez);
         ez.score = 0;
@@ -1003,7 +869,6 @@ pub(crate) fn mb_align1(
     mi: &MapIndex,
     qlen: i32,
     qseq0: &mut [&mut [u8]; 2],
-    mut mt: L2bMeth,
     r: &mut Hit,
     r2: &mut Hit,
     n_a: i32,
@@ -1029,17 +894,12 @@ pub(crate) fn mb_align1(
     };
     let mut dropped = 0;
     let ksw_flag = 0;
-    if r.rev() != 0 {
-        mt = l2b_meth_rev(mt);
-    }
     let mut mat_local = [0i8; 25];
     crate::minibwa::ksw2::ksw_gen_nt4_mat(
         &mut mat_local,
         opt.a as i8,
         opt.b as i8,
-        opt.b_ts as i8,
         opt.b_ambi as i8,
-        mt as i32,
     );
     let mat = &mat_local;
     let mut as1 = r.as_;
@@ -1413,7 +1273,6 @@ pub(crate) fn mb_align1_inv(
     mi: &MapIndex,
     qlen: i32,
     qseq0: &mut [&mut [u8]; 2],
-    mut mt: L2bMeth,
     r1: &Hit,
     r2: &Hit,
     r_inv: &mut Hit,
@@ -1446,17 +1305,12 @@ pub(crate) fn mb_align1_inv(
     }
     tseq.clear();
     tseq.resize(tl as usize, 0);
-    if r1.rev() == 0 {
-        mt = l2b_meth_rev(mt);
-    }
     let mut mat_local = [0i8; 25];
     crate::minibwa::ksw2::ksw_gen_nt4_mat(
         &mut mat_local,
         opt.a as i8,
         opt.b as i8,
-        opt.b_ts as i8,
         opt.b_ambi as i8,
-        mt as i32,
     );
     let mat = &mat_local;
     l2b_getseq(&mi.l2b, r1.tid, r1.te, r2.ts, tseq);
@@ -1560,7 +1414,7 @@ pub(crate) fn mb_event_identity(r: &Hit) -> f64 {
     let mut n_gap = 0;
     let mut n_gapo = 0;
     mb_count_gaps(r, &mut n_gap, &mut n_gapo);
-    r.mlen as f64 / (r.blen + p.n_ambi() as i32 - n_gap + n_gapo) as f64
+    r.mlen as f64 / (r.blen + p.n_ambi as i32 - n_gap + n_gapo) as f64
 }
 
 /// Original C static function `mb_recal_max_dp` from `minibwa/align.c:844`.
@@ -1578,7 +1432,7 @@ pub(crate) fn mb_recal_max_dp(r: &Hit, b2: f64, match_sc: i32, qlen: i32) -> i32
             n_gap += len as i32;
         }
     }
-    let mut n_mis = r.blen + p.n_ambi() as i32 - r.mlen - n_gap;
+    let mut n_mis = r.blen + p.n_ambi as i32 - r.mlen - n_gap;
     n_mis += ((qlen - (r.qe - r.qs)) as f64 / b2 + 0.499) as i32;
     (match_sc as f64 * (r.mlen as f64 - b2 * n_mis as f64 - gap_cost) + 0.499) as i32
 }
@@ -1643,7 +1497,6 @@ pub(crate) fn mb_align_skeleton_with_scratch(
     mi: &MapIndex,
     qlen: i32,
     qseq: &[u8],
-    mt: L2bMeth,
     n_regs_: &mut i32,
     regs: &mut Vec<Hit>,
     a: &mut Vec<Anchor>,
@@ -1667,9 +1520,7 @@ pub(crate) fn mb_align_skeleton_with_scratch(
         &mut mat,
         opt.a as i8,
         opt.b as i8,
-        opt.b_ts as i8,
         opt.b_ambi as i8,
-        mt as i32,
     );
     tseq.clear();
     let mut i = 0usize;
@@ -1681,7 +1532,6 @@ pub(crate) fn mb_align_skeleton_with_scratch(
             mi,
             qlen,
             &mut qseq0,
-            mt,
             &mut regs[i],
             &mut r2,
             n_a,
@@ -1698,7 +1548,7 @@ pub(crate) fn mb_align_skeleton_with_scratch(
             let (left, right) = regs.split_at_mut(i);
             let r1 = &left[i - 1];
             let rcur = &right[0];
-            if mb_align1_inv(scratch, opt, mi, qlen, &mut qseq0, mt, r1, rcur, &mut rinv, &mut ez, tseq, &mat,
+            if mb_align1_inv(scratch, opt, mi, qlen, &mut qseq0, r1, rcur, &mut rinv, &mut ez, tseq, &mat,
             ) != 0
             {
                 mb_insert_reg(&rinv, i as i32, &mut n_regs, regs);
@@ -1719,9 +1569,8 @@ pub(crate) fn mb_align_skeleton_with_scratch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
-    
+
+    use crate::minibwa::ksw2::KSW_EZ_GENERIC_SC;
     use crate::minibwa::options::{mb_opt_init, MapOpts};
     
 
@@ -1980,9 +1829,7 @@ mod tests {
             &mut mat,
             opt.a as i8,
             opt.b as i8,
-            opt.b_ts as i8,
             opt.b_ambi as i8,
-            0,
         );
         let q = vec![0, 1, 2, 3];
         let t = vec![0, 1, 2, 3];
@@ -2046,9 +1893,7 @@ mod tests {
             &mut mat,
             opt.a as i8,
             opt.b as i8,
-            opt.b_ts as i8,
             opt.b_ambi as i8,
-            0,
         );
         let target = "TCCCCATACCCAACCCCCTGGTCAACCTCAACCTAGGCCTCCTATTTATTCTAGCCACCTCTAGCCTAGCCGTTTACTCAATCCTCTGATCAGGGTGAGCATCAAACTC"
                 .bytes()

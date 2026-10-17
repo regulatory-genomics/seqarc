@@ -238,7 +238,7 @@ pub(crate) fn ksw_apply_zdrop(
 }
 
 /// Original C static function `ksw_gen_nt4_mat` from `minibwa/ksw2.h:199`.
-pub(crate) fn ksw_gen_nt4_mat(mat: &mut [i8; 25], a: i8, b: i8, b_ts: i8, b_ambi: i8, mt: i32) {
+pub(crate) fn ksw_gen_nt4_mat(mat: &mut [i8; 25], a: i8, b: i8, b_ambi: i8) {
     let a = if a < 0 { a.wrapping_neg() } else { a };
     let b = if b > 0 { -b } else { b };
     let b_ambi = if b_ambi > 0 { -b_ambi } else { b_ambi };
@@ -250,18 +250,6 @@ pub(crate) fn ksw_gen_nt4_mat(mat: &mut [i8; 25], a: i8, b: i8, b_ts: i8, b_ambi
     }
     for j in 0..5usize {
         mat[4 * 5 + j] = b_ambi;
-    }
-    if b_ts != 0 && b_ts != b {
-        let b_ts = if b_ts > 0 { -b_ts } else { b_ts };
-        mat[2] = b_ts;
-        mat[8] = b_ts;
-        mat[10] = b_ts;
-        mat[16] = b_ts;
-    }
-    if mt == 1 {
-        mat[1 * 5 + 3] = a;
-    } else if mt == 2 {
-        mat[2 * 5] = a;
     }
 }
 

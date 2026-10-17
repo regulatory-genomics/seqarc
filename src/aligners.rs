@@ -172,7 +172,7 @@ impl AlignmentIndex {
                 .map(Box::new)
                 .map(Self::Rustar);
         }
-        Index::load(path, false)
+        Index::load(path)
             .map(Self::Minibwa)
             .map_err(|error| Error::InvalidInput(error.to_string()))
     }
@@ -254,13 +254,12 @@ pub fn build_genome_index_with_options(
     Index::build_from_fasta_in(
         &normalized.fasta,
         index_file,
-        false,
         threads,
         workspace.path(),
     )
     .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let index =
-        Index::load(index_file, false).map_err(|error| Error::InvalidInput(error.to_string()))?;
+        Index::load(index_file).map_err(|error| Error::InvalidInput(error.to_string()))?;
     if index.reference_len() == 0 {
         return Err(Error::InvalidInput(
             "built genome index has an empty reference".into(),
@@ -509,7 +508,7 @@ pub fn align_dna_batch(
         .map(|index| format!("read-{index}"))
         .collect();
     let sequences = sequences.iter().map(AsRef::as_ref).collect::<Vec<&[u8]>>();
-    let options = minibwa::Opts::new().set_paired(false);
+    let options = minibwa::Opts::new();
     let aligner = minibwa::Aligner::new(index, &options);
     let mut buffer = minibwa::ThreadBuf::new();
     let hits = aligner
@@ -604,7 +603,7 @@ fn map_minibwa_records<F>(
 where
     F: Fn(&ReadRecord, Option<&GenomeAlignment>, &AlignmentIndex) -> Result<usize> + Sync,
 {
-    let opts = minibwa::Opts::new().set_paired(false);
+    let opts = minibwa::Opts::new();
     let aligner = minibwa::Aligner::new(index, &opts);
     mapping_pool.install(|| {
         use rayon::prelude::*;

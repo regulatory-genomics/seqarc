@@ -260,6 +260,11 @@ pub(crate) fn mb_chain_backtrack(
 }
 
 /// Original C static function `compact_a` from `minibwa/lchain.c:94`.
+///
+/// Unlike the C original (which returned a fresh allocation to the caller),
+/// this compacts the chains back into the input `a` and returns it, so the
+/// caller's reserved anchor-buffer capacity survives across reads. `perm` is
+/// a caller-owned permutation scratch buffer, reused across calls.
 pub(crate) fn compact_a(
     l2b: &L2b,
     n_u: i32,
@@ -267,8 +272,11 @@ pub(crate) fn compact_a(
     n_v: i32,
     v: Vec<i32>,
     mut a: Vec<Anchor>,
+    perm: &mut Vec<Anchor>,
 ) -> Vec<Anchor> {
-    let mut b = vec![Anchor::default(); n_v as usize];
+    perm.clear();
+    perm.resize(n_v as usize, Anchor::default());
+    let b: &mut Vec<Anchor> = perm;
     let mut k = 0usize;
     for i in 0..n_u as usize {
         let k0 = k;
@@ -299,8 +307,10 @@ pub(crate) fn compact_a(
         k += n;
     }
     u[..n_u as usize].copy_from_slice(&u2);
-    b[..k].copy_from_slice(&a[..k]);
-    b
+    // a[..k] now holds the compacted chains; returning it (not a fresh copy
+    // of b) preserves the caller's allocation.
+    a.truncate(k);
+    a
 }
 
 /// Original C global function `mb_lchain_dp` from `minibwa/lchain.c:163`.
@@ -315,6 +325,7 @@ pub(crate) fn mb_lchain_dp(
     chn_pen_gap: f32,
     n: i64,
     a: Vec<Anchor>,
+    perm: &mut Vec<Anchor>,
     n_u_: &mut i32,
     _u: &mut Vec<u64>,
 ) -> Vec<Anchor> {
@@ -488,7 +499,7 @@ pub(crate) fn mb_lchain_dp(
     if n_u == 0 {
         return Vec::new();
     }
-    compact_a(l2b, n_u, _u, n_v, v, a)
+    compact_a(l2b, n_u, _u, n_v, v, a, perm)
 }
 
 #[cfg(test)]
@@ -545,6 +556,7 @@ mod tests {
             0.01,
             anchors.len() as i64,
             anchors,
+            &mut Vec::new(),
             &mut n_u,
             &mut u,
         );
@@ -623,6 +635,7 @@ mod tests {
             0.01,
             anchors.len() as i64,
             anchors,
+            &mut Vec::new(),
             &mut n_u,
             &mut u,
         );

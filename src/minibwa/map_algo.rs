@@ -32,6 +32,9 @@ pub(crate) struct MapBuffer {
     pub anchor_sa_batch: Vec<(u64, u64)>,
     pub anchor_batch: Vec<(i64, i64)>,
     pub chain_w: Vec<u64>,
+    /// Permutation scratch for `compact_a`, so anchor compaction does not
+    /// allocate per read.
+    pub chain_perm: Vec<Anchor>,
     pub align_tseq: Vec<u8>,
     pub ksw: crate::minibwa::ksw2::Ksw2Scratch,
     pub align_qseq0: Vec<u8>,
@@ -56,6 +59,7 @@ pub(crate) fn mb_tbuf_init() -> MapBuffer {
         anchor_sa_batch: Vec::new(),
         anchor_batch: Vec::new(),
         chain_w: Vec::new(),
+        chain_perm: Vec::new(),
         align_tseq: Vec::new(),
         align_qseq0: Vec::new(),
     }
@@ -1095,6 +1099,7 @@ pub(crate) fn mb_map_sai(
             chn_pen_gap,
             v.n,
             anchors,
+            &mut b.chain_perm,
             &mut n_hit,
             &mut w,
         )
@@ -1135,6 +1140,7 @@ pub(crate) fn mb_map_sai(
                     chn_pen_gap,
                     n_a,
                     a,
+                    &mut b.chain_perm,
                     &mut n_hit,
                     &mut w,
                 )

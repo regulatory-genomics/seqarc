@@ -1039,11 +1039,14 @@ pub(crate) fn mb_set_mapq(
 }
 
 /// Original C global function `mb_map_sai` from `minibwa/map-algo.c:535`.
+///
+/// `seq` is the NT4-encoded query (same encoding as the seeding path in
+/// `mb_map_batch`), so the caller encodes each read once instead of twice.
 pub(crate) fn mb_map_sai(
     opt: &MapOpts,
     idx: &MapIndex,
     qlen: i64,
-    seq0: &str,
+    seq: &[u8],
     u: &mut SeedHitVec,
     n_hit_: &mut i32,
     b: &mut MapBuffer,
@@ -1061,11 +1064,6 @@ pub(crate) fn mb_map_sai(
     let mut hash = qname.map(mb_hash_str).unwrap_or(0);
     hash ^= (mb_hash64(qlen as u64).wrapping_add(mb_hash64(opt.seed as u64))) as u32;
     hash = mb_hash64(hash as u64) as u32;
-    let seq: Vec<u8> = seq0
-        .bytes()
-        .take(qlen as usize)
-        .map(|c| crate::minibwa::kommon::KOM_NT4_TABLE[c as usize])
-        .collect();
     let hi_cov = mb_cal_high_cov(u.n as i32, &u.a, opt.max_occ);
     let is_sr = mb_is_sr_mode(opt, qlen as i32);
     let sub_diff = (opt.a + opt.b).max(opt.q + opt.e);
@@ -1297,7 +1295,7 @@ pub(crate) fn mb_map_batch(
                     &opt_adap,
                     idx,
                     qlen[idx_k] as i64,
-                    seq[idx_k],
+                    &seq4[k],
                     &mut sai[k],
                     &mut n_hit[idx_k],
                     b,
